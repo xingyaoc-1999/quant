@@ -1,0 +1,21 @@
+[package]
+name = "api_client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+zip = "8.2.0"
+thiserror.workspace =true
+serde_json.workspace = true
+serde.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+tokio-socks.workspace = true
+tokio-tungstenite = { version = "0.29.0", features = ["native-tls"] }
+tracing.workspace = true
+chrono.workspace = true
+common = { path = "../common" }

@@ -1,0 +1,15 @@
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio.workspace =true
+tracing.workspace = true
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+chrono.workspace = true
+common = { path = "../common" }
+deadpool-postgres = "0.14.1"
+qdrant-client = "1.17.0"
+anyhow.workspace = true

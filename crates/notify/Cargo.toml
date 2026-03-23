@@ -1,0 +1,16 @@
+[package]
+name = "notify"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+reqwest.workspace = true 
+anyhow.workspace = true
+tracing.workspace = true
+teloxide = { version = "0.17.0", features = ["macros", "ctrlc_handler"] }
+tokio.workspace = true
+common = { path = "../common" }
+service = { path="../service" }
+quant ={path="../quant"}
+storage={path="../storage"}

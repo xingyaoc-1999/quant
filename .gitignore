@@ -1,0 +1,24 @@
+# --- 编译产物 ---
+# 所有的编译产物都在根目录的 target 文件夹下
+/target/
+
+# --- IDE 与 编辑器配置 ---
+# JetBrains (IntelliJ, RustRover, PyCharm 等)
+.idea/
+*.iml
+
+# VS Code
+.vscode/
+# 注意：如果你想共享团队的 launch.json 或 tasks.json，可以改写为：
+# .vscode/*
+# !.vscode/launch.json
+# !.vscode/tasks.json
+
+# Vim / Emacs
+*~
+*.swp
+*.swo
+
+# --- 操作系统临时文件 ---
+.DS_Store
+Thumbs.db

@@ -1,0 +1,18 @@
+[package]
+name = "service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+dashmap.workspace = true
+futures-util.workspace =true
+anyhow.workspace = true
+chrono.workspace = true
+api_client = { path = "../api_client" }
+common = { path = "../common" }
+quant = { path = "../quant" }
+storage = { path = "../storage" }
+rayon = "1.11.0"
