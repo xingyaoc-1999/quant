@@ -1,4 +1,4 @@
 // mod aggregator;
 pub mod analyzer;
 pub mod calculator;
-mod types;
+pub mod types;

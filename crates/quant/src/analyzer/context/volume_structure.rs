@@ -6,8 +6,7 @@ use crate::types::VolumeState;
 use serde_json::json;
 use std::borrow::Cow;
 
-/// 成交量结构分析器 (Context 阶段)
-/// 职责：分析当前市场的能量背景（成交量分布、异常量、量价配合度），定义全局环境乘数
+
 pub struct VolumeStructureAnalyzer;
 
 impl Analyzer for VolumeStructureAnalyzer {
@@ -38,7 +37,6 @@ impl Analyzer for VolumeStructureAnalyzer {
         let mut score = 0.0;
         let mut description: Vec<Cow<'static, str>> = Vec::new();
 
-        // --- 1. 量价形态检测 (核心 VSA 逻辑) ---
         if let Some(vol_state) = &feat.structure.volume_state {
             match vol_state {
                 VolumeState::Expand => {

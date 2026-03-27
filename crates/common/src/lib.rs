@@ -1,7 +1,7 @@
+use crate::utils::str_to_f64;
 use anyhow::Result;
 use chrono::Duration;
 use polars::{io::SerReader, prelude::CsvReadOptions};
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -83,7 +83,7 @@ impl fmt::Display for Symbol {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Copy)]
 
 pub struct Candle {
     pub symbol: Symbol,
@@ -302,10 +302,12 @@ impl fmt::Display for Interval {
         f.write_str(self.as_str())
     }
 }
-
-pub struct OpenInterestResponse {
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenInterestData {
     pub symbol: String,
-    pub open_interest: String,
+    #[serde(deserialize_with = "str_to_f64")]
+    pub open_interest: f64,
     pub time: i64,
 }
 
@@ -318,11 +320,37 @@ pub struct PremiumIndexResponse {
     pub next_funding_time: i64,
 }
 
-// 最终汇总到你日志中显示的结构
-pub struct ContractMetrics {
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TakerBuySellData {
+    #[serde(deserialize_with = "str_to_f64")]
+    pub buy_sell_ratio: f64,
+
+    #[serde(deserialize_with = "str_to_f64")]
+    pub buy_vol: f64,
+
+    #[serde(deserialize_with = "str_to_f64")]
+    pub sell_vol: f64, // 主动卖出量
+
+    pub timestamp: i64, // 时间戳
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TopTraderRatioData {
     pub symbol: String,
-    pub open_interest: f64,
-    pub funding_rate: f64,
-    pub mark_price: f64,
+    #[serde(deserialize_with = "str_to_f64")]
+    pub long_short_ratio: f64,
     pub timestamp: i64,
+}
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LiquidationOrder {
+    pub symbol: String,
+    pub side: String,
+    #[serde(deserialize_with = "str_to_f64")]
+    pub price: f64,
+    #[serde(deserialize_with = "str_to_f64")]
+    pub orig_qty: f64,
+    pub time: i64,
 }

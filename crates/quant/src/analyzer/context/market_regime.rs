@@ -1,25 +1,21 @@
 use crate::analyzer::{
     AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, AnalyzerStage, Config, MarketContext,
-    Role, SharedAnalysisState,
+    OIPositionState, Role, SharedAnalysisState,
 };
-use crate::types::TrendStructure;
+use crate::types::TrendStructure; // 确保引入了新定义的枚举
 use serde_json::json;
 
-/// 市场环境分析器 (Context 阶段)
-/// 职责：基于大周期的均线结构和波动率百分位，定义趋势背景及其对信号的过滤权重
 pub struct MarketRegimeAnalyzer;
 
 impl Analyzer for MarketRegimeAnalyzer {
     fn name(&self) -> &'static str {
         "market_regime"
     }
-
     fn stage(&self) -> AnalyzerStage {
         AnalyzerStage::Context
     }
-
     fn kind(&self) -> AnalyzerKind {
-        AnalyzerKind::TrendStrength
+        AnalyzerKind::MarketRegime
     }
 
     fn analyze(
@@ -28,75 +24,102 @@ impl Analyzer for MarketRegimeAnalyzer {
         _config: &Config,
         shared: &SharedAnalysisState,
     ) -> Result<AnalysisResult, AnalysisError> {
+        // 1. 获取 Trend 角色的数据
         let trend_data = ctx.get_role(Role::Trend);
         let trend_feat = &trend_data.feature_set;
 
-        // env_multiplier 用于全局环境加成/压制
-        let mut env_multiplier = 1.0;
+        let mut multiplier = 1.0;
         let mut score = 0.0;
         let mut description = Vec::new();
 
-        // --- 1. 趋势结构评估 ---
+        // --- A. 趋势结构评估 (宏观定调) ---
         if let Some(structure) = trend_feat.structure.trend_structure {
             match structure {
                 TrendStructure::StrongBullish => {
                     score = 60.0;
-                    env_multiplier = 1.3; // 强势多头，放大信号
-                    description.push("大周期完全多头排列");
+                    multiplier = 1.25;
+                    description.push("🚀 强力多头");
                 }
                 TrendStructure::Bullish => {
                     score = 30.0;
-                    env_multiplier = 1.1;
-                    description.push("大周期多头趋势");
+                    multiplier = 1.1;
+                    description.push("📈 上升趋势");
                 }
                 TrendStructure::StrongBearish => {
                     score = -60.0;
-                    env_multiplier = 1.3; // 强势空头，放大做空信号（取决于具体逻辑，这里指环境强弱）
-                    description.push("大周期完全空头排列");
+                    multiplier = 1.25;
+                    description.push("💀 强力空头");
                 }
                 TrendStructure::Bearish => {
                     score = -30.0;
-                    env_multiplier = 1.1;
-                    description.push("大周期空头趋势");
+                    multiplier = 1.1;
+                    description.push("📉 下降趋势");
                 }
                 TrendStructure::Range => {
                     score = 0.0;
-                    env_multiplier = 0.35; // 震荡市极大削减信号可信度
-                    description.push("均线纠缠(Range)");
+                    multiplier = 0.45;
+                    description.push("🦀 震荡纠缠");
                 }
             }
         }
 
-        // --- 2. 波动率调节 (非线性) ---
-        // 获取波动率在历史中的百分位位置
+        // --- B. 波动率调节 (强度修正) ---
         let vol_p = trend_feat.price_action.volatility_percentile;
-        if vol_p > 95.0 {
-            // 极高波动率通常伴随着情绪过热或洗盘
-            env_multiplier *= 0.6;
-            description.push("波动率过激");
-        } else if vol_p < 10.0 {
-            // 波动率收敛是爆发前兆
-            env_multiplier *= 1.2;
-            description.push("波动率收敛");
+        if vol_p > 90.0 {
+            multiplier *= 0.75;
+            description.push("⚠️ 波动过热");
+        } else if vol_p < 15.0 {
+            multiplier *= 1.3;
+            description.push("⏳ 深度收敛");
         }
 
-        // --- 3. 持久化到 Shared Analysis State ---
-        // 统一命名：context:xxx_multiplier
+        // --- C. 合约博弈分析 (利用重构后的 OIData) ---
+        // 直接从 RoleData 中获取已经计算好的语义化 OI 状态
+        if let Some(oi) = &trend_data.oi_data {
+            let mut futures_tags = Vec::new();
+
+            // 直接对状态枚举进行模式匹配，逻辑非常清晰
+            match oi.state {
+                OIPositionState::LongBuildUp => {
+                    multiplier *= 1.2;
+                    futures_tags.push("真钱买入");
+                }
+                OIPositionState::ShortBuildUp => {
+                    multiplier *= 1.2;
+                    futures_tags.push("空头压盘");
+                }
+                OIPositionState::LongUnwinding => {
+                    multiplier *= 0.8;
+                    futures_tags.push("多头踩踏");
+                }
+                OIPositionState::ShortCovering => {
+                    multiplier *= 0.85;
+                    futures_tags.push("空头回补");
+                }
+                OIPositionState::Neutral => {}
+            }
+
+            if !futures_tags.is_empty() {
+                description.push(format!("[博弈: {}]", futures_tags.join(",")));
+            }
+        }
+
+        // --- D. 结果写入 SharedState 供后续 Signal 阶段分析器引用 ---
         shared
             .data
-            .insert("context:trend_multiplier".into(), json!(env_multiplier));
+            .insert("ctx:regime:multiplier".to_string(), json!(multiplier));
         shared
             .data
-            .insert("context:trend_score".into(), json!(score));
+            .insert("ctx:regime:score".to_string(), json!(score));
 
         Ok(AnalysisResult {
-            score, // 环境分
-
+            score,
+            weight_multiplier: multiplier,
             description: description.join(" | "),
             debug_data: json!({
-                "structure": trend_feat.structure.trend_structure,
-                "volatility_p": vol_p,
-                "final_trend_multiplier": env_multiplier
+                "vol_p": vol_p,
+                "final_multiplier": multiplier,
+                "oi_state": trend_data.oi_data.as_ref().map(|d| format!("{:?}", d.state))
             }),
             ..Default::default()
         })

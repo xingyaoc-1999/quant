@@ -40,13 +40,13 @@ async fn main() -> Result<()> {
     let proxy_pool = Arc::new(setup_proxy_pool(&cfg.proxy));
     let ctx_manager = Arc::new(FeatureContextManager::new(&symbols));
 
-    let archive_provider = ArchiveProvider::new(proxy_pool.clone());
+    let archive_provider = Arc::new(ArchiveProvider::new(proxy_pool.clone()));
     let integrity_manager = Arc::new(DataIntegrityManager::new(
         symbols.clone(),
         ctx_manager.clone(),
         proxy_pool.clone(),
         storage.clone(),
-        archive_provider,
+        archive_provider.clone(),
     ));
 
     let (tx_to_tg, rx_out) = tokio::sync::mpsc::channel(100);

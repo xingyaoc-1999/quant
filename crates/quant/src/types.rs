@@ -14,9 +14,10 @@ pub enum TrendStructure {
     StrongBearish, // 价格 < MA20 < MA50 < MA200 (完全空头排列)
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
+    #[default]
     Long,
     Short,
 }
@@ -100,6 +101,7 @@ pub struct PriceAction {
     pub volume: f64,
     #[schemars(description = "波动率百分位 (基于BB Width历史窗口)")]
     pub volatility_percentile: f64,
+    pub price_change: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
@@ -328,17 +330,61 @@ pub struct InvalidationRules {
     pub structure_stop_price: Option<f64>,
     pub additional_rules: String,
 }
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, JsonSchema)]
+pub enum RiskLevel {
+    /// 1. 深度冷缩 (Deep Coiling)
+    /// 特征：OI处于24h低位，波动率极低。
+    /// 含义：暴风雨前的宁静，适合布局长线波段。
+    DeepCoiling,
 
+    Healthy,
+
+    LeveledUp,
+
+    /// 4. 极端拥挤 (Extreme Overheat)
+    /// 特征：OI 处于 95% 以上分位，费率激增（如 >0.03%）。
+    /// 含义：多杀多/空杀空的火药桶，波段交易必须止盈或大幅减仓。
+    ExtremeOverheat,
+
+    /// 5. 恐慌清算 (Panic Liquidation)
+    /// 特征：OI 剧烈下降（5m 跌幅 > 3%），价格巨震。
+    /// 含义：正在发生大规模爆仓，禁止入场，等待尘埃落定。
+    PanicLiquidation,
+}
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
+pub enum LSRatioStatus {
+    RetailCrowded,     // 散户过度拥挤 (散户多空比 > 2.0)
+    WhaleAccumulating, // 大户悄悄建仓 (大户比例持续上升)
+    Diverging,         // 严重背离 (大户和散户反着走)
+    Neutral,
+}
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct FuturesGameTheory {
-    /// 持仓量(OI)与价格关联描述：是增仓拉升还是空头平仓？
-    pub oi_dynamics: String,
-    /// 爆仓分布墙：识别可能吸附价格或造成阻力的清算区
+    pub money_flow: MoneyFlowStatus,
+    pub taker_aggression: f64, // 主动买卖比 (1.0 为中性)
+
+    // 2. 筹码博弈 (基于 L/S Ratio)
+    pub sentiment_divergence: f64, // 大户 vs 散户背离度
+    pub ls_status: LSRatioStatus,
+
+    // 3. 风险与压力 (基于 Funding/OI Percentile)
+    pub leverage_risk: RiskLevel,
+    pub funding_bias: f64, // 费率偏离度
+
+    // 4. 空间阻力 (基于 Liquidation)
     pub liquidation_zones: Vec<LiquidationZone>,
-    pub funding_bias: String, // e.g., "Neutral", "Extreme Positive"
+    pub liq_intensity: f64, // 爆仓强度 (识别是否发生踩踏)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
+pub enum MoneyFlowStatus {
+    HeavyAccumulation, // 强力吸筹 (Price ↓/横, OI ↑↑)
+    ShortSqueeze,      // 空头踩踏 (Price ↑, OI ↓↓)
+    LongUnwinding,     // 多头平仓 (Price ↓, OI ↓)
+    SpeculativeDrive,  // 投机驱动 (Price ↑, OI ↑)
+    Neutral,
+}
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema, Default)]
 pub struct LiquidationZone {
     pub direction: Direction,
     pub price_level: f64,
@@ -405,4 +451,21 @@ pub enum TradeOutcome {
     Win,
     Loss,
     Even,
+}
+#[derive(Debug, Clone, Default)]
+pub struct DerivativeSnapshot {
+    // --- 基础持仓 (Open Interest) ---
+    pub oi_base: f64,  // 原始持仓数量 (sumOpenInterest)
+    pub oi_value: f64, // 持仓总价值 (sumOpenInterestValue)
+    // --- 筹码质量 (Top Trader Ratio) ---
+    pub top_ls_ratio: f64,       // 大户账户多空比 (Top Trader Long/Short Ratio)
+    pub top_position_ratio: f64, // 大户持仓多空比 (Top Trader Position Ratio)
+
+    // --- 环境与成本 (Funding & Liq) ---
+    pub funding_rate: f64, // 当前资金费率
+    pub liq_buy_vol: f64,  // 最近周期的空头爆仓量 (Buy-side Liq)
+    pub liq_sell_vol: f64, // 最近周期的多头爆仓量 (Sell-side Liq)
+    pub liquidation_levels: LiquidationZone,
+
+    pub timestamp: i64, // 数据最后更新的时间戳
 }

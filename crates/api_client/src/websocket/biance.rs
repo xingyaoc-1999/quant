@@ -42,7 +42,6 @@ impl WsProtocol for BinanceKlineProtocol {
             .map(|s| Self::build_stream_name(s, &self.interval))
             .collect();
 
-        // 使用 json! 宏避免了定义 Request 结构体
         let request = json!({
             "method": "SUBSCRIBE",
             "params": params,

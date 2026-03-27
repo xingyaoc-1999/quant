@@ -8,6 +8,7 @@ use futures_util::stream::{self, StreamExt};
 
 use chrono::{DateTime, DurationRound, Utc};
 use common::{config::Appconfig, utils::CooledProxyPool, Candle, Interval, Symbol};
+use quant::types::DerivativeSnapshot;
 use std::{
     collections::HashMap,
     sync::{
@@ -25,7 +26,7 @@ pub struct DataIntegrityManager {
     feature_context: Arc<FeatureContextManager>,
     proxy_pool: Arc<CooledProxyPool>,
     storage: Arc<Storage>,
-    archive_provider: ArchiveProvider,
+    archive_provider: Arc<ArchiveProvider>,
 }
 
 impl DataIntegrityManager {
@@ -34,7 +35,7 @@ impl DataIntegrityManager {
         feature_context: Arc<FeatureContextManager>,
         proxy_pool: Arc<CooledProxyPool>,
         storage: Arc<Storage>,
-        archive_provider: ArchiveProvider,
+        archive_provider: Arc<ArchiveProvider>,
     ) -> Self {
         Self {
             symbols,
@@ -357,10 +358,6 @@ impl DataIntegrityManager {
                     if to_fix.is_empty() {
                         info!("✨ [Checker] Integrity check passed for all symbols.");
 
-                        // for entry in self.feature_context.registry.iter() {
-                        //     let (symbol, ctx) = entry.pair();
-                        //     info!(?ctx);
-                        // }
                         return Ok(());
                     }
 
@@ -406,4 +403,5 @@ impl DataIntegrityManager {
             }
         });
     }
+   
 }

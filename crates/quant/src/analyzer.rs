@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use common::{Interval, Symbol};
+use common::{Candle, Interval, Symbol};
 use core::fmt;
 use dashmap::DashMap;
 use schemars::JsonSchema;
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, str::FromStr};
 
-use crate::types::{CorrelationConflict, FeatureSet, LiquidationZone, LogicComponent};
+use crate::types::{CorrelationConflict, DerivativeSnapshot, FeatureSet, LogicComponent};
 mod audit;
 mod context;
 mod signal;
@@ -56,10 +56,103 @@ impl FromStr for Role {
         }
     }
 }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum OITrend {
+    Increasing, // 持仓累积
+    Decreasing, // 持仓流失
+    Stable,     // 持仓平稳
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum OIPositionState {
+    LongBuildUp,   // 价升量增：多头开仓
+    ShortBuildUp,  // 价跌量增：空头开仓
+    LongUnwinding, // 价跌量减：多头平仓（止损/止盈）
+    ShortCovering, // 价升量减：空头平仓（止损/止盈）
+    Neutral,
+}
+
 #[derive(Debug, Clone)]
 pub struct RoleData {
     pub interval: Interval,
     pub feature_set: FeatureSet,
+    pub taker_flow: TakerFlowData,
+    pub oi_data: Option<OIData>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OIData {
+    pub current_oi: f64,
+    pub oi_ma_fast: Option<f64>, // 比如 MA20
+    pub oi_ma_slow: Option<f64>, // 比如 MA50
+
+    // 相对变化率 (当前值 vs N个周期前)
+    pub change_rate: f64,
+    pub trend: OITrend,
+    pub state: OIPositionState,
+
+    pub oi_strength: f64, // 0.0 到 100.0
+    pub oi_signal: f64,   // -1.0 (极度看空) 到 1.0 (极度看多)
+}
+impl OIData {
+    /// 根据价格变化和OI变化计算市场状态
+    pub fn calculate_state(&mut self, price_change_pct: f64, oi_change_pct: f64) {
+        self.change_rate = oi_change_pct;
+
+        // 1. 确定趋势
+        self.trend = if oi_change_pct > 0.02 {
+            // 阈值可配置
+            OITrend::Increasing
+        } else if oi_change_pct < -0.02 {
+            OITrend::Decreasing
+        } else {
+            OITrend::Stable
+        };
+
+        // 2. 确定博弈状态 (经典四象限)
+        self.state = match (price_change_pct > 0.0, oi_change_pct > 0.0) {
+            (true, true) => OIPositionState::LongBuildUp, // 强势看涨
+            (false, true) => OIPositionState::ShortBuildUp, // 强势看跌
+            (false, false) => OIPositionState::LongUnwinding, // 弱势回调
+            (true, false) => OIPositionState::ShortCovering, // 空头回补
+        };
+
+        // 3. 计算信号得分 (简易示例)
+        self.oi_signal = match self.state {
+            OIPositionState::LongBuildUp => 1.0,
+            OIPositionState::ShortCovering => 0.5,
+            OIPositionState::LongUnwinding => -0.5,
+            OIPositionState::ShortBuildUp => -1.0,
+            OIPositionState::Neutral => 0.0,
+        };
+    }
+}
+#[derive(Debug, Clone, Default)]
+pub struct TakerFlowData {
+    pub buy_vol: f64,        // 该角色周期内的主动买入量
+    pub sell_vol: f64,       // 该角色周期内的主动卖出量
+    pub net_vol: f64,        // 净主动量
+    pub buy_sell_ratio: f64, // 主动买卖比
+}
+impl TakerFlowData {
+    pub fn from_candle(candle: &Candle) -> Self {
+        let buy_vol = candle.taker_buy_volume;
+        let sell_vol = candle.volume - candle.taker_buy_volume;
+        let net_vol = buy_vol - sell_vol;
+
+        let buy_sell_ratio = match (buy_vol, sell_vol) {
+            (_, 0.0) if buy_vol > 0.0 => f64::INFINITY,
+            (0.0, 0.0) => 0.0,
+            (_, 0.0) => 0.0,
+            _ => buy_vol / sell_vol,
+        };
+
+        Self {
+            buy_vol,
+            sell_vol,
+            net_vol,
+            buy_sell_ratio,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -68,9 +161,8 @@ pub struct MarketContext {
     pub timestamp: DateTime<Utc>,
     pub roles: HashMap<Role, RoleData>,
     pub current_price: f64,
-    pub open_interest: Option<f64>,
-    pub funding_rate: Option<f64>,
-    pub liquidation_levels: Vec<LiquidationZone>,
+
+    pub global: DerivativeSnapshot,
 }
 
 impl MarketContext {
@@ -80,9 +172,7 @@ impl MarketContext {
             timestamp,
             current_price: price,
             roles: HashMap::new(),
-            open_interest: None,
-            funding_rate: None,
-            liquidation_levels: Vec::new(),
+            global: DerivativeSnapshot::default(),
         }
     }
     pub fn get_role(&self, role: Role) -> &RoleData {
@@ -92,15 +182,6 @@ impl MarketContext {
     }
     pub fn with_role(mut self, role: Role, data: RoleData) -> Self {
         self.roles.insert(role, data);
-        self
-    }
-
-    pub fn is_futures(&self) -> bool {
-        self.open_interest.is_some() || self.funding_rate.is_some()
-    }
-    pub fn with_futures_data(mut self, oi: Option<f64>, funding: Option<f64>) -> Self {
-        self.open_interest = oi;
-        self.funding_rate = funding;
         self
     }
 }
@@ -114,6 +195,7 @@ pub enum AnalyzerKind {
     SupportResistance,
     Volatility,
     MarketRegime,
+    FuturesGameTheory,
 }
 
 /// 全局配置

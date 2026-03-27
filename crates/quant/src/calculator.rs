@@ -97,6 +97,7 @@ pub struct FeatureCalculator {
 
     // 2. 计数与状态
     count: usize,
+    prev_close: Option<f64>,
     ma20_slope_bars: i32,
     prev_macd: Option<f64>,
     prev_signal: Option<f64>,
@@ -139,6 +140,7 @@ impl FeatureCalculator {
             sum_y_sq: 0.0,
             sum_xy: 0.0,
             count: 0,
+            prev_close: None,
             ma20_slope_bars: 0,
             prev_macd: None,
             prev_signal: None,
@@ -172,7 +174,15 @@ impl FeatureCalculator {
         global_close: Option<f64>,
     ) -> FeatureSet {
         self.count += 1;
-
+        let price_change = if let Some(pc) = self.prev_close {
+            if pc.abs() > f64::EPSILON {
+                (candle.close - pc) / pc
+            } else {
+                0.0
+            }
+        } else {
+            0.0 // 第一根 K 线变化率为 0
+        };
         // 1. 计算所有底层指标
         let rsi_v = self.rsi.next(candle.close);
         let m20_v = self.ma20.next(candle.close);
@@ -275,6 +285,7 @@ impl FeatureCalculator {
                 close: candle.close,
                 volume: candle.volume,
                 volatility_percentile: vol_p,
+                price_change,
             },
             indicators: TechnicalIndicators {
                 rsi_14: (self.count >= 14).then_some(rsi_v),
@@ -524,7 +535,7 @@ impl FeatureCalculator {
     }
 
     pub fn peek(
-        &mut self,
+        &self,
         acc_candle: &Candle,
         interval: Interval,
         g_close: Option<f64>,

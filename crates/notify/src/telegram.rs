@@ -275,7 +275,7 @@ impl BotApp {
                                 seeds_map.insert(target_interval, seeds_res);
                                 seeds_map.insert(Interval::M1, m1_res.clone());
 
-                                m_clone.warmup_single_symbol(symbol_clone, &seeds_map, &m1_res);
+                                m_clone.warmup_single_symbol(symbol_clone, &seeds_map);
 
                                 info!(
                                     "✅ [Warmup] Success: {}'s {} updated",

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use common::utils::{retry_with_proxy_rotation_cooled, CooledProxyPool, ShouldRotate};
-use common::{Candle, ContractMetrics, Symbol};
+use common::{Candle, OpenInterestData, Symbol, TakerBuySellData, TopTraderRatioData};
 use serde::Deserialize;
 
 use std::io::{Cursor, Read};
@@ -21,18 +21,104 @@ impl ArchiveProvider {
         }
     }
 
-    // pub async fn fetch_contract_metrics(&self, symbol: Symbol) -> Result<ContractMetrics> {
-    //     let pool = self.proxy_pool.clone();
-    //     let factory = self.factory.clone();
-    //     let sym_str = symbol.to_string();
-    //
-    //     // 1. 获取持仓量 (Open Interest)
-    //     let oi_url = format!(
-    //         "https://fapi.binance.com/fapi/v1/openInterest?symbol={}",
-    //         sym_str
-    //     );
-    // }
+    pub async fn fetch_open_interest(&self, symbol: &Symbol) -> Result<OpenInterestData> {
+        let pool = self.proxy_pool.clone();
+        let factory = self.factory.clone();
+        let url = format!(
+            "https://fapi.binance.com/fapi/v1/openInterest?symbol={}",
+            symbol
+        );
 
+        let result = retry_with_proxy_rotation_cooled(
+            &pool,
+            move |proxy| {
+                let factory = factory.clone();
+                let url = url.clone();
+                async move {
+                    let client = factory.get_client(proxy).await?;
+                    let data = client
+                        .get(&url)
+                        .send()
+                        .await?
+                        .json()
+                        .await
+                        .map_err(|e| RequestError::Other(e.to_string()))?;
+
+                    Ok(data)
+                }
+            },
+            BinanceRotator,
+        )
+        .await;
+
+        result.map_err(|e| anyhow::anyhow!("OI fetch failed: {}", e))
+    }
+
+    pub async fn fetch_top_trader_ratio(&self, symbol: Symbol) -> Result<TopTraderRatioData> {
+        let pool = self.proxy_pool.clone();
+        let factory = self.factory.clone();
+        let url = format!("https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={}&period=5m&limit=1", symbol);
+
+        retry_with_proxy_rotation_cooled(
+            &pool,
+            move |proxy| {
+                let factory = factory.clone();
+                let url = url.clone();
+                async move {
+                    let client = factory.get_client(proxy).await?;
+                    let data: Vec<TopTraderRatioData> = client
+                        .get(&url)
+                        .send()
+                        .await?
+                        .json()
+                        .await
+                        .map_err(|e| RequestError::Other(e.to_string()))?;
+                    data.first()
+                        .cloned()
+                        .ok_or(RequestError::Other("Empty TopTrader Data".into()))
+                }
+            },
+            BinanceRotator,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("TopTrader Error: {}", e))
+    }
+    pub async fn fetch_taker_buy_sell_ratio(&self, symbol: Symbol) -> Result<TakerBuySellData> {
+        let pool = self.proxy_pool.clone();
+        let factory = self.factory.clone();
+
+        let url = format!(
+            "https://fapi.binance.com/futures/data/takerbuySellVol?symbol={}&period=5m&limit=1",
+            symbol
+        );
+
+        let result = retry_with_proxy_rotation_cooled(
+            &pool,
+            move |proxy| {
+                let factory = factory.clone();
+                let url = url.clone();
+                async move {
+                    let client = factory.get_client(proxy).await?;
+                    let data_vec: Vec<TakerBuySellData> = client
+                        .get(&url)
+                        .send()
+                        .await?
+                        .json()
+                        .await
+                        .map_err(|e| RequestError::Other(e.to_string()))?;
+
+                    data_vec
+                        .first()
+                        .cloned()
+                        .ok_or(RequestError::Other("No taker data returned".into()))
+                }
+            },
+            BinanceRotator,
+        )
+        .await;
+
+        result.map_err(|e| anyhow::anyhow!("Taker Ratio fetch failed: {}", e))
+    }
     pub async fn fetch_recent_ohlcv(
         &self,
         symbol: Symbol,
@@ -141,12 +227,4 @@ impl ShouldRotate<RequestError> for BinanceRotator {
             _ => false,
         }
     }
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct OpenInterest {
-    symbol: String,
-    open_interest: String,
-    time: i64,
 }

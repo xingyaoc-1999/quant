@@ -1,19 +1,21 @@
-use chrono::Utc;
 use common::{
     config::{Appconfig, RoleConfig},
     Candle, Interval, Symbol,
 };
 use dashmap::DashMap;
 use quant::{
-    analyzer::{MarketContext, Role, RoleData},
+    analyzer::{MarketContext, Role, RoleData, TakerFlowData},
     calculator::FeatureCalculator,
+    types::DerivativeSnapshot,
 };
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    RwLock,
 };
+
+
 
 pub struct RoleProcessor {
     pub interval: Interval,
@@ -32,6 +34,25 @@ impl RoleProcessor {
         }
     }
 
+    pub fn current_taker_flow(&self) -> TakerFlowData {
+        if let Some(acc) = &self.current_acc {
+            TakerFlowData::from_candle(acc)
+        } else {
+            TakerFlowData::default()
+        }
+    }
+
+    pub fn current_role_data(&self, g_close: Option<f64>) -> Option<RoleData> {
+        let acc = self.current_acc.as_ref()?;
+        let feature_set = self.calculator.peek(acc, self.interval, g_close);
+        let taker_flow = TakerFlowData::from_candle(acc);
+        Some(RoleData {
+            interval: self.interval,
+            feature_set,
+            taker_flow,
+        })
+    }
+
     pub fn sync_historical_anchor(&mut self, candle: &Candle) {
         self.last_processed_ts = candle.timestamp;
         self.current_acc = Some(candle.clone());
@@ -43,63 +64,59 @@ impl RoleProcessor {
             return None;
         }
 
-        let m1_ts = m1.timestamp;
-        if let Some(acc) = self.current_acc.as_mut() {
-            let current_bucket_idx = m1_ts / interval_ms;
-            let acc_bucket_idx = acc.timestamp / interval_ms;
+        let acc = self.current_acc.get_or_insert_with(|| Candle {
+            timestamp: (m1.timestamp / interval_ms) * interval_ms,
+            ..m1.clone()
+        });
 
-            if current_bucket_idx > acc_bucket_idx {
-                let closed_bar = self.current_acc.take().unwrap();
-                self.current_acc = Some(self.init_acc(m1));
-                return Some(closed_bar);
-            }
+        let current_bucket = m1.timestamp / interval_ms;
+        let acc_bucket = acc.timestamp / interval_ms;
 
-            acc.high = acc.high.max(m1.high);
-            acc.low = acc.low.min(m1.low);
-            acc.close = m1.close;
-            acc.volume += m1.volume;
-            acc.quote_volume += m1.quote_volume;
-            acc.trade_count += m1.trade_count;
-
-            None
-        } else {
-            self.current_acc = Some(self.init_acc(m1));
-            None
+        if current_bucket > acc_bucket {
+            return self.current_acc.replace(Candle {
+                timestamp: (m1.timestamp / interval_ms) * interval_ms,
+                ..m1.clone()
+            });
         }
-    }
 
-    pub fn init_acc(&self, m1: &Candle) -> Candle {
-        let interval_ms = self.interval.to_millis();
-        let aligned_ts = (m1.timestamp / interval_ms) * interval_ms;
+        acc.high = acc.high.max(m1.high);
+        acc.low = acc.low.min(m1.low);
+        acc.close = m1.close;
+        acc.volume += m1.volume;
+        acc.quote_volume += m1.quote_volume;
+        acc.trade_count += m1.trade_count;
 
-        let mut acc = m1.clone();
-        acc.timestamp = aligned_ts;
-        acc
+        None
     }
 }
 
+// ==================== 符号上下文 ====================
+
 pub struct SymbolContext {
-    pub roles: HashMap<Role, RoleProcessor>,
+    // 增加内部读写锁，使高频获取只需 DashMap 的读锁
+    pub roles: RwLock<HashMap<Role, RoleProcessor>>,
+    pub latest_snap: RwLock<DerivativeSnapshot>,
 }
 
 impl SymbolContext {
     pub fn new(config: RoleConfig) -> Self {
-        let roles: HashMap<Role, RoleProcessor> = [
-            (Role::Trend, config.trend),
-            (Role::Filter, config.filter),
-            (Role::Entry, config.entry),
-        ]
-        .iter()
-        .map(|(role, interval)| (*role, RoleProcessor::new(*interval)))
-        .collect();
-
-        Self { roles }
+        Self {
+            roles: RwLock::new(HashMap::from([
+                (Role::Trend, RoleProcessor::new(config.trend)),
+                (Role::Filter, RoleProcessor::new(config.filter)),
+                (Role::Entry, RoleProcessor::new(config.entry)),
+            ])),
+            latest_snap: RwLock::new(DerivativeSnapshot::default()),
+        }
     }
 }
 
+// ==================== 全局特征上下文管理器 ====================
+
 pub struct FeatureContextManager {
-    pub registry: Arc<DashMap<Symbol, MarketContext>>,
-    pub symbol_contexts: Arc<DashMap<Symbol, SymbolContext>>,
+    // 移除冗余的 Arc（如果外层本身会共享该 Manager）
+    pub registry: DashMap<Symbol, MarketContext>,
+    pub symbol_contexts: DashMap<Symbol, SymbolContext>,
     pub global_btc_price: AtomicU64,
 }
 
@@ -108,13 +125,13 @@ impl FeatureContextManager {
         let symbol_contexts = DashMap::new();
         let cfg = Appconfig::global();
 
-        for symbol in symbols {
-            symbol_contexts.insert(*symbol, SymbolContext::new(cfg.role));
+        for &symbol in symbols {
+            symbol_contexts.insert(symbol, SymbolContext::new(cfg.role));
         }
 
         Self {
-            registry: Arc::new(DashMap::new()),
-            symbol_contexts: Arc::new(symbol_contexts),
+            registry: DashMap::new(),
+            symbol_contexts,
             global_btc_price: AtomicU64::new(f64::NAN.to_bits()),
         }
     }
@@ -125,73 +142,146 @@ impl FeatureContextManager {
         (!val.is_nan()).then_some(val)
     }
 
+    pub fn update_realtime_m1(&self, candle: Candle) {
+        let symbol = candle.symbol;
+
+        if symbol.is_btc() {
+            self.global_btc_price
+                .store(candle.close.to_bits(), Ordering::Relaxed);
+        }
+        let g_close = self.get_global_btc();
+
+        // 优化点 1: 改为只读获取，避免分片级别的锁阻塞
+        let symbol_ctx = match self.symbol_contexts.get(&symbol) {
+            Some(ctx) => ctx,
+            None => return,
+        };
+
+        // 2. 更新各角色的特征
+        let mut roles_guard = symbol_ctx.roles.write().expect("Lock poisoned");
+        // 预分配内存避免动态扩容
+        let mut role_updates = Vec::with_capacity(roles_guard.len());
+
+        for (role, proc) in roles_guard.iter_mut() {
+            if let Some(closed_bar) = proc.process_m1(&candle) {
+                if closed_bar.timestamp > proc.last_processed_ts {
+                    proc.last_processed_ts = closed_bar.timestamp;
+                    let feature_set = proc.calculator.next(&closed_bar, proc.interval, g_close);
+                    let taker_flow = TakerFlowData::from_candle(&closed_bar);
+                    role_updates.push((
+                        *role,
+                        RoleData {
+                            interval: proc.interval,
+                            feature_set,
+                            taker_flow,
+                        },
+                    ));
+                }
+            } else if let Some(role_data) = proc.current_role_data(g_close) {
+                role_updates.push((*role, role_data));
+            }
+        }
+        drop(roles_guard); // 尽早释放锁
+
+        // 3. 将更新写入 registry
+        if !role_updates.is_empty() {
+            let mut ctx = self.registry.entry(symbol).or_default();
+            ctx.current_price = candle.close;
+            ctx.timestamp = chrono::Utc::now();
+
+            ctx.roles.extend(role_updates);
+        }
+    }
+
+    pub fn update_derivative_snap(&self, symbol: &Symbol, snap: DerivativeSnapshot) {
+        if let Some(ctx) = self.symbol_contexts.get(symbol) {
+            let mut writer = ctx.latest_snap.write().expect("Lock poisoned");
+            *writer = snap;
+        }
+    }
+
     pub fn warmup_single_symbol(
         &self,
         symbol: Symbol,
-        seeds_map: &HashMap<Interval, Vec<Candle>>,
-        m1_candles: &[Candle],
+        interval_data_map: &HashMap<Interval, Vec<Candle>>,
     ) {
         let g_close = self.get_global_btc();
-        let mut latest_updates = Vec::new();
 
-        if let Some(mut symbol_ctx) = self.symbol_contexts.get_mut(&symbol) {
-            for (role, proc) in symbol_ctx.roles.iter_mut() {
-                let mut last_feat = None;
-                let mut seed_end_ts = 0;
+        let m1_candles = interval_data_map
+            .get(&Interval::M1)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
 
-                if let Some(seeds) = seeds_map.get(&proc.interval) {
-                    for candle in seeds {
-                        last_feat = Some(proc.calculator.next(candle, proc.interval, g_close));
-                        seed_end_ts = candle.timestamp;
-                    }
+        // 只读获取 Context
+        let symbol_ctx = match self.symbol_contexts.get(&symbol) {
+            Some(ctx) => ctx,
+            None => return,
+        };
 
-                    if let Some(last_seed) = seeds.last() {
-                        proc.sync_historical_anchor(last_seed);
-                    }
+        // 初始化各角色的特征
+        let mut latest_role_results = HashMap::new();
+        let mut roles_guard = symbol_ctx.roles.write().expect("Lock poisoned");
+
+        for (role, proc) in roles_guard.iter_mut() {
+            let mut last_feat = None;
+            let mut seed_last_ts = 0;
+
+            if let Some(seeds) = interval_data_map.get(&proc.interval) {
+                for candle in seeds {
+                    last_feat = Some(proc.calculator.next(candle, proc.interval, g_close));
                 }
+                if let Some(last_seed) = seeds.last() {
+                    proc.sync_historical_anchor(last_seed);
+                    seed_last_ts = last_seed.timestamp;
+                }
+            }
 
-                for candle in m1_candles {
-                    if candle.timestamp > seed_end_ts {
-                        if let Some(closed_bar) = proc.process_m1(candle) {
+            for m1 in m1_candles {
+                if m1.timestamp > seed_last_ts {
+                    if let Some(closed_bar) = proc.process_m1(m1) {
+                        if closed_bar.timestamp > proc.last_processed_ts {
                             last_feat =
                                 Some(proc.calculator.next(&closed_bar, proc.interval, g_close));
                             proc.last_processed_ts = closed_bar.timestamp;
                         }
                     }
                 }
+            }
 
-                if let Some(acc) = proc.current_acc.as_ref() {
-                    last_feat = Some(proc.calculator.peek(acc, proc.interval, g_close));
-                }
+            if let Some(acc) = proc.current_acc.as_ref() {
+                last_feat = Some(proc.calculator.peek(acc, proc.interval, g_close));
+            }
 
-                if let Some(feat) = last_feat {
-                    latest_updates.push((
-                        *role,
-                        RoleData {
-                            interval: proc.interval,
-                            feature_set: feat,
-                        },
-                    ));
-                }
+            if let Some(feat) = last_feat {
+                latest_role_results.insert(
+                    *role,
+                    RoleData {
+                        interval: proc.interval,
+                        feature_set: feat,
+                        taker_flow: proc.current_taker_flow(),
+                    },
+                );
             }
         }
+        drop(roles_guard);
 
-        if !latest_updates.is_empty() {
-            let mut registry_entry = self.registry.entry(symbol).or_default();
-            let ctx = registry_entry.value_mut();
+        if !latest_role_results.is_empty() {
+            let current_price = m1_candles.last().map(|c| c.close).unwrap_or(0.0);
 
-            ctx.symbol = symbol;
+            let mut ctx = self.registry.entry(symbol).or_default();
+            ctx.current_price = current_price;
+            ctx.timestamp = chrono::Utc::now();
 
-            if let Some(last_m1) = m1_candles.last() {
-                ctx.current_price = last_m1.close;
-            }
-
-            ctx.timestamp = Utc::now();
-
-            for (role, data) in latest_updates {
-                ctx.roles.insert(role, data);
-            }
+            ctx.roles.extend(latest_role_results);
         }
+    }
+
+    pub fn warmup_symbols(&self, history_map: HashMap<Symbol, HashMap<Interval, Vec<Candle>>>) {
+        history_map
+            .into_par_iter()
+            .for_each(|(symbol, interval_data)| {
+                self.warmup_single_symbol(symbol, &interval_data);
+            });
     }
 
     pub fn update_symbol_config(
@@ -200,172 +290,18 @@ impl FeatureContextManager {
         config: HashMap<Role, Interval>,
     ) -> Vec<(Role, Interval)> {
         let mut updated_roles = Vec::new();
-
-        self.symbol_contexts.entry(symbol).and_modify(|ctx| {
+        if let Some(ctx) = self.symbol_contexts.get(&symbol) {
+            let mut roles_guard = ctx.roles.write().expect("Lock poisoned");
             for (role, new_interval) in config {
-                let is_changed = match ctx.roles.get(&role) {
-                    Some(proc) => proc.interval != new_interval,
-                    None => true,
-                };
-
-                if is_changed {
+                let entry = roles_guard
+                    .entry(role)
+                    .or_insert_with(|| RoleProcessor::new(new_interval));
+                if entry.interval != new_interval {
                     updated_roles.push((role, new_interval));
-                    ctx.roles.insert(role, RoleProcessor::new(new_interval));
+                    *entry = RoleProcessor::new(new_interval);
                 }
             }
-        });
-
+        }
         updated_roles
-    }
-
-    pub fn warmup_symbols(&self, history_map: HashMap<Symbol, HashMap<Interval, Vec<Candle>>>) {
-        let btc_map = history_map
-            .get(&Symbol::BTCUSDT)
-            .and_then(|m| m.get(&Interval::M1))
-            .map(|candles| {
-                candles
-                    .iter()
-                    .map(|c| (c.timestamp, c.close))
-                    .collect::<HashMap<i64, f64>>()
-            })
-            .unwrap_or_default();
-
-        let all_results: Vec<(Symbol, MarketContext)> = history_map
-            .into_par_iter()
-            .filter_map(|(symbol, interval_data_map)| {
-                let mut latest_role_results = HashMap::new();
-
-                if let Some(mut symbol_ctx) = self.symbol_contexts.get_mut(&symbol) {
-                    for (role, proc) in symbol_ctx.roles.iter_mut() {
-                        let mut last_feat = None;
-                        let mut seed_last_ts = 0;
-
-                        // 2. 处理种子数据 (Seeds)
-                        if let Some(seeds) = interval_data_map.get(&proc.interval) {
-                            for candle in seeds {
-                                let sync_btc = btc_map.get(&candle.timestamp).cloned();
-                                last_feat =
-                                    Some(proc.calculator.next(candle, proc.interval, sync_btc));
-                                seed_last_ts = candle.timestamp;
-                            }
-                            if let Some(last_seed) = seeds.last() {
-                                proc.sync_historical_anchor(last_seed);
-                            }
-                        }
-
-                        if let Some(m1_history) = interval_data_map.get(&Interval::M1) {
-                            for m1 in m1_history {
-                                if m1.timestamp > seed_last_ts {
-                                    if let Some(closed_bar) = proc.process_m1(m1) {
-                                        // ⭐ 修正：闭合时，使用闭合 K 线的时间戳匹配 BTC
-                                        let sync_btc = btc_map.get(&closed_bar.timestamp).cloned();
-                                        last_feat = Some(proc.calculator.next(
-                                            &closed_bar,
-                                            proc.interval,
-                                            sync_btc,
-                                        ));
-                                        proc.last_processed_ts = closed_bar.timestamp;
-                                    }
-                                }
-                            }
-                        }
-
-                        // 4. 处理未闭合的“偷窥”数据 (Peek)
-                        if let Some(acc) = proc.current_acc.as_ref() {
-                            // ⭐ 修正：Peek 时通常使用最新的 BTC 价格
-                            let latest_btc = btc_map.get(&acc.timestamp).cloned();
-                            last_feat = Some(proc.calculator.peek(acc, proc.interval, latest_btc));
-                        }
-
-                        if let Some(feat) = last_feat {
-                            latest_role_results.insert(
-                                *role,
-                                RoleData {
-                                    interval: proc.interval,
-                                    feature_set: feat,
-                                },
-                            );
-                        }
-                    }
-                }
-
-                // ... 后续构建 MarketContext 的逻辑保持不变 ...
-                if !latest_role_results.is_empty() {
-                    let current_price = interval_data_map
-                        .get(&Interval::M1)
-                        .and_then(|m1s| m1s.last())
-                        .map(|c| c.close)
-                        .unwrap_or(0.0);
-
-                    let ctx = MarketContext {
-                        symbol,
-                        current_price,
-                        timestamp: Utc::now(),
-                        roles: latest_role_results,
-                        ..Default::default()
-                    };
-                    Some((symbol, ctx))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for (symbol, ctx) in all_results {
-            self.registry.insert(symbol, ctx);
-        }
-    }
-
-    pub fn update_realtime_m1(&self, candle: Candle) {
-        let symbol = &candle.symbol;
-
-        if symbol.is_btc() {
-            self.global_btc_price
-                .store(candle.close.to_bits(), Ordering::Relaxed);
-        }
-        let g_close = self.get_global_btc();
-        let mut updates = Vec::new();
-
-        if let Some(mut symbol_ctx) = self.symbol_contexts.get_mut(symbol) {
-            for (role, proc) in symbol_ctx.roles.iter_mut() {
-                // ⭐ A分支：K线闭合了，产生永久特征更新
-                if let Some(closed_bar) = proc.process_m1(&candle) {
-                    if closed_bar.timestamp > proc.last_processed_ts {
-                        let feat = proc.calculator.next(&closed_bar, proc.interval, g_close);
-                        proc.last_processed_ts = closed_bar.timestamp;
-
-                        updates.push((
-                            *role,
-                            RoleData {
-                                interval: proc.interval,
-                                feature_set: feat,
-                            },
-                        ));
-                    }
-                } else if let Some(acc) = proc.current_acc.as_ref() {
-                    let feat = proc.calculator.peek(acc, proc.interval, g_close);
-                    updates.push((
-                        *role,
-                        RoleData {
-                            interval: proc.interval,
-                            feature_set: feat,
-                        },
-                    ));
-                }
-            }
-        }
-
-        if !updates.is_empty() {
-            let mut registry_entry = self.registry.entry(*symbol).or_default();
-            let ctx = registry_entry.value_mut();
-
-            ctx.symbol = *symbol;
-            ctx.current_price = candle.close;
-            ctx.timestamp = Utc::now();
-
-            for (role, data) in updates {
-                ctx.roles.insert(role, data);
-            }
-        }
     }
 }
