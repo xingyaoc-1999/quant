@@ -16,7 +16,6 @@ impl Analyzer for StructureDivergenceAnalyzer {
         AnalyzerKind::Divergence
     }
     fn stage(&self) -> AnalyzerStage {
-        // 作为信号验证层，运行在 Resonance 之后
         AnalyzerStage::Signal
     }
 
@@ -29,104 +28,107 @@ impl Analyzer for StructureDivergenceAnalyzer {
         let trend_data = ctx.get_role(Role::Trend);
         let feat = &trend_data.feature_set;
 
-        let mut score = 0.0;
-        let mut description: Vec<Cow<'static, str>> = Vec::new();
-
-        // --- 1. 获取主信号方向 (Direction Locking) ---
-        // 从共享状态中提取由 Resonance 或其他动量分析器存入的方向 (-1.0 到 1.0)
-        let direction = shared
+        // --- 1. 获取上下文 ---
+        let regime = shared
             .data
-            .get("signal:direction")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+            .get("ctx:regime:structure")
+            .map(|v| v.to_string())
+            .unwrap_or("Range".to_string());
 
-        // 如果没有明确的交易意向，防守型分析器直接休眠，节省计算资源
-        if direction == 0.0 {
+        // 获取当前信号方向 (Signal 阶段特有)
+        let action = shared
+            .data
+            .get("signal:action")
+            .map(|v| v.to_string())
+            .unwrap_or("NONE".to_string());
+
+        if action == "NONE" {
             return Ok(AnalysisResult::default());
         }
 
-        let is_long = direction > 0.0;
+        let is_long = action == "BUY";
+        let mut score = 0.0;
+        let mut m_divergence: f64 = 1.0; // 引入维度乘数：背离验证
+        let mut m_mtf: f64 = 1.0; // 引入维度乘数：多周期对齐
+        let mut description: Vec<Cow<'static, str>> = Vec::new();
 
-        // --- 2. 动能背离验证 (Divergence Check) ---
+        // --- 2. 背离验证 (Divergence Validation) ---
         if let Some(div) = &feat.signals.macd_divergence {
-            match div {
-                DivergenceType::Bearish => {
-                    if is_long {
-                        // 准备做多，但出现顶背离 -> 致命危险，强烈扣分 (负分抵消多头)
-                        score -= 45.0;
-                        description.push(Cow::Borrowed("MACD_BEAR_DIV:EXHAUSTION_RISK"));
-                    } else {
-                        // 准备做空，且出现顶背离 -> 顺势确认，给予奖励 (负分增强空头)
-                        score -= 15.0;
-                        description.push(Cow::Borrowed("MACD_BEAR_DIV:CONFIRM_SHORT"));
-                    }
-                }
-                DivergenceType::Bullish => {
-                    if !is_long {
-                        // 准备做空，但出现底背离 -> 致命危险，强烈扣分 (正分抵消空头)
-                        score += 45.0;
-                        description.push(Cow::Borrowed("MACD_BULL_DIV:REVERSAL_RISK"));
-                    } else {
-                        // 准备做多，且出现底背离 -> 顺势确认，给予奖励 (正分增强多头)
-                        score += 15.0;
-                        description.push(Cow::Borrowed("MACD_BULL_DIV:CONFIRM_LONG"));
-                    }
-                }
-            }
-        }
-
-        // --- 3. 支撑与阻力空间验证 (S/R Space) ---
-        // 核心逻辑：买在阻力位下方和卖在支撑位上方是交易大忌
-        if is_long {
-            if let Some(dist_r) = feat.space.dist_to_resistance {
-                if dist_r < 0.008 {
-                    // 距离阻力位不到 0.8%，盈亏比极差 -> 强力踩刹车
+            match (div, is_long) {
+                // 顶背离 (Bearish Div)
+                (DivergenceType::Bearish, true) => {
+                    // 做多遇到顶背离：严重惩罚
+                    m_divergence = if regime == "Range" { 0.3 } else { 0.6 };
                     score -= 30.0;
-                    description.push(Cow::Borrowed("WALL_NEAR:RESISTANCE"));
-                } else if dist_r > 0.03 {
-                    // 上方空间极大 (>3%) -> 增加开仓信心
-                    score += 10.0;
-                    description.push(Cow::Borrowed("SPACE_OPEN:UP"));
+                    description.push(Cow::Borrowed("MACD_BEAR_DIV:LONG_EXHAUSTION"));
                 }
-            }
-        } else {
-            if let Some(dist_s) = feat.space.dist_to_support {
-                if dist_s < 0.008 {
-                    // 距离支撑位不到 0.8%，随时可能被反抽 -> 强力踩刹车 (正分抵消空单)
-                    score += 30.0;
-                    description.push(Cow::Borrowed("WALL_NEAR:SUPPORT"));
-                } else if dist_s > 0.03 {
-                    // 下方深不见底 -> 增加开仓信心
-                    score -= 10.0;
-                    description.push(Cow::Borrowed("SPACE_OPEN:DOWN"));
+                (DivergenceType::Bearish, false) => {
+                    // 做空遇到顶背离：共振奖励
+                    m_divergence = 1.3;
+                    score += 20.0;
+                    description.push(Cow::Borrowed("MACD_BEAR_DIV:SHORT_CONFIRM"));
+                }
+                // 底背离 (Bullish Div)
+                (DivergenceType::Bullish, true) => {
+                    // 做多遇到底背离：共振奖励
+                    m_divergence = 1.3;
+                    score += 20.0;
+                    description.push(Cow::Borrowed("MACD_BULL_DIV:LONG_CONFIRM"));
+                }
+                (DivergenceType::Bullish, false) => {
+                    // 做空遇到底背离：严重惩罚
+                    m_divergence = if regime == "Range" { 0.3 } else { 0.6 };
+                    score -= 30.0;
+                    description.push(Cow::Borrowed("MACD_BULL_DIV:SHORT_EXHAUSTION"));
                 }
             }
         }
 
-        // --- 4. 多周期对齐验证 (MTF Alignment) ---
+        // --- 3. MTF 校验 (MTF Dimension) ---
         if let Some(aligned) = feat.structure.mtf_aligned {
-            let sign = direction.signum(); // 1.0 或 -1.0
             if aligned {
-                // 顺着大级别趋势走，给予奖励
-                score += 10.0 * sign;
+                m_mtf = 1.2;
                 description.push(Cow::Borrowed("MTF_ALIGNED"));
             } else {
-                // 逆着大级别趋势（比如 15m 看多但 4h 在 200均线下方），削弱分数
-                score -= 20.0 * sign;
-                description.push(Cow::Borrowed("MTF_CONFLICT:COUNTER_TREND"));
+                // 强趋势下的逆势惩罚更重
+                m_mtf = if regime.contains("Strong") { 0.4 } else { 0.7 };
+                description.push(Cow::Borrowed("MTF_CONFLICT:ANTI_TREND"));
             }
         }
 
-        // --- 5. 组装结果 ---
+        // --- 4. 空间截断 (Final Safety Gate) ---
+        let dist_to_barrier = if is_long {
+            feat.space.dist_to_resistance.unwrap_or(1.0)
+        } else {
+            feat.space.dist_to_support.unwrap_or(1.0)
+        };
+
+        if dist_to_barrier < 0.002 {
+            // 距离最近障碍不足 0.2%：直接将该交易降权到几乎不可执行
+            m_divergence *= 0.2;
+            description.push(Cow::Borrowed("SAFETY:NO_RUNWAY_KILL_SWITCH"));
+        }
+
+        // --- 5. 持久化到维度矩阵 ---
+        // 注意：这是 Signal 阶段的校验维度
+        shared.data.insert(
+            format!("multiplier:signal_check:{}_div", action.to_lowercase()),
+            json!(m_divergence),
+        );
+        shared.data.insert(
+            format!("multiplier:signal_check:{}_mtf", action.to_lowercase()),
+            json!(m_mtf),
+        );
+
         Ok(AnalysisResult {
-            score,
+            score, // 这里保留 score，因为 Signal 阶段通常需要加分/减分来决定最终等级
+            weight_multiplier: m_divergence * m_mtf,
             description: description.join(" | "),
             debug_data: json!({
-                "macd_div": feat.signals.macd_divergence,
-                "dist_r": feat.space.dist_to_resistance,
-                "dist_s": feat.space.dist_to_support,
-                "mtf_aligned": feat.structure.mtf_aligned,
-                "direction_input": direction
+                "action": action,
+                "m_div": m_divergence,
+                "m_mtf": m_mtf,
+                "dist": dist_to_barrier
             }),
             ..Default::default()
         })

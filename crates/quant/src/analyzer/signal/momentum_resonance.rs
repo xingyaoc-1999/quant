@@ -7,10 +7,7 @@ use common::Interval;
 use serde_json::json;
 use std::borrow::Cow;
 
-/// 动量共振分析器 (V3 增强版)
-/// 核心职责：捕获均线收复/跌破与 MACD 共振，并根据市场空间和相关性进行动态评分缩放
 pub struct ResonanceAnalyzer {
-    /// 默认老化阈值：当趋势持续步数超过此值，分值开始衰减
     default_aging_threshold: i32,
 }
 
@@ -26,11 +23,9 @@ impl Analyzer for ResonanceAnalyzer {
     fn name(&self) -> &'static str {
         "momentum_resonance"
     }
-
     fn stage(&self) -> AnalyzerStage {
         AnalyzerStage::Signal
     }
-
     fn kind(&self) -> AnalyzerKind {
         AnalyzerKind::Momentum
     }
@@ -44,128 +39,105 @@ impl Analyzer for ResonanceAnalyzer {
         let trend_data = ctx.get_role(Role::Trend);
         let feat = &trend_data.feature_set;
 
-        // --- 1. 获取外部环境因子 ---
-        let correlation = feat.structure.correlation_with_global.unwrap_or(0.0);
-        let aging_threshold = match trend_data.interval {
-            Interval::M15 => 24, // 15m 线：约 6 小时后开始老化
-            Interval::H1 => 48,  // 1h 线：约 2 天
-            Interval::D1 => 20,  // 日线：约 1 个月
-            _ => self.default_aging_threshold,
-        };
-
-        let mut abs_score = 0.0; // 存储信号绝对强度
-        let mut description: Vec<Cow<'static, str>> = Vec::new();
-
-        // --- 2. 核心触发逻辑与方向锁定 (Direction) ---
+        // --- 1. 核心信号判定 (Trigger Identification) ---
         let is_reclaim = feat.signals.ma20_reclaim.unwrap_or(false);
         let is_breakdown = feat.signals.ma20_breakdown.unwrap_or(false);
         let macd_cross = feat.signals.macd_cross;
 
+        // 确定基础方向
         let direction = if is_reclaim || macd_cross == Some(MacdCross::Golden) {
-            1.0 // 看多极性
+            1.0 // Long
         } else if is_breakdown || macd_cross == Some(MacdCross::Death) {
-            -1.0 // 看空极性
+            -1.0 // Short
         } else {
-            // 无核心触发信号，直接返回默认值
-            return Ok(AnalysisResult {
-                description: format!("{}: NO_BASE_SIGNAL", self.name()),
-                ..Default::default()
-            });
+            // 无基础触发信号，直接返回
+            return Ok(AnalysisResult::default());
         };
 
-        // --- 3. 基础强度分配 (Base Power) ---
-        if is_reclaim || is_breakdown {
-            abs_score += 45.0; // 均线突破/收复是强信号
-            description.push(if direction > 0.0 {
-                Cow::Borrowed("LONG:MA20_RECLAIM")
-            } else {
-                Cow::Borrowed("SHORT:MA20_BREAKDOWN")
-            });
+        let mut description: Vec<Cow<'static, str>> = Vec::new();
+        let mut m_resonance: f64 = 1.0; // 核心：共振质量乘数
+
+        // --- 2. 基础得分分配 (Base Signal Strength) ---
+        // 价格收复均线 (Reclaim) 的权重通常高于单纯的 MACD 交叉
+        let base_score = if is_reclaim || is_breakdown {
+            description.push(Cow::Borrowed("TRIGGER:MA20_STRUCT_CHANGE"));
+            45.0
         } else {
-            abs_score += 30.0; // 单纯指标金叉/死叉分值稍低
-            description.push(if direction > 0.0 {
-                Cow::Borrowed("LONG:MACD_CROSS")
-            } else {
-                Cow::Borrowed("SHORT:MACD_CROSS")
-            });
-        }
-
-        // --- 4. 动能确认奖励 (Momentum Bonus) ---
-        let mom_confirmed = (direction > 0.0
-            && feat.signals.macd_momentum == Some(MacdMomentum::Increasing))
-            || (direction < 0.0 && feat.signals.macd_momentum == Some(MacdMomentum::Decreasing));
-
-        if mom_confirmed {
-            abs_score += 15.0;
-            description.push(Cow::Borrowed("MOM_CONFIRMED"));
-        }
-
-        // --- 5. 空间压制检查 (Space Filtering) ---
-        let space_dist = if direction > 0.0 {
-            feat.space.dist_to_resistance
-        } else {
-            feat.space.dist_to_support
+            description.push(Cow::Borrowed("TRIGGER:MACD_CROSS"));
+            30.0
         };
 
-        if let Some(dist) = space_dist {
-            if dist < 0.003 {
-                // 距离阻力/支撑不到 0.3%，视为“撞墙”，大幅扣分
-                abs_score -= 30.0;
-                description.push(Cow::Borrowed("SPACE_BLOCKED"));
-            } else if dist > 0.02 {
-                // 空间大于 2%，属于“海阔天空”，额外奖励
-                abs_score += 10.0;
-                description.push(Cow::Borrowed("SPACE_OPEN"));
+        // --- 3. 趋势阶段评估 (Aging & Early Bird Logic) ---
+        let slope_bars = feat.structure.ma20_slope_bars.abs();
+        let aging_threshold = match trend_data.interval {
+            Interval::M15 => 24,
+            Interval::H1 => 48,
+            _ => self.default_aging_threshold,
+        };
+
+        if slope_bars < 12 {
+            // 趋势初期：高爆发潜力
+            m_resonance *= 1.3;
+            description.push(Cow::Borrowed("QUALITY:EARLY_TREND_PREMIUM"));
+        } else if slope_bars > aging_threshold {
+            // 趋势老化：胜率衰减
+            let penalty = 1.0 - ((slope_bars - aging_threshold) as f64 / 30.0).min(0.7);
+            m_resonance *= penalty;
+            description.push(Cow::Owned(format!(
+                "QUALITY:AGING_TREND({:.0}%)",
+                penalty * 100.0
+            )));
+        }
+
+        // --- 4. 动能一致性确认 (Momentum Confirmation) ---
+        if let Some(macd_mom) = feat.signals.macd_momentum {
+            let mom_confirmed = (direction > 0.0 && macd_mom == MacdMomentum::Increasing)
+                || (direction < 0.0 && macd_mom == MacdMomentum::Decreasing);
+
+            if mom_confirmed {
+                m_resonance *= 1.25;
+                description.push(Cow::Borrowed("CONFIRM:MOMENTUM_ALIGNED"));
+            } else {
+                m_resonance *= 0.8;
+                description.push(Cow::Borrowed("WARNING:MOMENTUM_DIVERGENT"));
             }
         }
 
-        // --- 6. 相关性调整 (Alpha/Beta Scaling) ---
-        if correlation > 0.9 {
-            // 与大盘高度同步，属于 Beta 收益，分值打 8 折（追求独立行情）
-            abs_score *= 0.8;
-            description.push(Cow::Borrowed("HIGH_CORR_BETA"));
-        } else if correlation < -0.3 {
-            // 逆势或独立走势，属于高质量 Alpha，分值溢价 20%
-            abs_score *= 1.2;
-            description.push(Cow::Borrowed("INDEPENDENT_ALPHA"));
+        // --- 5. 市场 Beta 相关性过滤 ---
+        if let Some(correlation) = feat.structure.correlation_with_global {
+            if correlation > 0.90 {
+                // 相关性过高说明只是随大盘波动，独立动能不足
+                m_resonance *= 0.75;
+                description.push(Cow::Borrowed("BETA:HIGH_MARKET_CORR"));
+            }
         }
 
-        // --- 7. 趋势老化惩罚与早鸟奖励 (Aging Logic) ---
-        let slope_bars = feat.structure.ma20_slope_bars.abs();
-        if slope_bars > aging_threshold {
-            // 趋势太老，容易发生均线回归，根据超时比例扣分
-            let penalty_ratio = ((slope_bars - aging_threshold) as f64 / 20.0).min(1.0);
-            abs_score -= 25.0 * penalty_ratio;
-            description.push(Cow::Owned(format!(
-                "TREND_AGING(-{:.0}%)",
-                penalty_ratio * 100.0
-            )));
-        } else if slope_bars > 0 && slope_bars < 8 {
-            // 趋势刚启动不久，属于早鸟阶段，额外奖励
-            abs_score += 10.0;
-            description.push(Cow::Borrowed("EARLY_BONUS"));
-        }
+        // --- 6. 持久化核心 Action 和 维度乘数 ---
+        let action_str = if direction > 0.0 { "BUY" } else { "SELL" };
 
-        // --- 8. 最终安全性加固 ---
-        // 确保各种惩罚不会让 abs_score 变成负数（防止多头信号变成空头信号）
-        let final_strength = abs_score.max(0.0);
-
-        // 将信号方向写入共享状态，供后续模块（如审计或下单）使用
+        // 关键：写入全局 Action，供后续 DivergenceAnalyzer 等读取
         shared
             .data
-            .insert("signal:direction".into(), json!(direction));
+            .insert("signal:action".into(), json!(action_str));
 
+        // 关键：写入维度乘数 (使用 resonance_{action} 细分)
+        shared.data.insert(
+            format!("multiplier:signal:resonance_{}", action_str.to_lowercase()),
+            json!(m_resonance),
+        );
+
+        // --- 7. 返回结果 ---
         Ok(AnalysisResult {
-            // 最终分数 = 强度 * 方向
-            score: final_strength * direction,
+            // Score 代表信号原始冲力
+            score: base_score * direction,
+            // Multiplier 代表该信号的置信度/质量
+            weight_multiplier: m_resonance,
             description: description.join(" | "),
             debug_data: json!({
-                "raw_abs_strength": abs_score,
-                "final_abs_strength": final_strength,
-                "direction": direction,
-                "correlation": correlation,
+                "direction": action_str,
+                "m_resonance": m_resonance,
                 "slope_bars": slope_bars,
-                "space_dist": space_dist,
+                "base_score": base_score
             }),
             ..Default::default()
         })

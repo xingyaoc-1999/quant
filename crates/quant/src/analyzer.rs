@@ -1,3 +1,4 @@
+use crate::types::{CorrelationConflict, DerivativeSnapshot, FeatureSet, LogicComponent};
 use chrono::{DateTime, Utc};
 use common::{Candle, Interval, Symbol};
 use core::fmt;
@@ -6,8 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, str::FromStr};
-
-use crate::types::{CorrelationConflict, DerivativeSnapshot, FeatureSet, LogicComponent};
+use tracing::info;
 mod audit;
 mod context;
 mod signal;
@@ -63,6 +63,18 @@ pub enum OITrend {
     Stable,     // 持仓平稳
 }
 
+impl OITrend {
+    /// 根据变化率和阈值推导趋势
+    pub fn determine(oi_change: f64, threshold: f64) -> Self {
+        if oi_change > threshold {
+            Self::Increasing
+        } else if oi_change < -threshold {
+            Self::Decreasing
+        } else {
+            Self::Stable
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum OIPositionState {
     LongBuildUp,   // 价升量增：多头开仓
@@ -71,7 +83,32 @@ pub enum OIPositionState {
     ShortCovering, // 价升量减：空头平仓（止损/止盈）
     Neutral,
 }
+impl OIPositionState {
+    /// 经典四象限推导，增加对“零波动”的处理
+    pub fn determine(price_change: f64, oi_change: f64) -> Self {
+        // 修复原逻辑：如果 OI 变化极其微小（比如小于万分之一），直接判定为中性，避免误报信号
+        if oi_change.abs() < 1e-4 {
+            return Self::Neutral;
+        }
 
+        match (price_change > 0.0, oi_change > 0.0) {
+            (true, true) => Self::LongBuildUp,
+            (false, true) => Self::ShortBuildUp,
+            (false, false) => Self::LongUnwinding,
+            (true, false) => Self::ShortCovering,
+        }
+    }
+
+    pub fn signal_score(&self) -> f64 {
+        match self {
+            Self::LongBuildUp => 1.0,
+            Self::ShortCovering => 0.5,
+            Self::Neutral => 0.0,
+            Self::LongUnwinding => -0.5,
+            Self::ShortBuildUp => -1.0,
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub struct RoleData {
     pub interval: Interval,
@@ -81,49 +118,19 @@ pub struct RoleData {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OIData {
-    pub current_oi: f64,
-    pub oi_ma_fast: Option<f64>, // 比如 MA20
-    pub oi_ma_slow: Option<f64>, // 比如 MA50
+    pub current_oi_amount: f64, // 持仓数量 (币)
+    pub current_oi_value: f64,
 
-    // 相对变化率 (当前值 vs N个周期前)
-    pub change_rate: f64,
-    pub trend: OITrend,
-    pub state: OIPositionState,
-
-    pub oi_strength: f64, // 0.0 到 100.0
-    pub oi_signal: f64,   // -1.0 (极度看空) 到 1.0 (极度看多)
+    pub change_history: Vec<f64>,
 }
 impl OIData {
-    /// 根据价格变化和OI变化计算市场状态
-    pub fn calculate_state(&mut self, price_change_pct: f64, oi_change_pct: f64) {
-        self.change_rate = oi_change_pct;
+    pub fn new(amount: f64, value: f64, change_history: Vec<f64>) -> Self {
+        Self {
+            current_oi_amount: amount,
+            current_oi_value: value,
 
-        // 1. 确定趋势
-        self.trend = if oi_change_pct > 0.02 {
-            // 阈值可配置
-            OITrend::Increasing
-        } else if oi_change_pct < -0.02 {
-            OITrend::Decreasing
-        } else {
-            OITrend::Stable
-        };
-
-        // 2. 确定博弈状态 (经典四象限)
-        self.state = match (price_change_pct > 0.0, oi_change_pct > 0.0) {
-            (true, true) => OIPositionState::LongBuildUp, // 强势看涨
-            (false, true) => OIPositionState::ShortBuildUp, // 强势看跌
-            (false, false) => OIPositionState::LongUnwinding, // 弱势回调
-            (true, false) => OIPositionState::ShortCovering, // 空头回补
-        };
-
-        // 3. 计算信号得分 (简易示例)
-        self.oi_signal = match self.state {
-            OIPositionState::LongBuildUp => 1.0,
-            OIPositionState::ShortCovering => 0.5,
-            OIPositionState::LongUnwinding => -0.5,
-            OIPositionState::ShortBuildUp => -1.0,
-            OIPositionState::Neutral => 0.0,
-        };
+            change_history,
+        }
     }
 }
 #[derive(Debug, Clone, Default)]
@@ -155,22 +162,21 @@ impl TakerFlowData {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MarketContext {
     pub symbol: Symbol,
     pub timestamp: DateTime<Utc>,
     pub roles: HashMap<Role, RoleData>,
-    pub current_price: f64,
 
     pub global: DerivativeSnapshot,
 }
 
 impl MarketContext {
-    pub fn new(symbol: Symbol, timestamp: DateTime<Utc>, price: f64) -> Self {
+    pub fn new(symbol: Symbol, timestamp: DateTime<Utc>) -> Self {
         Self {
             symbol,
             timestamp,
-            current_price: price,
+
             roles: HashMap::new(),
             global: DerivativeSnapshot::default(),
         }
@@ -195,7 +201,6 @@ pub enum AnalyzerKind {
     SupportResistance,
     Volatility,
     MarketRegime,
-    FuturesGameTheory,
 }
 
 /// 全局配置

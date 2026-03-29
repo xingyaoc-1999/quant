@@ -1986,6 +1986,7 @@ name = "notify"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "api_client",
  "common",
  "quant",
  "reqwest",
@@ -3074,6 +3075,7 @@ dependencies = [
  "serde_json",
  "ta",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

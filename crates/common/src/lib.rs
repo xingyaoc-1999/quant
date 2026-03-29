@@ -1,4 +1,4 @@
-use crate::utils::str_to_f64;
+use crate::utils::{str_to_f64, str_to_i64};
 use anyhow::Result;
 use chrono::Duration;
 use polars::{io::SerReader, prelude::CsvReadOptions};
@@ -15,26 +15,14 @@ pub mod config;
 
 pub mod utils;
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    JsonSchema,
-    Default,
-    PartialOrd,
-    Ord,
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, PartialOrd, Ord,
 )]
 pub enum Symbol {
-    #[default]
     BTCUSDT,
     ETHUSDT,
-    BNBUSDT,
-    SOLUSDT,
-    XRPUSDT,
+    // BNBUSDT,
+    // SOLUSDT,
+    // XRPUSDT,
 }
 
 impl Symbol {
@@ -45,9 +33,9 @@ impl Symbol {
         let symbols = &[
             Self::BTCUSDT,
             Self::ETHUSDT,
-            Self::BNBUSDT,
-            Self::SOLUSDT,
-            Self::XRPUSDT,
+            // Self::BNBUSDT,
+            // Self::SOLUSDT,
+            // Self::XRPUSDT,
         ];
         symbols.to_vec()
     }
@@ -56,9 +44,9 @@ impl Symbol {
         match self {
             Symbol::BTCUSDT => "BTCUSDT",
             Symbol::ETHUSDT => "ETHUSDT",
-            Symbol::BNBUSDT => "BNBUSDT",
-            Symbol::SOLUSDT => "SOLUSDT",
-            Symbol::XRPUSDT => "XRPUSDT",
+            // Symbol::BNBUSDT => "BNBUSDT",
+            // Symbol::SOLUSDT => "SOLUSDT",
+            // Symbol::XRPUSDT => "XRPUSDT",
         }
     }
 }
@@ -70,9 +58,9 @@ impl FromStr for Symbol {
         match s.to_uppercase().as_str() {
             "BTCUSDT" | "BTC" => Ok(Symbol::BTCUSDT),
             "ETHUSDT" | "ETH" => Ok(Symbol::ETHUSDT),
-            "BNBUSDT" | "BNB" => Ok(Symbol::BNBUSDT),
-            "SOLUSDT" | "SOL" => Ok(Symbol::SOLUSDT),
-            "XRPUSDT" | "XRP" => Ok(Symbol::XRPUSDT),
+            // "BNBUSDT" | "BNB" => Ok(Symbol::BNBUSDT),
+            // "SOLUSDT" | "SOL" => Ok(Symbol::SOLUSDT),
+            // "XRPUSDT" | "XRP" => Ok(Symbol::XRPUSDT),
             _ => Err(format!("Unsupported symbol: {}", s)),
         }
     }
@@ -302,55 +290,24 @@ impl fmt::Display for Interval {
         f.write_str(self.as_str())
     }
 }
-#[derive(Deserialize, Debug)]
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OpenInterestData {
-    pub symbol: String,
+pub struct OpenInterestRecord {
+    pub symbol: Symbol,
     #[serde(deserialize_with = "str_to_f64")]
-    pub open_interest: f64,
-    pub time: i64,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct PremiumIndexResponse {
-    pub symbol: String,
-    pub last_funding_rate: String,
-    pub mark_price: String,
-    pub next_funding_time: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct TakerBuySellData {
+    pub sum_open_interest: f64,
     #[serde(deserialize_with = "str_to_f64")]
-    pub buy_sell_ratio: f64,
-
-    #[serde(deserialize_with = "str_to_f64")]
-    pub buy_vol: f64,
-
-    #[serde(deserialize_with = "str_to_f64")]
-    pub sell_vol: f64, // 主动卖出量
-
-    pub timestamp: i64, // 时间戳
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct TopTraderRatioData {
-    pub symbol: String,
-    #[serde(deserialize_with = "str_to_f64")]
-    pub long_short_ratio: f64,
+    pub sum_open_interest_value: f64,
+    #[serde(deserialize_with = "str_to_i64")]
     pub timestamp: i64,
 }
-#[derive(Debug, Deserialize, Clone)]
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LiquidationOrder {
-    pub symbol: String,
-    pub side: String,
+pub struct BinanceOpenInterest {
     #[serde(deserialize_with = "str_to_f64")]
-    pub price: f64,
-    #[serde(deserialize_with = "str_to_f64")]
-    pub orig_qty: f64,
+    pub open_interest: f64,
+    pub symbol: Symbol,
     pub time: i64,
 }

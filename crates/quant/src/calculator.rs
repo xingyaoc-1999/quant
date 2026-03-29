@@ -174,16 +174,7 @@ impl FeatureCalculator {
         global_close: Option<f64>,
     ) -> FeatureSet {
         self.count += 1;
-        let price_change = if let Some(pc) = self.prev_close {
-            if pc.abs() > f64::EPSILON {
-                (candle.close - pc) / pc
-            } else {
-                0.0
-            }
-        } else {
-            0.0 // 第一根 K 线变化率为 0
-        };
-        // 1. 计算所有底层指标
+
         let rsi_v = self.rsi.next(candle.close);
         let m20_v = self.ma20.next(candle.close);
         let m50_v = self.ma50.next(candle.close);
@@ -232,7 +223,6 @@ impl FeatureCalculator {
         let correlation =
             global_close.map(|gc| self.update_correlation_incremental(candle.close, gc));
 
-        // 4. 支撑压力距离
         let (dist_res, dist_sup) = if self.recent_highs.len() == Self::STRUCT_WINDOW {
             let res = self.recent_highs.iter().copied().fold(f64::MIN, f64::max);
             let sup = self.recent_lows.iter().copied().fold(f64::MAX, f64::min);
@@ -285,7 +275,6 @@ impl FeatureCalculator {
                 close: candle.close,
                 volume: candle.volume,
                 volatility_percentile: vol_p,
-                price_change,
             },
             indicators: TechnicalIndicators {
                 rsi_14: (self.count >= 14).then_some(rsi_v),
@@ -304,8 +293,10 @@ impl FeatureCalculator {
             structure: MarketStructure {
                 trend_structure: self.get_trend_struct(candle.close, m20_v, m50_v, m200_v),
                 rsi_state: (self.count >= 14).then_some(match rsi_v {
-                    v if v > 70.0 => RsiState::Strong,
-                    v if v < 30.0 => RsiState::Weak,
+                    v if v >= 70.0 => RsiState::Overbought,
+                    v if v <= 30.0 => RsiState::Oversold,
+                    v if v > 60.0 => RsiState::Strong,
+                    v if v < 40.0 => RsiState::Weak,
                     _ => RsiState::Neutral,
                 }),
                 volume_state: Some(

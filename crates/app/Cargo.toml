@@ -5,13 +5,12 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
-tracing.workspace=true
-tokio.workspace= true
-anyhow.workspace=true
-tracing-subscriber.workspace=true
-service= {path="../service"}
-common = {path="../common"}
-storage = {path="../storage"}
-api_client = {path="../api_client"}
-notify={path="../notify"}
-
+tracing.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing-subscriber.workspace = true
+service = { path = "../service" }
+common = { path = "../common" }
+storage = { path = "../storage" }
+api_client = { path = "../api_client" }
+notify = { path = "../notify" }

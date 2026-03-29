@@ -5,12 +5,13 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
-reqwest.workspace = true 
+reqwest.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 teloxide = { version = "0.17.0", features = ["macros", "ctrlc_handler"] }
 tokio.workspace = true
 common = { path = "../common" }
-service = { path="../service" }
-quant ={path="../quant"}
-storage={path="../storage"}
+service = { path = "../service" }
+quant = { path = "../quant" }
+storage = { path = "../storage" }
+api_client = { path = "../api_client" }

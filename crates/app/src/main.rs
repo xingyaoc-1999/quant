@@ -58,7 +58,13 @@ async fn main() -> Result<()> {
     info!("🚀 Starting Telegram Bot...");
     tokio::spawn(async move {
         if let Err(e) = tg_app
-            .run(tx_in, rx_out, ctx_manager.clone(), storage.clone())
+            .run(
+                tx_in,
+                rx_out,
+                ctx_manager.clone(),
+                archive_provider.clone(),
+                storage.clone(),
+            )
             .await
         {
             error!("❌ Telegram Bot Runtime Error: {:?}", e);

@@ -2,6 +2,7 @@ mod command;
 mod menu;
 
 use anyhow::{Context, Result};
+use api_client::http::binance::ArchiveProvider;
 use common::{
     utils::{retry_with_proxy_rotation_cooled, CooledProxyPool, ShouldRotate},
     Interval, Symbol,
@@ -78,6 +79,7 @@ impl BotApp {
         tx_in: Sender<(String, ChatId)>,
         mut rx_in: Receiver<(String, ChatId)>,
         manager: Arc<FeatureContextManager>,
+        archive_provider: Arc<ArchiveProvider>,
         storage: Arc<Storage>,
     ) -> Result<()> {
         let app = Arc::new(self);
@@ -123,7 +125,7 @@ impl BotApp {
             let tx_in_msg = tx_in.clone();
             let storage = storage.clone();
             let manager_for_cb = manager.clone();
-
+            let provider_for_cb = archive_provider.clone();
             let handler = dptree::entry()
                 .branch(
                     Update::filter_message()
@@ -144,9 +146,11 @@ impl BotApp {
                     move |bot: Bot, q: CallbackQuery| {
                         let manager = manager_for_cb.clone();
                         let storage = storage.clone();
+                        let provider = provider_for_cb.clone();
                         async move {
                             if let Err(e) =
-                                BotApp::handle_callback_query(bot, q, manager, storage).await
+                                BotApp::handle_callback_query(bot, q, manager, provider, storage)
+                                    .await
                             {
                                 error!("❌ [Callback Error] {:#}", e);
                             }
@@ -197,6 +201,7 @@ impl BotApp {
         bot: Bot,
         q: CallbackQuery,
         manager: Arc<FeatureContextManager>,
+        archive_provider: Arc<ArchiveProvider>,
         storage: Arc<Storage>,
     ) -> Result<()> {
         let data = q.data.as_ref().context("Callback data is missing")?;
@@ -250,11 +255,18 @@ impl BotApp {
                 let mut config = HashMap::new();
                 config.insert(role, interval);
                 let changed_roles = manager.update_symbol_config(symbol, config);
+
+                let provider = archive_provider.clone();
+
+                // ... 前面解析 symbol, role, interval 的代码保持不变 ...
+
                 if !changed_roles.is_empty() {
                     for (changed_role, target_interval) in changed_roles {
                         let m_clone = manager.clone();
                         let s_clone = storage.clone();
+                        let p_clone = archive_provider.clone();
                         let symbol_clone = symbol;
+
                         tokio::spawn(async move {
                             info!(
                                 "🚀 [Warmup] Starting: {} | {} -> {:?}",
@@ -262,32 +274,44 @@ impl BotApp {
                             );
 
                             let res: anyhow::Result<()> = async {
-                                let (seeds_res, m1_res) = tokio::try_join!(
-                                    s_clone.get_latest_candles(
-                                        &symbol_clone,
-                                        target_interval,
-                                        1000
-                                    ),
-                                    s_clone.get_latest_candles(&symbol_clone, Interval::M1, 1000)
-                                )?;
+                // 1. 必填数据：只 try_join K 线数据，如果 K 线都拿不到，那预热没法做
+                let (seeds_res, m1_res) = tokio::try_join!(
+                    s_clone.get_latest_candles(&symbol_clone, target_interval, 200),
+                    s_clone.get_latest_candles(&symbol_clone, Interval::M1, 1000),
+                )?;
 
-                                let mut seeds_map = HashMap::new();
-                                seeds_map.insert(target_interval, seeds_res);
-                                seeds_map.insert(Interval::M1, m1_res.clone());
+                // 2. 选填数据：单独抓取 OI，失败仅打印警告，不中断流程
+                let oi_res = p_clone.fetch_open_interest_hist(symbol_clone, target_interval).await;
 
-                                m_clone.warmup_single_symbol(symbol_clone, &seeds_map);
+                // 3. 组装 Seeds Map
+                let mut seeds_map = HashMap::new();
+                seeds_map.insert(target_interval, seeds_res);
+                seeds_map.insert(Interval::M1, m1_res);
 
-                                info!(
-                                    "✅ [Warmup] Success: {}'s {} updated",
-                                    symbol_clone, changed_role
-                                );
-                                Ok(())
-                            }
-                            .await;
+                // 4. 组装 OI Map (关键：适配 Option 签名)
+                let mut oi_map = HashMap::new();
+                let oi_param = match oi_res {
+                    Ok(data) => {
+                        oi_map.insert(target_interval, data);
+                        Some(&oi_map) // 抓取成功，传数据
+                    }
+                    Err(e) => {
+                        warn!("⚠️ [Warmup] OI fetch failed for {}, proceeding with K-lines only: {:?}", symbol_clone, e);
+                        None // 抓取失败或没数据，传 None
+                    }
+                };
+
+                // 5. 执行预热 (现在的实现即便 oi_param 是 None 也会算出指标)
+                m_clone.warmup_single_symbol(symbol_clone, &seeds_map, oi_param);
+
+                info!("✅ [Warmup] Success: {}'s {} updated", symbol_clone, changed_role);
+                Ok(())
+            }
+            .await;
 
                             if let Err(e) = res {
                                 error!(
-                                    "❌ [Warmup] Error for {} {}: {:?}",
+                                    "❌ [Warmup] Critical error for {} {}: {:?}",
                                     symbol_clone, changed_role, e
                                 );
                             }

@@ -175,6 +175,23 @@ where
     }
 }
 
+pub fn str_to_i64<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrInt {
+        String(String),
+        Int(i64),
+    }
+
+    match StringOrInt::deserialize(deserializer)? {
+        StringOrInt::String(s) => s.parse::<i64>().map_err(serde::de::Error::custom),
+        StringOrInt::Int(i) => Ok(i),
+    }
+}
+
 pub async fn retry<F, Fut, T, E>(mut operation: F) -> Result<T, E>
 where
     F: FnMut() -> Fut,

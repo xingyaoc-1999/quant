@@ -18,8 +18,10 @@ impl BotApp {
         for entry in feature_contexts.symbol_contexts.iter() {
             let symbol = entry.key();
             let context = entry.value();
+            let roles_guard = context.roles.read().expect("Lock poisoned");
 
-            for (role, processor) in &context.roles {
+            // 2. 遍历锁内部的 HashMap
+            for (role, processor) in roles_guard.iter() {
                 display_data.push((*symbol, *role, processor.interval));
             }
         }
@@ -68,7 +70,7 @@ impl BotApp {
             .collect();
         buttons.push(vec![InlineKeyboardButton::callback(
             "⬅️ 返回列表",
-                    "LST:BACK",
+            "LST:BACK",
         )]);
         InlineKeyboardMarkup::new(buttons)
     }

@@ -25,9 +25,11 @@ pub enum Direction {
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum RsiState {
-    Strong,  // RSI > 70
-    Weak,    // RSI < 30
-    Neutral, // 30-70
+    Overbought, // 极度超买 (>70)
+    Oversold,   // 极度超卖 (<30)
+    Strong,     // 强势区 (60-70)
+    Weak,       // 弱势区 (30-40)
+    Neutral,    // 中轴区 (40-60)
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +103,6 @@ pub struct PriceAction {
     pub volume: f64,
     #[schemars(description = "波动率百分位 (基于BB Width历史窗口)")]
     pub volatility_percentile: f64,
-    pub price_change: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
@@ -168,8 +169,7 @@ pub struct AIAuditPayload {
     pub score_engine: ScoreEngineSummary,
     pub market_statistics: MarketStatistics,
     pub trade_management_audit: TradeManagementAudit,
-    pub futures_game_theory: FuturesGameTheory,
-    pub dynamic_context: DynamicContext,
+
     pub global_context: GlobalContext,
 }
 pub struct AIAuditPayloadBuilder {
@@ -177,8 +177,6 @@ pub struct AIAuditPayloadBuilder {
     score_engine: Option<ScoreEngineSummary>,
     market_statistics: Option<MarketStatistics>,
     trade_management_audit: Option<TradeManagementAudit>,
-    futures_game_theory: Option<FuturesGameTheory>,
-    dynamic_context: Option<DynamicContext>,
     global_context: Option<GlobalContext>,
 }
 
@@ -189,8 +187,7 @@ impl AIAuditPayloadBuilder {
             score_engine: None,
             market_statistics: None,
             trade_management_audit: None,
-            futures_game_theory: None,
-            dynamic_context: None,
+
             global_context: None,
         }
     }
@@ -215,16 +212,6 @@ impl AIAuditPayloadBuilder {
         self
     }
 
-    pub fn game_theory(mut self, gt: FuturesGameTheory) -> Self {
-        self.futures_game_theory = Some(gt);
-        self
-    }
-
-    pub fn dynamic_context(mut self, ctx: DynamicContext) -> Self {
-        self.dynamic_context = Some(ctx);
-        self
-    }
-
     pub fn global_context(mut self, global: GlobalContext) -> Self {
         self.global_context = Some(global);
         self
@@ -236,12 +223,14 @@ impl AIAuditPayloadBuilder {
             score_engine: self.score_engine.ok_or("Missing score_engine")?,
             market_statistics: self.market_statistics.ok_or("Missing market_statistics")?,
             trade_management_audit: self.trade_management_audit.ok_or("Missing trade_audit")?,
-            futures_game_theory: self
-                .futures_game_theory
-                .ok_or("Missing futures_game_theory")?,
-            dynamic_context: self.dynamic_context.ok_or("Missing dynamic_context")?,
             global_context: self.global_context.ok_or("Missing global_context")?,
         })
+    }
+}
+
+impl Default for AIAuditPayloadBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
@@ -332,23 +321,23 @@ pub struct InvalidationRules {
 }
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, JsonSchema)]
 pub enum RiskLevel {
-    /// 1. 深度冷缩 (Deep Coiling)
-    /// 特征：OI处于24h低位，波动率极低。
-    /// 含义：暴风雨前的宁静，适合布局长线波段。
+    // 1. 深度冷缩 (Deep Coiling)
+    // 特征：OI处于24h低位，波动率极低。
+    // 含义：暴风雨前的宁静，适合布局长线波段。
     DeepCoiling,
 
     Healthy,
 
     LeveledUp,
 
-    /// 4. 极端拥挤 (Extreme Overheat)
-    /// 特征：OI 处于 95% 以上分位，费率激增（如 >0.03%）。
-    /// 含义：多杀多/空杀空的火药桶，波段交易必须止盈或大幅减仓。
+    // 4. 极端拥挤 (Extreme Overheat)
+    // 特征：OI 处于 95% 以上分位，费率激增（如 >0.03%）。
+    // 含义：多杀多/空杀空的火药桶，波段交易必须止盈或大幅减仓。
     ExtremeOverheat,
 
-    /// 5. 恐慌清算 (Panic Liquidation)
-    /// 特征：OI 剧烈下降（5m 跌幅 > 3%），价格巨震。
-    /// 含义：正在发生大规模爆仓，禁止入场，等待尘埃落定。
+    // 5. 恐慌清算 (Panic Liquidation)
+    // 特征：OI 剧烈下降（5m 跌幅 > 3%），价格巨震。
+    // 含义：正在发生大规模爆仓，禁止入场，等待尘埃落定。
     PanicLiquidation,
 }
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
@@ -452,20 +441,12 @@ pub enum TradeOutcome {
     Loss,
     Even,
 }
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default)]
 pub struct DerivativeSnapshot {
-    // --- 基础持仓 (Open Interest) ---
-    pub oi_base: f64,  // 原始持仓数量 (sumOpenInterest)
-    pub oi_value: f64, // 持仓总价值 (sumOpenInterestValue)
-    // --- 筹码质量 (Top Trader Ratio) ---
-    pub top_ls_ratio: f64,       // 大户账户多空比 (Top Trader Long/Short Ratio)
-    pub top_position_ratio: f64, // 大户持仓多空比 (Top Trader Position Ratio)
+    pub timestamp: i64,
 
-    // --- 环境与成本 (Funding & Liq) ---
-    pub funding_rate: f64, // 当前资金费率
-    pub liq_buy_vol: f64,  // 最近周期的空头爆仓量 (Buy-side Liq)
-    pub liq_sell_vol: f64, // 最近周期的多头爆仓量 (Sell-side Liq)
-    pub liquidation_levels: LiquidationZone,
+    pub last_price: f64,
 
-    pub timestamp: i64, // 数据最后更新的时间戳
+    pub current_oi_amount: f64, // 持仓张数/币数
+    pub current_oi_value: f64,  // 持仓名义价值 (U)
 }

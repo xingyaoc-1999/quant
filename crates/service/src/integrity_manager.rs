@@ -7,8 +7,9 @@ use api_client::{
 use futures_util::stream::{self, StreamExt};
 
 use chrono::{DateTime, DurationRound, Utc};
-use common::{config::Appconfig, utils::CooledProxyPool, Candle, Interval, Symbol};
-use quant::types::DerivativeSnapshot;
+use common::{
+    config::Appconfig, utils::CooledProxyPool, Candle, Interval, OpenInterestRecord, Symbol,
+};
 use std::{
     collections::HashMap,
     sync::{
@@ -20,6 +21,13 @@ use std::{
 use storage::postgres::Storage;
 use tokio::{sync::mpsc, time::interval};
 use tracing::{error, info, warn};
+
+struct PreWarmData {
+    // Symbol -> (Interval -> Vec<Candle>)
+    history_map: HashMap<Symbol, HashMap<Interval, Vec<Candle>>>,
+
+    pub history_oi_map: HashMap<Symbol, HashMap<Interval, Vec<OpenInterestRecord>>>,
+}
 
 pub struct DataIntegrityManager {
     symbols: Vec<Symbol>,
@@ -72,47 +80,90 @@ impl DataIntegrityManager {
             manager.clone().start_realtime_engine();
 
             manager.clone().start_runtime_checker();
+            manager.clone().start_oi_poller();
 
             info!("✅ [Manager] System is live and background tasks are scheduled.");
         });
     }
-    async fn get_multi_history(&self) -> Result<HashMap<Symbol, HashMap<Interval, Vec<Candle>>>> {
+    async fn get_multi_history(&self) -> Result<PreWarmData> {
         let config = Appconfig::global().role;
-        let intervals = vec![config.trend, config.filter, config.entry, Interval::M1];
+        let candle_intervals = vec![config.trend, config.filter, config.entry, Interval::M1];
+        let oi_intervals = vec![config.trend, config.filter, config.entry];
 
-        let mut history_stream = stream::iter(intervals)
-            .map(|interval| async move {
-                let limit = if interval == Interval::M1 { 1000 } else { 200 };
-                let result = self.storage.get_batch(interval, &self.symbols, limit).await;
-                (interval, result)
+        // --- PART A: 获取 OHLCV (1m 为主) ---
+        let mut history_map: HashMap<Symbol, HashMap<Interval, Vec<Candle>>> = HashMap::new();
+        let mut candle_stream = stream::iter(candle_intervals)
+            .map(|interval| {
+                let symbols = self.symbols.clone();
+                let storage = self.storage.clone();
+                async move {
+                    let limit = if interval == Interval::M1 { 1000 } else { 200 };
+                    let res = storage.get_batch(interval, &symbols, limit).await;
+                    (interval, res)
+                }
             })
             .buffer_unordered(4);
-        let mut final_map: HashMap<Symbol, HashMap<Interval, Vec<Candle>>> = HashMap::new();
 
-        while let Some((interval, res)) = history_stream.next().await {
-            let batch_result = res?;
-            for (symbol, candles) in batch_result {
-                final_map
-                    .entry(symbol)
+        while let Some((interval, res)) = candle_stream.next().await {
+            let batch = res?;
+            for (sym, candles) in batch {
+                history_map
+                    .entry(sym)
                     .or_default()
                     .insert(interval, candles);
             }
         }
 
-        Ok(final_map)
+        let mut oi_tasks = Vec::new();
+        for &symbol in &self.symbols {
+            for &interval in &oi_intervals {
+                oi_tasks.push((symbol, interval));
+            }
+        }
+
+        let mut oi_history_map: HashMap<Symbol, HashMap<Interval, Vec<OpenInterestRecord>>> =
+            HashMap::new();
+        let mut oi_stream = stream::iter(oi_tasks)
+            .map(|(symbol, interval)| {
+                let provider = self.archive_provider.clone();
+                async move {
+                    let res = provider.fetch_open_interest_hist(symbol, interval).await;
+
+                    (symbol, interval, res)
+                }
+            })
+            .buffer_unordered(10);
+
+        while let Some((symbol, interval, res)) = oi_stream.next().await {
+            match res {
+                Ok(records) => {
+                    oi_history_map
+                        .entry(symbol)
+                        .or_default()
+                        .insert(interval, records);
+                }
+                Err(e) => warn!("⚠️ [OI-Fetch] {} {:?} failed: {}", symbol, interval, e),
+            }
+        }
+
+        Ok(PreWarmData {
+            history_map,
+            history_oi_map: oi_history_map,
+        })
     }
-    async fn execute_cold_start(&self) -> Result<()> {
+    pub async fn execute_cold_start(&self) -> Result<()> {
         info!(
-            "📂 [Cold Start] Pre-warming {} symbols using synchronized data...",
+            "📂 [Cold Start] Pre-warming {} symbols...",
             self.symbols.len()
         );
-        let multi_history = self.get_multi_history().await?;
+
+        let pre_warm_data = self.get_multi_history().await?;
 
         let ctx = Arc::clone(&self.feature_context);
 
         tokio::task::spawn_blocking(move || {
-            ctx.warmup_symbols(multi_history);
-            info!("✅ [Warmup] Calculation complete.");
+            ctx.warmup_symbols(pre_warm_data.history_map, &pre_warm_data.history_oi_map);
+            info!("✅ [Warmup] All symbols synchronized and calculated.");
         })
         .await?;
 
@@ -146,7 +197,7 @@ impl DataIntegrityManager {
                 tokio::select! {
                     biased;
                     Some(candle) = rx.recv() => {
-                        manager.feature_context.update_realtime_m1(candle.clone());
+                        manager.feature_context.update_realtime_m1(candle);
 
                         buffer.push(candle);
                         if buffer.len() >= 50 {
@@ -403,5 +454,31 @@ impl DataIntegrityManager {
             }
         });
     }
-   
+    pub fn start_oi_poller(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+
+            loop {
+                interval.tick().await;
+                for &symbol in &self.symbols {
+                    let feature_ctx = self.feature_context.clone();
+                    let archive = self.archive_provider.clone();
+
+                    match archive.fetch_open_interest(symbol).await {
+                        Ok(oi_data) => {
+                            // 使用修复后的方法：只传 OI 核心数据
+                            feature_ctx.update_oi_from_poller(
+                                symbol,
+                                oi_data.open_interest,
+                                oi_data.time,
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch OI for {}: {}", symbol, e);
+                        }
+                    }
+                }
+            }
+        });
+    }
 }
