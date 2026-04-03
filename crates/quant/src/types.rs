@@ -164,89 +164,6 @@ pub struct SignalStates {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub struct AIAuditPayload {
-    pub header: AuditHeader,
-    pub score_engine: ScoreEngineSummary,
-    pub market_statistics: MarketStatistics,
-    pub trade_management_audit: TradeManagementAudit,
-
-    pub global_context: GlobalContext,
-}
-pub struct AIAuditPayloadBuilder {
-    header: Option<AuditHeader>,
-    score_engine: Option<ScoreEngineSummary>,
-    market_statistics: Option<MarketStatistics>,
-    trade_management_audit: Option<TradeManagementAudit>,
-    global_context: Option<GlobalContext>,
-}
-
-impl AIAuditPayloadBuilder {
-    pub fn new() -> Self {
-        Self {
-            header: None,
-            score_engine: None,
-            market_statistics: None,
-            trade_management_audit: None,
-
-            global_context: None,
-        }
-    }
-
-    pub fn header(mut self, header: AuditHeader) -> Self {
-        self.header = Some(header);
-        self
-    }
-
-    pub fn score_engine(mut self, score_engine: ScoreEngineSummary) -> Self {
-        self.score_engine = Some(score_engine);
-        self
-    }
-
-    pub fn market_statistics(mut self, stats: MarketStatistics) -> Self {
-        self.market_statistics = Some(stats);
-        self
-    }
-
-    pub fn trade_audit(mut self, audit: TradeManagementAudit) -> Self {
-        self.trade_management_audit = Some(audit);
-        self
-    }
-
-    pub fn global_context(mut self, global: GlobalContext) -> Self {
-        self.global_context = Some(global);
-        self
-    }
-
-    pub fn build(self) -> Result<AIAuditPayload, String> {
-        Ok(AIAuditPayload {
-            header: self.header.ok_or("Missing header")?,
-            score_engine: self.score_engine.ok_or("Missing score_engine")?,
-            market_statistics: self.market_statistics.ok_or("Missing market_statistics")?,
-            trade_management_audit: self.trade_management_audit.ok_or("Missing trade_audit")?,
-            global_context: self.global_context.ok_or("Missing global_context")?,
-        })
-    }
-}
-
-impl Default for AIAuditPayloadBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub struct AuditHeader {
-    /// 策略唯一标识符，定义其底层逻辑（如趋势跟踪、均值回归）
-    pub strategy_id: String,
-    /// 交易标的名称（如 BTCUSDT）
-    pub symbol: Symbol,
-    pub direction: Option<Direction>,
-    /// 信号生成的时间戳
-    pub timestamp: DateTime<Utc>,
-    pub trigger_source: TriggerSource,
-    /// 逻辑角色的物理周期配置映射。Entry 决定精度，Trend 决定胜率底色
-    pub interval_setup: IntervalSetup,
-}
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct IntervalSetup {
     pub entry: Interval,
     pub trend: Interval,
@@ -262,30 +179,6 @@ impl Default for IntervalSetup {
             trend: Interval::H4,
         }
     }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TriggerSource {
-    Manual,
-    Auto,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema, Default)]
-pub struct ScoreEngineSummary {
-    /// 引擎给出的 0-100 综合得分。高于 80 通常意味着极强的技术共振
-    pub final_score: f64,
-    /// 正向驱动项：为什么认为值得做
-    pub positive_drivers: Vec<LogicComponent>,
-    /// 负向扣分项：AI 需评估瑕疵是否致命
-    pub red_flags: Vec<LogicComponent>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema, Default)]
-pub struct LogicComponent {
-    pub id: String,   // 分析器名称或唯一标识
-    pub score: f64,   // 该组件贡献的分数（可能为正或负）
-    pub desc: String, // 可读描述
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
@@ -397,6 +290,7 @@ pub struct PriceGravityWell {
     pub source: String, // e.g., "H4_MA200", "Liq_Wall"
     /// 距离当前价格的百分比（如 0.005 表示上方 0.5%）
     pub distance_pct: f64,
+    pub strength: f64, // 0.0 ~ 1.0，对应刚才计算的 intensity
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]

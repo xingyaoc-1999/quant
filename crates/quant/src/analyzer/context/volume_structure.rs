@@ -1,10 +1,9 @@
 use crate::analyzer::{
-    AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, AnalyzerStage, Config, MarketContext,
-    Role, SharedAnalysisState,
+    AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, AnalyzerStage, Config, ContextKey,
+    MarketContext, Role, SharedAnalysisState,
 };
 use crate::types::VolumeState;
 use serde_json::json;
-use std::borrow::Cow;
 
 pub struct VolumeStructureAnalyzer;
 
@@ -14,6 +13,7 @@ impl Analyzer for VolumeStructureAnalyzer {
     }
 
     fn stage(&self) -> AnalyzerStage {
+        // 依然属于 Context 阶段，为 Signal 提供权重
         AnalyzerStage::Context
     }
 
@@ -27,93 +27,90 @@ impl Analyzer for VolumeStructureAnalyzer {
         _config: &Config,
         shared: &SharedAnalysisState,
     ) -> Result<AnalysisResult, AnalysisError> {
-        let trend_data = ctx.get_role(Role::Trend);
-        let feat = &trend_data.feature_set;
+        // 1. 获取币种作用域与特征
+        let scope = shared.scope(&ctx.symbol);
+        let trend_role = ctx.get_role(Role::Trend)?;
+        let feat = &trend_role.feature_set;
+
+        // --- A. 从上下文获取波动率状态 ---
+        let is_vol_compressed = scope.get_bool(ContextKey::VolIsCompressed);
 
         let mut m_vol: f64 = 1.0;
-        let mut score = 0.0;
-        let mut description: Vec<Cow<'static, str>> = Vec::new();
+        let mut res = AnalysisResult::new(self.kind(), "VOL_STRUCT".into());
 
-        // --- 1. 获取波动率上下文 ---
-        let is_compressed = shared
-            .data
-            .get("ctx:volatility:is_compressed")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        // --- 2. 基础成交量逻辑 & 解锁机制 ---
+        // --- B. 核心：成交量状态逻辑 ---
         if let Some(vol_state) = &feat.structure.volume_state {
             match vol_state {
                 VolumeState::Expand => {
-                    m_vol = 1.3;
-                    score = 15.0;
-                    description.push(Cow::Borrowed("VOL:EXPANSION_CONFIRMED"));
+                    // 放量：动能强劲
+                    m_vol = 1.35;
+                    res = res
+                        .with_score(15.0)
+                        .because("成交量显著扩张，趋势动能得到燃料支撑");
 
-                    // 【核心解锁】如果是放量，说明正在尝试突破压缩区，顶开波动率设置的天花板
-                    if is_compressed {
-                        shared
-                            .data
-                            .insert("ctx:volatility:max_env_multiplier".into(), json!(1.5));
-                        description.push(Cow::Borrowed("VOL:BREAKOUT_UNLOCK"));
+                    // 【核心解锁】突破逻辑
+                    // 如果波动率之前是压缩的，现在的放量就是“顶开天花板”的信号
+                    if is_vol_compressed {
+                        // 动态增加后续信号的权重上限
+                        scope.insert_ctx(ContextKey::MultMomentum, json!(1.5));
+                        res = res.because(
+                            "检测到放量突破压缩区 (Volatility Breakout)，解锁更高动能权重",
+                        );
                     }
                 }
                 VolumeState::Shrink => {
-                    m_vol = 0.75;
-                    score = -5.0;
-                    description.push(Cow::Borrowed("VOL:SHRINKING_INTEREST"));
+                    // 缩量：兴趣减退
+                    m_vol = 0.7;
+                    res = res
+                        .with_score(-5.0)
+                        .because("成交量萎缩，市场参与度下降，谨防虚假波动");
                 }
                 VolumeState::Squeeze => {
-                    // 如果处于波动率压缩+成交量挤压，这是极高潜力的蓄势
-                    m_vol = if is_compressed { 1.15 } else { 0.85 };
-                    description.push(Cow::Borrowed("VOL:SQUEEZE_ACCUMULATING"));
+                    // 极致挤压：变盘前夜
+                    // 如果波动率也压缩，那就是双重挤压，爆发潜力巨大
+                    m_vol = if is_vol_compressed { 1.2 } else { 0.85 };
+                    res = res.because("成交量进入极致挤压状态，市场正在高度蓄势");
                 }
-                _ => {}
+                _ => {
+                    m_vol = 1.0;
+                }
             }
         }
 
-        // --- 3. 异常与风险校验 ---
+        // --- C. 智能检测：异常与风险 ---
 
-        // A. 高潮爆量反转 (Climax) - 此时通常是流动性最后的喷发，不是好的入场点
+        // 1. 高潮爆量检测 (Climax/Exhaustion)
+        // 逻辑：如果价格波动极大（Extreme Candle）且成交量也是巨量，通常是反转信号而非持续信号
         if feat.signals.extreme_candle.unwrap_or(false) {
-            m_vol *= 0.65; // 惩罚性降权
-            description.push(Cow::Borrowed("VOL:CLIMAX_EXHAUSTION_RISK"));
+            m_vol *= 0.6;
+            res = res
+                .violate()
+                .because("检测到放量力竭 (Volume Climax)，警惕流动性最后喷发后的反转");
         }
 
-        // B. 蓄势爆发准备 (结合 RSI 窄幅震荡)
+        // 2. “火药桶”模式 (Explosive Setup)
+        // 条件：低波动 + 持续缩量 + RSI走平
         let rsi_ready = feat.signals.rsi_range_3.unwrap_or(false);
         let vol_shrink_3 = feat.signals.volume_shrink_3.unwrap_or(false);
 
-        if rsi_ready && vol_shrink_3 && is_compressed {
-            // 这是一个“火药桶”模式：低波、缩量、RSI走平
-            m_vol *= 1.4;
-            description.push(Cow::Borrowed("VOL:EXPLOSIVE_SETUP"));
+        if rsi_ready && vol_shrink_3 && is_vol_compressed {
+            m_vol *= 1.45;
+            res = res.because("确认‘火药桶’蓄势模式：低波+缩量+RSI盘整，极易触发爆发性单边");
         }
 
-        // --- 4. 结构化持久化 ---
-        // 使用符合 Aggregator 自动提取的键名
-        shared
-            .data
-            .insert("multiplier:volume:structure".into(), json!(m_vol));
+    
 
-        // 记录成交量强度供其他 Analyzer 参考
-        shared.data.insert(
-            "ctx:volume:is_strong".into(),
-            json!(matches!(
-                feat.structure.volume_state,
-                Some(VolumeState::Expand)
-            )),
-        );
+        // --- E. 结果持久化 ---
+        scope.set_multiplier(self.kind(), m_vol);
 
-        Ok(AnalysisResult {
-            score,
-            weight_multiplier: m_vol,
-            description: description.join(" | "),
-            debug_data: json!({
-                "vol_m": m_vol,
-                "is_compressed": is_compressed,
-                "vol_state": format!("{:?}", feat.structure.volume_state)
-            }),
-            ..Default::default()
-        })
+        // 额外标记：成交量是否强劲，供 Entry 阶段做最后的门槛检查
+        let is_strong = matches!(feat.structure.volume_state, Some(VolumeState::Expand));
+        scope.insert_ctx(ContextKey::MultOi, json!(if is_strong { 1.1 } else { 0.9 }));
+
+        Ok(res.with_mult(m_vol).debug(json!({
+            "final_m_vol": m_vol,
+            "vol_state": format!("{:?}", feat.structure.volume_state),
+            "is_vol_compressed": is_vol_compressed,
+        })))
     }
 }

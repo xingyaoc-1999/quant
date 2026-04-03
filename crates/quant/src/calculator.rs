@@ -97,7 +97,6 @@ pub struct FeatureCalculator {
 
     // 2. 计数与状态
     count: usize,
-    prev_close: Option<f64>,
     ma20_slope_bars: i32,
     prev_macd: Option<f64>,
     prev_signal: Option<f64>,
@@ -140,7 +139,6 @@ impl FeatureCalculator {
             sum_y_sq: 0.0,
             sum_xy: 0.0,
             count: 0,
-            prev_close: None,
             ma20_slope_bars: 0,
             prev_macd: None,
             prev_signal: None,

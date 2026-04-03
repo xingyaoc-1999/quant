@@ -47,6 +47,21 @@ impl RoleProcessor {
         }
     }
 
+    pub fn get_volume_projection(&self) -> f64 {
+        let acc = match &self.current_acc {
+            Some(a) => a,
+            None => return 0.0,
+        };
+
+        let interval_ms = self.interval.to_millis();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let elapsed_ms = (now_ms - acc.timestamp).max(1);
+
+        let progress = (elapsed_ms as f64 / interval_ms as f64).min(1.0);
+
+        acc.volume / progress
+    }
+
     fn calculate_oi_metrics(&self, current_oi: f64) -> Vec<f64> {
         let mut history_changes = Vec::new();
         let steps = [1, 3, 7, 14];

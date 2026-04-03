@@ -256,10 +256,8 @@ impl BotApp {
                 config.insert(role, interval);
                 let changed_roles = manager.update_symbol_config(symbol, config);
 
-                let provider = archive_provider.clone();
 
-                // ... 前面解析 symbol, role, interval 的代码保持不变 ...
-
+           
                 if !changed_roles.is_empty() {
                     for (changed_role, target_interval) in changed_roles {
                         let m_clone = manager.clone();
