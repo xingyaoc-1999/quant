@@ -1,11 +1,14 @@
-use crate::types::{CorrelationConflict, DerivativeSnapshot, FeatureSet};
+use crate::{
+    report::AnalysisReport,
+    types::{DerivativeSnapshot, Direction, FeatureSet, RoleData},
+};
 use chrono::{DateTime, Utc};
 use common::{Candle, Interval, Symbol};
 use core::fmt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, f64, str::FromStr};
 use tracing::{debug, error, warn};
 mod context;
 // ==========================================
@@ -38,6 +41,7 @@ impl ContextKey {
             Self::VolAtrRatio => "ctx:vol:atr_ratio",
             Self::VolIsCompressed => "ctx:vol:is_compressed",
             Self::VolPercentile => "ctx:vol:percentile",
+            Self::VolumeState => "ctx:vol:volumestate",
             Self::RegimeStructure => "ctx:regime:structure",
             Self::MarketCorrelation => "ctx:market:correlation",
             Self::MultRegimeBase => "multiplier:regime:base",
@@ -49,10 +53,6 @@ impl ContextKey {
         }
     }
 }
-
-// ==========================================
-// 2. 角色定义与枚举
-// ==========================================
 
 #[derive(
     Debug, Hash, Eq, PartialEq, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialOrd, Ord,
@@ -98,90 +98,18 @@ impl FromStr for Role {
     }
 }
 
-// ==========================================
-// 3. 核心业务逻辑 (持仓量与流向)
-// ==========================================
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub enum OIPositionState {
-    LongBuildUp,   // 价升量增
-    ShortBuildUp,  // 价跌量增
-    LongUnwinding, // 价跌量减
-    ShortCovering, // 价升量减
-    Neutral,
-}
-
-impl OIPositionState {
-    pub fn determine(price_change: f64, oi_change: f64) -> Self {
-        const EPSILON: f64 = 1e-6;
-        if oi_change.abs() < EPSILON {
-            return Self::Neutral;
-        }
-        match (price_change > 0.0, oi_change > 0.0) {
-            (true, true) => Self::LongBuildUp,
-            (false, true) => Self::ShortBuildUp,
-            (false, false) => Self::LongUnwinding,
-            (true, false) => Self::ShortCovering,
-        }
-    }
-
-    pub fn signal_score(&self) -> f64 {
-        match self {
-            Self::LongBuildUp => 1.0,
-            Self::ShortCovering => 0.5,
-            Self::Neutral => 0.0,
-            Self::LongUnwinding => -0.5,
-            Self::ShortBuildUp => -1.0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct TakerFlowData {
-    pub buy_vol: f64,
-    pub sell_vol: f64,
-    pub net_vol: f64,
-    pub buy_sell_ratio: Option<f64>, // 改为 Option，避免除以零
-}
-
-impl TakerFlowData {
-    pub fn from_candle(candle: &Candle) -> Self {
-        let buy_vol = candle.taker_buy_volume;
-        let sell_vol = (candle.volume - candle.taker_buy_volume).max(0.0);
-        let net_vol = buy_vol - sell_vol;
-        let ratio = if sell_vol > 0.0 {
-            Some(buy_vol / sell_vol)
-        } else if buy_vol > 0.0 {
-            Some(f64::INFINITY)
-        } else {
-            None
-        };
-        Self {
-            buy_vol,
-            sell_vol,
-            net_vol,
-            buy_sell_ratio: ratio,
-        }
-    }
-}
-
-// ==========================================
-// 4. 分析结果与分析器
-// ==========================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AnalysisResult {
     pub kind: AnalyzerKind,
     pub score: f64,
+    pub direction: crate::types::Direction, // 关键：增加方向
     pub is_violation: bool,
     pub weight_multiplier: f64,
     pub description: String,
     pub tag: String,
     pub rationale: Vec<String>,
     pub debug_data: Value,
-    pub conflict: Option<CorrelationConflict>,
 }
-
 impl AnalysisResult {
     pub fn new(kind: AnalyzerKind, tag: String) -> Self {
         Self {
@@ -220,18 +148,6 @@ impl AnalysisResult {
         self.debug_data = data;
         self
     }
-
-    pub fn to_ai_prompt(&self) -> String {
-        format!(
-            "[{}] Type: {:?}, Score: {:.1}, Context_Weight_Mult: {:.2}\n  - Reason: {}\n  - Data Snapshot: {}",
-            self.tag,
-            self.kind,
-            self.score,
-            self.weight_multiplier,
-            self.rationale.join("; "),
-            self.debug_data.to_string()
-        )
-    }
 }
 
 impl Default for AnalysisResult {
@@ -245,12 +161,13 @@ impl Default for AnalysisResult {
             rationale: vec![],
             debug_data: json!({}),
             kind: AnalyzerKind::MarketRegime,
-            conflict: None,
+
+            direction: Direction::Neutral,
         }
     }
 }
 
-#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 pub enum AnalyzerKind {
     TrendStrength,
     Momentum,
@@ -280,11 +197,6 @@ pub trait Analyzer: Send + Sync {
     fn kind(&self) -> AnalyzerKind;
     fn analyze(&self, ctx: &mut MarketContext) -> Result<AnalysisResult, AnalysisError>;
 }
-
-// ==========================================
-// 5. 市场上下文 (包含共享缓存)
-// ==========================================
-
 #[derive(Debug, Clone)]
 pub struct MarketContext {
     pub symbol: Symbol,
@@ -349,46 +261,7 @@ impl MarketContext {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct RoleData {
-    pub interval: Interval,
-    pub feature_set: FeatureSet,
-    pub taker_flow: TakerFlowData,
-    pub oi_data: Option<OIData>,
-}
 
-// ==========================================
-// 6. OI 数据
-// ==========================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OIData {
-    pub current_oi_amount: f64,
-    pub current_oi_value: f64,
-    pub change_history: Vec<f64>,
-}
-
-impl OIData {
-    pub fn new(amount: f64, value: f64, history: Vec<f64>) -> Self {
-        Self {
-            current_oi_amount: amount,
-            current_oi_value: value,
-            change_history: history,
-        }
-    }
-
-    /// 计算最新一段 OI 变化率
-    pub fn delta_ratio(&self) -> f64 {
-        if self.change_history.is_empty() {
-            return 0.0;
-        }
-        self.change_history.last().cloned().unwrap_or(0.0) / self.current_oi_amount.max(1.0)
-    }
-}
-
-// ==========================================
-// 7. 配置与最终信号
-// ==========================================
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -397,7 +270,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// 验证配置的有效性
     pub fn validate(&self) -> Result<(), String> {
         if !(0.0..=1.0).contains(&self.sensitivity) {
             return Err(format!(
@@ -414,14 +286,13 @@ impl Config {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct FinalSignal {
     pub symbol: Symbol,
     pub net_score: f64,
     pub is_rejected: bool,
     pub reason: String,
     pub sub_reports: Vec<AnalysisResult>,
-    pub market_snapshot: Value,
 }
 
 impl FinalSignal {
@@ -432,7 +303,6 @@ impl FinalSignal {
             is_rejected: false,
             reason: "OK".into(),
             sub_reports: reports,
-            market_snapshot: json!({}),
         }
     }
 
@@ -443,7 +313,6 @@ impl FinalSignal {
             is_rejected: true,
             reason: format!("Violation triggered by: {}", tag),
             sub_reports: reports,
-            market_snapshot: json!({}),
         }
     }
 }
@@ -471,8 +340,7 @@ impl AnalysisEngine {
         self.analyzers.push(analyzer);
     }
 
-    /// 按添加顺序依次执行所有分析器
-    pub fn run(&mut self, mut ctx: MarketContext) -> FinalSignal {
+    pub fn run(&mut self, mut ctx: MarketContext) -> AnalysisReport {
         let mut results = Vec::new();
         let mut errors = Vec::new();
 
@@ -497,33 +365,79 @@ impl AnalysisEngine {
             error!("{} analyzer(s) failed during analysis", errors.len());
         }
 
-        self.aggregate(ctx, results)
+      let verdict =   self.aggregate(&ctx, results);
+      
+      AnalysisReport::build(&ctx, verdict)
     }
 
-    fn aggregate(&self, ctx: MarketContext, results: Vec<AnalysisResult>) -> FinalSignal {
+    fn aggregate(&self, ctx: &MarketContext, results: Vec<AnalysisResult>) -> FinalSignal {
+        // 1. 一票否决逻辑 (保持不变，这是最强的风控)
         if let Some(violation) = results.iter().find(|r| r.is_violation) {
             let tag = violation.tag.clone();
             return FinalSignal::rejected_with_reports(ctx.symbol.clone(), &tag, results);
         }
 
-        let mut total_score = 0.0;
+        let mut total_weighted_score = 0.0;
         let mut total_weight = 0.0;
+        let mut pos_scores = 0.0;
+        let mut neg_scores = 0.0;
 
+        // 2. 核心加权计算
         for res in &results {
             let base_weight = self.config.weights.get(&res.kind).cloned().unwrap_or(1.0);
             let dyn_mult = ctx.get_multiplier(res.kind);
+
+            // 最终权重 = 静态配置 * 运行时环境乘数 * 分析器内部修正
             let weight = base_weight * dyn_mult * res.weight_multiplier;
-            total_score += res.score * weight;
+
+            total_weighted_score += res.score * weight;
             total_weight += weight;
+
+            // 用于计算方向一致性（共振度）
+            if res.score > 0.0 {
+                pos_scores += weight;
+            } else if res.score < 0.0 {
+                neg_scores += weight;
+            }
         }
 
-        let net_score = if total_weight > 0.0 {
-            total_score / total_weight
+        // 3. 计算基础净分 (归一化第一步：加权平均)
+        let mut net_score = if total_weight > 0.0 {
+            total_weighted_score / total_weight
         } else {
             0.0
         };
 
-        FinalSignal::new_with_reports(ctx.symbol, net_score, results)
+        // 4. 计算共振因子 (Resonance Factor)
+        // 逻辑：如果多空权重严重失衡，说明方向高度一致，增强信号；如果多空势均力敌，说明分歧大，削弱信号。
+        let resonance_factor = if (pos_scores + neg_scores) > 0.0 {
+            (pos_scores - neg_scores).abs() / (pos_scores + neg_scores)
+        } else {
+            1.0
+        };
+
+        // 施加共振惩罚/奖励：分歧越大，分数越向 0 萎缩
+        net_score *= resonance_factor;
+
+        // 5. 最终映射 (归一化第二步：非线性映射)
+        // 使用 tanh 函数将分数平滑映射到 [-100, 100] 区间
+        // 这样可以保证即便出现极端加权分，下游的仓位计算逻辑也不会溢出
+        let final_score = self.normalize_to_standard_range(net_score);
+
+        FinalSignal::new_with_reports(ctx.symbol, final_score, results)
+    }
+
+    /// 辅助函数：将原始加权分映射到标准 [-100, 100] 空间
+    fn normalize_to_standard_range(&self, score: f64) -> f64 {
+        // 灵敏度系数，决定了原始分数达到多少时会接近饱和
+        // 假设原始加权分在 50 左右代表强信号
+        let sensitivity = 0.04;
+
+        // 使用 Tanh 函数：tanh(x) 的值域是 [-1, 1]
+        let normalized = (score * sensitivity).tanh();
+
+        // 放大到 100 分制
+        (normalized * 100.0).round()
     }
 }
 

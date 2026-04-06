@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
-use common::{Interval, Symbol};
+use common::{Candle, Interval, Symbol};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-// --- 基础枚举定义 ---
+// --- 1. 市场结构与趋势 (Market Structure) ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, JsonSchema, Deserialize)]
 pub enum TrendStructure {
@@ -14,85 +14,56 @@ pub enum TrendStructure {
     StrongBearish, // 价格 < MA20 < MA50 < MA200 (完全空头排列)
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Direction {
-    #[default]
-    Long,
-    Short,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum RsiState {
-    Overbought, // 极度超买 (>70)
-    Oversold,   // 极度超卖 (<30)
-    Strong,     // 强势区 (60-70)
-    Weak,       // 弱势区 (30-40)
-    Neutral,    // 中轴区 (40-60)
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum MacdCross {
-    Golden, // 金叉
-    Death,  // 死叉
+    Overbought, // > 70
+    Oversold,   // < 30
+    Strong,     // 60-70
+    Weak,       // 30-40
+    Neutral,    // 40-60
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum MacdMomentum {
-    Increasing, // 柱体变长/向上
-    Decreasing, // 柱体变短/向下
-    Flat,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum VolumeState {
-    Expand,  // 放量
-    Shrink,  // 缩量
-    Squeeze, // 极度挤压
-    Normal,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
 pub enum CandleType {
     BullishBody,
     BearishBody,
     Doji,
 }
 
+// --- 2. 信号与动能 (Signals & Momentum) ---
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MacdCross {
+    Golden,
+    Death,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum MacdMomentum {
+    Increasing,
+    Decreasing,
+    Flat,
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq)]
 pub enum DivergenceType {
-    Bullish, // 底背离
-    Bearish, // 顶背离
+    Bullish,
+    Bearish,
 }
 
-// --- 核心结构体定义 ---
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
-pub struct FeatureSet {
-    pub bucket: DateTime<Utc>,
-    pub symbol: Symbol,
-    pub interval: Interval,
-
-    #[serde(flatten)]
-    pub price_action: PriceAction,
-
-    #[serde(flatten)]
-    pub indicators: TechnicalIndicators,
-
-    #[serde(flatten)]
-    pub structure: MarketStructure,
-
-    #[serde(flatten)]
-    pub space: SpaceGeometry,
-
-    #[serde(flatten)]
-    pub signals: SignalStates,
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumeState {
+    Expand,
+    Shrink,
+    Squeeze,
+    Normal,
 }
+
+// --- 3. 特征集容器 (Feature Containers) ---
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
 pub struct PriceAction {
@@ -126,7 +97,6 @@ pub struct MarketStructure {
     pub trend_structure: Option<TrendStructure>,
     pub rsi_state: Option<RsiState>,
     pub volume_state: Option<VolumeState>,
-    #[schemars(description = "当前K线基本形态")]
     pub candle_type: Option<CandleType>,
     pub ma20_slope: Option<f64>,
     pub ma20_slope_bars: i32,
@@ -139,208 +109,179 @@ pub struct SpaceGeometry {
     pub ma20_dist_ratio: Option<f64>,
     pub dist_to_resistance: Option<f64>,
     pub dist_to_support: Option<f64>,
-    #[schemars(description = "均线收敛状态 (MA20/MA50距离是否小于阈值)")]
     pub ma_converging: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
 pub struct SignalStates {
-    // 趋势与转向
     pub macd_divergence: Option<DivergenceType>,
     pub rsi_divergence: Option<DivergenceType>,
     pub macd_cross: Option<MacdCross>,
     pub macd_momentum: Option<MacdMomentum>,
-
-    // 关键位置触发
     pub ma20_reclaim: Option<bool>,
     pub ma20_breakdown: Option<bool>,
-
-    #[schemars(description = "RSI是否连续在窄幅区间震荡 (蓄势)")]
     pub rsi_range_3: Option<bool>,
-    #[schemars(description = "成交量是否连续萎缩 (缩量回调)")]
     pub volume_shrink_3: Option<bool>,
-    #[schemars(description = "是否为极端异常波动K线")]
     pub extreme_candle: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub struct IntervalSetup {
-    pub entry: Interval,
-    pub trend: Interval,
-    pub confirmation: Interval,
+// --- 4. 期货博弈论 (Futures Game Theory) ---
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, JsonSchema)]
+pub enum RiskLevel {
+    DeepCoiling,      // 深度冷缩：OI低位，波动极低
+    Healthy,          // 健康趋势
+    LeveledUp,        // 杠杆推升
+    ExtremeOverheat,  // 极端拥挤：OI 95%分位，费率激增
+    PanicLiquidation, // 恐慌清算：OI剧降，禁止入场
 }
-impl Default for IntervalSetup {
-    fn default() -> Self {
-        Self {
-            entry: Interval::M5,
 
-            confirmation: Interval::H1,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, JsonSchema)]
+pub enum OIPositionState {
+    /// 价升量增 (Speculative Drive / Long Build-up): 多头主动进攻，投机力量推动
+    LongBuildUp,
+    /// 价跌量增 (Heavy Accumulation / Short Build-up): 空头主动开仓，或大户在低位吸筹接盘
+    ShortBuildUp,
+    /// 价跌量减 (Long Unwinding): 多头爆仓或止损，引发连环踩踏
+    LongUnwinding,
+    /// 价升量减 (Short Squeeze / Short Covering): 空头爆仓或止盈，空头平仓引发的被迫买入
+    ShortCovering,
+    /// 震荡/无明显持仓变化
+    Neutral,
+}
 
-            trend: Interval::H4,
+impl OIPositionState {
+    /// 物理层：根据价格和持仓变化判定状态
+    pub fn determine(price_change: f64, oi_change: f64) -> Self {
+        // 使用较小的阈值避免微小波动触发状态切换
+        const THRESHOLD: f64 = 1e-6;
+        if oi_change.abs() < THRESHOLD {
+            return Self::Neutral;
+        }
+
+        match (price_change > 0.0, oi_change > 0.0) {
+            (true, true) => Self::LongBuildUp,
+            (false, true) => Self::ShortBuildUp,
+            (false, false) => Self::LongUnwinding,
+            (true, false) => Self::ShortCovering,
+        }
+    }
+
+    /// 评分层：用于趋势插件和引擎打分
+    pub fn signal_score(&self) -> f64 {
+        match self {
+            Self::LongBuildUp => 1.0,   // 极强多头
+            Self::ShortCovering => 0.5, // 被动多头(空平)
+            Self::Neutral => 0.0,
+            Self::LongUnwinding => -0.5, // 被动空头(多平)
+            Self::ShortBuildUp => -1.0,  // 极强空头
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub struct MarketStatistics {
-    /// 当前波动率在历史周期内的百分比排名(0-100)。极低分位意味着即将爆发
-    pub volatility_percentile: f64,
-    /// 成交量活跃度分位数(0-100)。高分位代表机构参与度高
-    pub volume_percentile: f64,
-    /// 当前趋势已经持续的 K 线数量。>40 意味着趋势可能过度拉升或老化
-    pub trend_exhaustion_risk: u32,
-}
+// --- 5. 整合特征集 (The Unified Feature Set) ---
 
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub struct TradeManagementAudit {
-    /// 止盈/止损盈亏比
-    pub rr_ratio: f64,
-    pub entry_price: f64,
-    pub stop_loss: f64,
-    pub take_profit: f64,
-    pub current_price: f64,
-    /// 物理路径阻碍描述。例如：止盈位前有大级别均线压制
-    pub execution_hurdles: String,
-    pub invalidation_rules: InvalidationRules,
-}
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
+pub struct FeatureSet {
+    pub bucket: DateTime<Utc>,
+    pub symbol: Symbol,
+    pub interval: Interval,
 
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub struct InvalidationRules {
-    /// 时间失效：入场后指定分钟内未兑现动能则离场
-    pub time_stop_minutes: Option<u32>,
-    /// 结构失效：若收盘价破坏此价位，则逻辑即刻作废
-    pub structure_stop_price: Option<f64>,
-    pub additional_rules: String,
-}
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, JsonSchema)]
-pub enum RiskLevel {
-    // 1. 深度冷缩 (Deep Coiling)
-    // 特征：OI处于24h低位，波动率极低。
-    // 含义：暴风雨前的宁静，适合布局长线波段。
-    DeepCoiling,
-
-    Healthy,
-
-    LeveledUp,
-
-    // 4. 极端拥挤 (Extreme Overheat)
-    // 特征：OI 处于 95% 以上分位，费率激增（如 >0.03%）。
-    // 含义：多杀多/空杀空的火药桶，波段交易必须止盈或大幅减仓。
-    ExtremeOverheat,
-
-    // 5. 恐慌清算 (Panic Liquidation)
-    // 特征：OI 剧烈下降（5m 跌幅 > 3%），价格巨震。
-    // 含义：正在发生大规模爆仓，禁止入场，等待尘埃落定。
-    PanicLiquidation,
-}
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub enum LSRatioStatus {
-    RetailCrowded,     // 散户过度拥挤 (散户多空比 > 2.0)
-    WhaleAccumulating, // 大户悄悄建仓 (大户比例持续上升)
-    Diverging,         // 严重背离 (大户和散户反着走)
-    Neutral,
-}
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub struct FuturesGameTheory {
-    pub money_flow: MoneyFlowStatus,
-    pub taker_aggression: f64, // 主动买卖比 (1.0 为中性)
-
-    // 2. 筹码博弈 (基于 L/S Ratio)
-    pub sentiment_divergence: f64, // 大户 vs 散户背离度
-    pub ls_status: LSRatioStatus,
-
-    // 3. 风险与压力 (基于 Funding/OI Percentile)
-    pub leverage_risk: RiskLevel,
-    pub funding_bias: f64, // 费率偏离度
-
-    // 4. 空间阻力 (基于 Liquidation)
-    pub liquidation_zones: Vec<LiquidationZone>,
-    pub liq_intensity: f64, // 爆仓强度 (识别是否发生踩踏)
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub enum MoneyFlowStatus {
-    HeavyAccumulation, // 强力吸筹 (Price ↓/横, OI ↑↑)
-    ShortSqueeze,      // 空头踩踏 (Price ↑, OI ↓↓)
-    LongUnwinding,     // 多头平仓 (Price ↓, OI ↓)
-    SpeculativeDrive,  // 投机驱动 (Price ↑, OI ↑)
-    Neutral,
-}
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema, Default)]
-pub struct LiquidationZone {
-    pub direction: Direction,
-    pub price_level: f64,
-    pub strength: f64,
-    pub description: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub struct DynamicContext {
-    /// 空间重力场：整合所有技术与爆仓位，标注相对于当前价的百分比距离
-    pub gravity_wells: Vec<PriceGravityWell>,
-    /// 逻辑审计：专门指出指标间的背离或共振异常
-    pub logic_conflicts: Vec<CorrelationConflict>,
-    /// 信号新鲜度（秒）
-    pub signal_age: u64,
+    #[serde(flatten)]
+    pub price_action: PriceAction,
+    #[serde(flatten)]
+    pub indicators: TechnicalIndicators,
+    #[serde(flatten)]
+    pub structure: MarketStructure,
+    #[serde(flatten)]
+    pub space: SpaceGeometry,
+    #[serde(flatten)]
+    pub signals: SignalStates,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct PriceGravityWell {
     pub level: f64,
-    pub source: String, // e.g., "H4_MA200", "Liq_Wall"
-    /// 距离当前价格的百分比（如 0.005 表示上方 0.5%）
-    pub distance_pct: f64,
-    pub strength: f64, // 0.0 ~ 1.0，对应刚才计算的 intensity
+    pub source: String,    // e.g., "H4_MA200", "Liq_Wall"
+    pub distance_pct: f64, // 距离百分比
+    pub strength: f64,     // 0.0 ~ 1.0
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub struct CorrelationConflict {
-    pub factor_a: String,
-    pub factor_b: String,
-    pub nature: String, // e.g., "Divergence", "Confluence"
-    pub description: String,
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    #[default]
+    Long,
+    Short,
+    Neutral, // 用于无方向震荡或平仓观望
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub struct GlobalContext {
-    pub session: Session,
-    /// 与 BTC 相关性（-1 到 1）
-    pub btc_correlation: f64,
-    pub macro_events: String,
-    pub strategy_health: StrategyHealth,
-}
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Session {
-    NyOpen,
-    NyClose,
-    LondonOpen,
-    LondonClose,
-    Asia,
-    Overlap,
-    Weekend,
-}
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub struct StrategyHealth {
-    pub last_3_trades: Vec<TradeOutcome>,
-    pub daily_pnl: f64,
-    pub win_rate_recent: f64,
-    pub consecutive_losses: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TradeOutcome {
-    Win,
-    Loss,
-    Even,
-}
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default)]
 pub struct DerivativeSnapshot {
     pub timestamp: i64,
 
     pub last_price: f64,
 
-    pub current_oi_amount: f64, // 持仓张数/币数
-    pub current_oi_value: f64,  // 持仓名义价值 (U)
+    /// 当前持仓总量 (以张数或币数为单位)
+    pub current_oi_amount: f64,
+
+    /// 当前持仓名义价值 (以 U 为单位，用于跨币种横向对比风险)
+    pub current_oi_value: f64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OIData {
+    pub current_oi_amount: f64,
+    pub current_oi_value: f64,
+    pub change_history: Vec<f64>,
+}
+
+impl OIData {
+    pub fn new(amount: f64, value: f64, history: Vec<f64>) -> Self {
+        Self {
+            current_oi_amount: amount,
+            current_oi_value: value,
+            change_history: history,
+        }
+    }
+
+    pub fn delta_ratio(&self) -> f64 {
+        if self.change_history.is_empty() {
+            return 0.0;
+        }
+        self.change_history.last().cloned().unwrap_or(0.0) / self.current_oi_amount.max(1.0)
+    }
+}
+#[derive(Debug, Clone, Default)]
+pub struct TakerFlowData {
+    pub buy_vol: f64,
+    pub sell_vol: f64,
+    pub net_vol: f64,
+    pub taker_buy_ratio: Option<f64>, // 改为 Option，避免除以零
+}
+
+impl TakerFlowData {
+    pub fn from_candle(candle: &Candle) -> Self {
+        let buy_vol = candle.taker_buy_volume;
+        let total_vol = candle.volume;
+
+        let ratio = if total_vol > 0.0 {
+            Some(buy_vol / total_vol)
+        } else {
+            Some(0.5)
+        };
+
+        Self {
+            buy_vol,
+            sell_vol: (total_vol - buy_vol).max(0.0),
+            net_vol: buy_vol - (total_vol - buy_vol),
+            taker_buy_ratio: ratio,
+        }
+    }
+}
+#[derive(Debug, Clone)]
+pub struct RoleData {
+    pub interval: Interval,
+    pub feature_set: FeatureSet,
+    pub taker_flow: TakerFlowData,
+    pub oi_data: Option<OIData>,
 }

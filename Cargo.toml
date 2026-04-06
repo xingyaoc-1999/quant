@@ -11,7 +11,7 @@ authors = ["xingyaoc"]
 tokio = { version = "1.50.0", features = ["full"] }
 tokio-util = { version = "0.7", features = ["full"] }
 futures-util = "0.3.32"
-ractor = "0.15.11"
+
 dashmap = "6.1.0"
 reqwest = { version = "0.12.28", features = ["socks", "json"] }
 
@@ -19,10 +19,10 @@ schemars = { version = "1.2.1", features = ["chrono04"] }
 
 url = "2.5.8"
 tokio-socks = "0.5.2"
-
-
+teloxide = { version = "0.17.0", features = ["macros", "ctrlc_handler"] }
+ractor = "0.15.11"
 rig-qdrant = "0.2.1"
-
+rig-core = { version = "0.33.0", features = ["all"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4.41", features = ["serde"] }
@@ -33,4 +33,3 @@ config = "0.15.19"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ta = "0.5.0"
-rig-core = { version = "0.33.0", features = ["all"] }

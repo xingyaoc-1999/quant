@@ -5,3 +5,17 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+rig-core.workspace =true
+ractor.workspace=true
+
+tracing.workspace =true
+thiserror.workspace=true
+schemars.workspace =true
+serde.workspace =true
+serde_json.workspace =true
+tokio.workspace =true
+anyhow.workspace =true
+teloxide.workspace =true
+quant={path="../quant"}
+service = {path="../service"}
+common = {path ="../common"}

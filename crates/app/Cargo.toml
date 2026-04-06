@@ -8,9 +8,14 @@ authors.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+ractor.workspace =true
 tracing-subscriber.workspace = true
+rig-core.workspace =true
+
 service = { path = "../service" }
 common = { path = "../common" }
+
 storage = { path = "../storage" }
 api_client = { path = "../api_client" }
 notify = { path = "../notify" }
+agent = {path="../agent"}

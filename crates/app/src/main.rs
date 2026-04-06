@@ -1,17 +1,23 @@
 use std::{sync::Arc, time::Duration};
 
+use agent::agent::{
+    technical::{TechnicalAgent, TechnicalAgentArgs, TechnicalAgentMessage},
+    Model,
+};
 use anyhow::{Context, Result};
+use rig::tool::ToolSet;
 
 use api_client::http::binance::ArchiveProvider;
 
 use common::{
-    config::{self, Appconfig, ProxyConfig},
+    config::{Appconfig, ProxyConfig},
     utils::CooledProxyPool,
     Symbol,
 };
 
 use notify::telegram::BotApp;
 
+use ractor::{cast, Actor};
 use service::{context::FeatureContextManager, integrity_manager::DataIntegrityManager};
 
 use storage::postgres::Storage;
@@ -54,7 +60,6 @@ async fn main() -> Result<()> {
 
     let tg_app = BotApp::new(cfg.telegram.token.clone(), proxy_pool.clone()).await?;
 
-    // --- 4. 启动异步任务 ---
     info!("🚀 Starting Telegram Bot...");
     tokio::spawn(async move {
         if let Err(e) = tg_app
@@ -67,19 +72,39 @@ async fn main() -> Result<()> {
             )
             .await
         {
-            error!("❌ Telegram Bot Runtime Error: {:?}", e);
+            error!("Telegram Bot Runtime Error: {:?}", e);
         }
     });
 
     info!("🚀 Starting Integrity Manager...");
     integrity_manager.start();
+    let model = Model::openai(
+        "sk-KL85Y5XsOM7kcm7qzSSFUUJ5iqEAcU3kiV4rAGsWPC6rFlp7",
+        "https://aiberm.com/v1",
+        "openai/gpt-5.4",
+    )?;
+    let tool_set = ToolSet::builder().static_tool(score_query).build();
+    let agent_args = TechnicalAgentArgs {
+        model,
+        tx_out: tx_to_tg,
+        tool_set,
+    };
+
+    let (agent_actor, _agent_handle) = Actor::spawn(
+        Some("TechnicalAgent".to_string()),
+        TechnicalAgent,
+        agent_args,
+    )
+    .await?;
 
     let mut rx_cmd = rx_from_tg;
+    let actor_for_router = agent_actor.clone();
+
     tokio::spawn(async move {
         while let Some((cmd, chat_id)) = rx_cmd.recv().await {
             info!("📩 Received command from TG: {}", cmd);
-            // 这里处理你的 CONFIG:SET_ROLE:BTC/USDT:MarketMaker 逻辑
-            // 处理完后可以给 tx_to_tg 发个确认
+
+            let _ = cast!(actor_for_router, TechnicalAgentMessage::Task(cmd, chat_id));
         }
     });
 

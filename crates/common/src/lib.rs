@@ -137,7 +137,6 @@ impl Candle {
         let mut candles = Vec::with_capacity(df.height());
 
         for i in 0..df.height() {
-            // 使用 get(i) 获取值。核心字段若缺失则回退到默认值（或你可以用 filter_map 剔除）
             candles.push(Candle {
                 symbol: *symbol,
                 timestamp: open_time.get(i).unwrap_or(0),
@@ -147,7 +146,6 @@ impl Candle {
                 close: close.get(i).unwrap_or(0.0),
                 volume: volume.get(i).unwrap_or(0.0),
 
-                // 处理可选列：如果列不存在或该行为 null，则填 0.0 / 0
                 quote_volume: quote.as_ref().and_then(|c| c.get(i)).unwrap_or(0.0),
                 taker_buy_volume: taker_buy.as_ref().and_then(|c| c.get(i)).unwrap_or(0.0),
                 taker_buy_quote_volume: taker_quote.as_ref().and_then(|c| c.get(i)).unwrap_or(0.0),

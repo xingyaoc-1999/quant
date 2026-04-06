@@ -256,8 +256,6 @@ impl BotApp {
                 config.insert(role, interval);
                 let changed_roles = manager.update_symbol_config(symbol, config);
 
-
-           
                 if !changed_roles.is_empty() {
                     for (changed_role, target_interval) in changed_roles {
                         let m_clone = manager.clone();

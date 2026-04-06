@@ -1,8 +1,7 @@
 use crate::analyzer::{
-    AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, ContextKey, MarketContext,
-    OIPositionState, Role,
+    AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, ContextKey, MarketContext, Role,
 };
-use crate::types::{RsiState, TrendStructure};
+use crate::types::{OIPositionState, RsiState, TrendStructure};
 use serde_json::json;
 
 pub struct MarketRegimeAnalyzer;
@@ -157,9 +156,44 @@ impl Analyzer for MarketRegimeAnalyzer {
                 _ => {}
             }
         }
+        // --- E. 主动流向博弈 (Taker Flow) ---
+        let mut m_flow = 1.0;
 
-        let final_mult = m_regime * m_mtf * m_momentum * m_oi;
+        if let Some(pct) = trend.taker_flow.taker_buy_ratio {
+            match structure {
+                TrendStructure::StrongBullish | TrendStructure::Bullish => {
+                    if pct > 0.55 {
+                        // 主买占比超过 55%：动力充足
+                        // 公式：将 0.55-0.80 的占比映射为 1.1-1.6 的乘数
+                        m_flow = 1.0 + (pct.min(0.8) - 0.5) * 2.0;
+                    } else if pct < 0.42 {
+                        // 主买占比低于 42%：虽然价格在涨，但全是主动砸盘，背离严重
+                        m_flow = 0.65;
+                    }
+                }
 
+                TrendStructure::StrongBearish | TrendStructure::Bearish => {
+                    if pct < 0.45 {
+                        // 主买占比低于 45% = 主卖占比超过 55%
+                        m_flow = 1.0 + (0.5 - pct.max(0.2)) * 2.0;
+                    } else if pct > 0.58 {
+                        // 价格在跌，但主动买盘开始反扑，警惕空头回补
+                        m_flow = 0.65;
+                    }
+                }
+
+                // --- 震荡市：利用极端占比识别假突破 ---
+                TrendStructure::Range => {
+                    // 占比 > 65% 或 < 35% 通常意味着震荡即将结束，资金开始选择方向
+                    if pct > 0.65 || pct < 0.35 {
+                        m_flow = 1.25;
+                    } else {
+                        m_flow = 0.9; // 极其均衡的占比在震荡市意味着没有交易价值
+                    }
+                }
+            }
+        }
+        let final_mult = m_regime * m_mtf * m_momentum * m_oi * m_flow;
         // --- D. 持久化 (必须与 Volume/Level 分析器对齐) ---
         ctx.set_cached(ContextKey::RegimeStructure, json!(structure));
         ctx.set_multiplier(AnalyzerKind::TrendStrength, m_regime * m_mtf);

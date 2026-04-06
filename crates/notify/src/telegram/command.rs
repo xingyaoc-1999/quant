@@ -1,8 +1,8 @@
 use crate::telegram::BotApp;
 use service::context::FeatureContextManager;
 use std::sync::Arc;
+use teloxide::prelude::*;
 use teloxide::utils::command::BotCommands;
-use teloxide::{prelude::*, types::BotCommand};
 use tokio::sync::mpsc::Sender;
 use tracing::error;
 
