@@ -86,6 +86,7 @@ impl Actor for TechnicalAgent {
                 debug!("[{}] Received task: {}", actor_name, task);
                 match state.process_task(&task).await {
                     Ok(output) => {
+                        info!(output);
                         if let Err(e) = state.tx_out.send((output, chat_id)).await {
                             error!("[{}] Failed to send response: {:?}", actor_name, e);
                         }

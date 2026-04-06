@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
     let tg_app = BotApp::new(cfg.telegram.token.clone(), proxy_pool.clone()).await?;
 
     info!("🚀 Starting Telegram Bot...");
-    // ✅ 修复：克隆引用给异步任务使用
+    
     let ctx_for_tg = ctx_manager.clone();
     let storage_for_tg = storage.clone();
     let archive_for_tg = archive_provider.clone();

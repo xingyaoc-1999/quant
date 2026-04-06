@@ -1,7 +1,4 @@
-use crate::{
-    report::AnalysisReport,
-    types::{DerivativeSnapshot, Direction, FeatureSet, RoleData},
-};
+use crate::{report::AnalysisAudit, types::{DerivativeSnapshot, Direction, FeatureSet, RoleData}};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use common::{Candle, Interval, Symbol};
@@ -161,8 +158,6 @@ impl Default for AnalysisResult {
             rationale: vec![],
             debug_data: json!({}),
             kind: AnalyzerKind::MarketRegime,
-
-            
         }
     }
 }
@@ -333,12 +328,8 @@ pub struct AnalysisEngine {
 }
 
 impl AnalysisEngine {
-    pub fn new(config: Config,analyzers:Vec<Box<dyn Analyzer>>) -> Self{
-        
-     Self {
-            analyzers,
-            config,
-        }
+    pub fn new(config: Config, analyzers: Vec<Box<dyn Analyzer>>) -> Self {
+        Self { analyzers, config }
     }
 
     pub fn add_analyzer(&mut self, analyzer: Box<dyn Analyzer>) {
@@ -346,7 +337,7 @@ impl AnalysisEngine {
         self.analyzers.push(analyzer);
     }
 
-    pub fn run(&self, ctx: &mut MarketContext) -> AnalysisReport {
+    pub fn run(&self, ctx: &mut MarketContext) -> AnalysisAudit {
         let mut results = Vec::new();
         let mut errors = Vec::new();
 
@@ -373,7 +364,7 @@ impl AnalysisEngine {
 
         let verdict = self.aggregate(&ctx, results);
 
-        AnalysisReport::build(&ctx, verdict)
+        AnalysisAudit::build(&ctx, verdict)
     }
 
     fn aggregate(&self, ctx: &MarketContext, results: Vec<AnalysisResult>) -> FinalSignal {

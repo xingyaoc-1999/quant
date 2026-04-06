@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize}; // 建议引入 chrono 处理时间，或者使用 ctx 内部的时间
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub struct AnalysisReport {
+pub struct AnalysisAudit {
     /// 引擎给出的综合判定
     pub verdict: FinalSignal,
 
@@ -43,7 +43,7 @@ pub struct MarketSnapshot {
     pub entry_taker_ratio: f64,
 }
 
-impl AnalysisReport {
+impl AnalysisAudit {
     pub fn build(ctx: &MarketContext, verdict: FinalSignal) -> Self {
         // ========== 1. 预提取 Role (性能与借用优化) ==========
         // 这样后续代码中只通过 Option 访问，不再多次进入 ctx 查找

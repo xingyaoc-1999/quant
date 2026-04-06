@@ -1,4 +1,3 @@
-use quant::report::AnalysisReport;
 use rig::{
     client::CompletionClient,
     completion::{CompletionRequestBuilder, ToolDefinition},
@@ -45,15 +44,15 @@ impl Model {
         history: Vec<Message>,
         preamble: String,
         definitions: Vec<ToolDefinition>,
-        schema: Schema,
+        schema: Option<Schema>,
     ) -> Result<OneOrMany<AssistantContent>> {
         let response = CompletionRequestBuilder::new(model, current_msg)
-            .preamble(preamble)
+            // .preamble(preamble)
             .messages(history)
             .temperature(0.2)
             .tools(definitions)
-            .tool_choice(ToolChoice::Auto)
-            .output_schema(schema)
+            .tool_choice(ToolChoice::None)
+            // .output_schema(schema)
             .send()
             .await
             .context("Failed to get model response")?;
@@ -74,7 +73,7 @@ impl Model {
 
         let definitions = tool_set.get_tool_definitions().await?;
         let mut turns = 0;
-        let schema = schemars::schema_for!(AnalysisReport);
+        // let schema = schemars::schema_for!(AnalysisReport);
 
         while turns < max_turns {
             let (current_msg, history) = chat_history
@@ -89,7 +88,7 @@ impl Model {
                         history.to_vec(),
                         preamble.clone(),
                         definitions.clone(),
-                        schema.clone(),
+                        None,
                     )
                     .await?
                 }
@@ -100,7 +99,7 @@ impl Model {
                         history.to_vec(),
                         preamble.clone(),
                         definitions.clone(),
-                        schema.clone(),
+                        None,
                     )
                     .await?
                 }

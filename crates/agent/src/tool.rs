@@ -1,5 +1,5 @@
 use common::Symbol;
-use quant::{analyzer::AnalysisEngine, report::AnalysisReport};
+use quant::{analyzer::AnalysisEngine, report::AnalysisAudit};
 use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -37,7 +37,7 @@ impl Tool for ScoreQueryTool {
 
     type Error = ScoringToolError;
     type Args = ScoreQueryArgs;
-    type Output = AnalysisReport; // 目标输出类型
+    type Output = AnalysisAudit; // 目标输出类型
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         let parameters = serde_json::to_value(schemars::schema_for!(ScoreQueryArgs))
@@ -67,5 +67,9 @@ impl Tool for ScoreQueryTool {
         let report = self.engine.run(&mut *market_data_ptr);
 
         Ok(report)
+    }
+
+    fn name(&self) -> String {
+        Self::NAME.to_string()
     }
 }
