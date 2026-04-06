@@ -1,11 +1,21 @@
 use std::{sync::Arc, time::Duration};
 
 use agent::{
-    agent::{Model, technical::{TechnicalAgent, TechnicalAgentArgs, TechnicalAgentMessage}},
-    tool::ScoreQueryTool
+    agent::{
+        technical::{TechnicalAgent, TechnicalAgentArgs, TechnicalAgentMessage},
+        Model,
+    },
+    tool::ScoreQueryTool,
 };
 use anyhow::{Context, Result};
-use quant::analyzer::{AnalysisEngine, Config};
+use quant::analyzer::{
+    context::{
+        level_proximity::LevelProximityAnalyzer, market_regime::MarketRegimeAnalyzer,
+        volatility_environment::VolatilityEnvironmentAnalyzer,
+        volume_structure::VolumeStructureAnalyzer,
+    },
+    AnalysisEngine, Analyzer, Config,
+};
 use rig::tool::ToolSet;
 
 use api_client::http::binance::ArchiveProvider;
@@ -45,12 +55,12 @@ async fn main() -> Result<()> {
     // 3. 初始化核心组件
     let symbols = Symbol::all();
     let proxy_pool = Arc::new(setup_proxy_pool(&cfg.proxy));
-    
+
     // ctx_manager 是核心共享资源
     let ctx_manager = Arc::new(FeatureContextManager::new(&symbols));
 
     let archive_provider = Arc::new(ArchiveProvider::new(proxy_pool.clone()));
-    
+
     // ✅ 修复：克隆 ctx_manager 传入数据完整性管理器
     let integrity_manager = Arc::new(DataIntegrityManager::new(
         symbols.clone(),
@@ -71,16 +81,10 @@ async fn main() -> Result<()> {
     let ctx_for_tg = ctx_manager.clone();
     let storage_for_tg = storage.clone();
     let archive_for_tg = archive_provider.clone();
-    
+
     tokio::spawn(async move {
         if let Err(e) = tg_app
-            .run(
-                tx_in,
-                rx_out,
-                ctx_for_tg,
-                archive_for_tg,
-                storage_for_tg,
-            )
+            .run(tx_in, rx_out, ctx_for_tg, archive_for_tg, storage_for_tg)
             .await
         {
             error!("Telegram Bot Runtime Error: {:?}", e);
@@ -97,17 +101,18 @@ async fn main() -> Result<()> {
         "https://aiberm.com/v1",
         "openai/gpt-5.4",
     )?;
-
-     let engine = AnalysisEngine::new(Config::default());
-    
-    
+    let analyzers: Vec<Box<dyn Analyzer>> = vec![
+        Box::new(VolatilityEnvironmentAnalyzer), // 1. 环境基调
+        Box::new(MarketRegimeAnalyzer),          // 2. 确定方向
+        Box::new(VolumeStructureAnalyzer),       // 3. 能量确认
+        Box::new(LevelProximityAnalyzer),        // 4. 空间位置
+    ];
+    let engine = AnalysisEngine::new(Config::default(), analyzers);
 
     // ✅ 修复：克隆 ctx_manager 给 Tool 使用
     let score_query = ScoreQueryTool::new(ctx_manager.clone(), Arc::new(engine));
-    
-    let tool_set = ToolSet::builder()
-        .static_tool(score_query)
-        .build();
+
+    let tool_set = ToolSet::builder().static_tool(score_query).build();
 
     let agent_args = TechnicalAgentArgs {
         model,
@@ -115,7 +120,7 @@ async fn main() -> Result<()> {
         tool_set,
     };
 
-    // 7. 启动 Actor 
+    // 7. 启动 Actor
     let (agent_actor, _agent_handle) = Actor::spawn(
         Some("TechnicalAgent".to_string()),
         TechnicalAgent,

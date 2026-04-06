@@ -126,15 +126,16 @@ impl Model {
             });
 
             if tool_calls.is_empty() {
-                chat_history.retain(|msg| match msg {
-                    Message::User { content } => {
-                        content.iter().any(|c| matches!(c, UserContent::Text(_)))
-                    }
-                    Message::Assistant { content, .. } => content
-                        .iter()
-                        .any(|c| matches!(c, AssistantContent::Text(_))),
-                    Message::System { content } => {true}
-                });
+                chat_history.clear();
+                // chat_history.retain(|msg| match msg {
+                //     Message::User { content } => {
+                //         content.iter().any(|c| matches!(c, UserContent::Text(_)))
+                //     }
+                //     Message::Assistant { content, .. } => content
+                //         .iter()
+                //         .any(|c| matches!(c, AssistantContent::Text(_))),
+                //     Message::System { content } => {true}
+                // });
 
                 return Ok(current_turn_text);
             }

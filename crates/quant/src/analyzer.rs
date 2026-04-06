@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, f64, str::FromStr};
 use tracing::{debug, error, warn};
-mod context;
+pub mod context;
 // ==========================================
 // 1. 常量与上下文 Key (类型安全)
 // ==========================================
@@ -103,7 +103,6 @@ impl FromStr for Role {
 pub struct AnalysisResult {
     pub kind: AnalyzerKind,
     pub score: f64,
-    pub direction: Direction,
     pub is_violation: bool,
     pub weight_multiplier: f64,
     pub description: String,
@@ -163,7 +162,7 @@ impl Default for AnalysisResult {
             debug_data: json!({}),
             kind: AnalyzerKind::MarketRegime,
 
-            direction: Direction::Neutral,
+            
         }
     }
 }
@@ -334,10 +333,10 @@ pub struct AnalysisEngine {
 }
 
 impl AnalysisEngine {
-    pub fn new(config: Config) -> Self{
+    pub fn new(config: Config,analyzers:Vec<Box<dyn Analyzer>>) -> Self{
         
      Self {
-            analyzers: Vec::new(),
+            analyzers,
             config,
         }
     }
