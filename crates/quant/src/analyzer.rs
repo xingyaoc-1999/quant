@@ -2,6 +2,7 @@ use crate::{
     report::AnalysisReport,
     types::{DerivativeSnapshot, Direction, FeatureSet, RoleData},
 };
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use common::{Candle, Interval, Symbol};
 use core::fmt;
@@ -102,7 +103,7 @@ impl FromStr for Role {
 pub struct AnalysisResult {
     pub kind: AnalyzerKind,
     pub score: f64,
-    pub direction: crate::types::Direction, // 关键：增加方向
+    pub direction: Direction,
     pub is_violation: bool,
     pub weight_multiplier: f64,
     pub description: String,
@@ -261,31 +262,37 @@ impl MarketContext {
     }
 }
 
-
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub weights: HashMap<AnalyzerKind, f64>,
     pub sensitivity: f64,
 }
 
-impl Config {
-    pub fn validate(&self) -> Result<(), String> {
-        if !(0.0..=1.0).contains(&self.sensitivity) {
-            return Err(format!(
-                "sensitivity must be in [0,1], got {}",
-                self.sensitivity
-            ));
+impl Default for Config {
+    fn default() -> Self {
+        let mut weights = HashMap::new();
+
+        // 核心过滤器：环境不对，后面全废 (给高权重)
+        weights.insert(AnalyzerKind::MarketRegime, 1.5);
+
+        // 趋势追踪：量化交易的盈利核心
+        weights.insert(AnalyzerKind::TrendStrength, 1.2);
+
+        // 辅助指标：作为验证使用 (默认权重)
+        weights.insert(AnalyzerKind::Momentum, 1.0);
+        weights.insert(AnalyzerKind::VolumeProfile, 1.0);
+
+        // 反转指标：风险较高，初始给低权重，靠动态乘数激活
+        weights.insert(AnalyzerKind::Divergence, 0.8);
+        weights.insert(AnalyzerKind::SupportResistance, 0.8);
+        weights.insert(AnalyzerKind::Volatility, 0.5);
+
+        Self {
+            weights,
+            sensitivity: 0.04, // 对应你 tanh 逻辑里的推荐值
         }
-        for (kind, &weight) in &self.weights {
-            if weight < 0.0 {
-                return Err(format!("weight for {:?} is negative: {}", kind, weight));
-            }
-        }
-        Ok(())
     }
 }
-
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct FinalSignal {
     pub symbol: Symbol,
@@ -327,12 +334,12 @@ pub struct AnalysisEngine {
 }
 
 impl AnalysisEngine {
-    pub fn new(config: Config) -> Result<Self, String> {
-        config.validate()?;
-        Ok(Self {
+    pub fn new(config: Config) -> Self{
+        
+     Self {
             analyzers: Vec::new(),
             config,
-        })
+        }
     }
 
     pub fn add_analyzer(&mut self, analyzer: Box<dyn Analyzer>) {
@@ -340,12 +347,12 @@ impl AnalysisEngine {
         self.analyzers.push(analyzer);
     }
 
-    pub fn run(&mut self, mut ctx: MarketContext) -> AnalysisReport {
+    pub fn run(&self, ctx: &mut MarketContext) -> AnalysisReport {
         let mut results = Vec::new();
         let mut errors = Vec::new();
 
         for analyzer in &self.analyzers {
-            match analyzer.analyze(&mut ctx) {
+            match analyzer.analyze(ctx) {
                 Ok(res) => {
                     debug!(
                         "Analyzer {} produced score: {:.3}",
@@ -365,9 +372,9 @@ impl AnalysisEngine {
             error!("{} analyzer(s) failed during analysis", errors.len());
         }
 
-      let verdict =   self.aggregate(&ctx, results);
-      
-      AnalysisReport::build(&ctx, verdict)
+        let verdict = self.aggregate(&ctx, results);
+
+        AnalysisReport::build(&ctx, verdict)
     }
 
     fn aggregate(&self, ctx: &MarketContext, results: Vec<AnalysisResult>) -> FinalSignal {
@@ -427,23 +434,12 @@ impl AnalysisEngine {
         FinalSignal::new_with_reports(ctx.symbol, final_score, results)
     }
 
-    /// 辅助函数：将原始加权分映射到标准 [-100, 100] 空间
     fn normalize_to_standard_range(&self, score: f64) -> f64 {
-        // 灵敏度系数，决定了原始分数达到多少时会接近饱和
-        // 假设原始加权分在 50 左右代表强信号
-        let sensitivity = 0.04;
-
-        // 使用 Tanh 函数：tanh(x) 的值域是 [-1, 1]
-        let normalized = (score * sensitivity).tanh();
-
-        // 放大到 100 分制
+        // 使用配置中的灵敏度，而不是硬编码
+        let normalized = (score * self.config.sensitivity).tanh();
         (normalized * 100.0).round()
     }
 }
-
-// ==========================================
-// 9. 错误类型
-// ==========================================
 
 #[derive(Debug, thiserror::Error)]
 pub enum AnalysisError {

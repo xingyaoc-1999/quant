@@ -6,7 +6,6 @@ use serde::Deserialize;
 use service::context::FeatureContextManager;
 use std::{str::FromStr, sync::Arc};
 use thiserror::Error;
-use tracing::{debug, error};
 
 #[derive(Debug, Error)]
 pub enum ScoringToolError {
@@ -53,16 +52,19 @@ impl Tool for ScoreQueryTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // 1. 解析 Symbol，注意 clone 以防 args 后续还要用
         let symbol = Symbol::from_str(&args.symbol)
-            .map_err(|_| ScoringToolError::SymbolNotFound(args.symbol))?;
+            .map_err(|_| ScoringToolError::SymbolNotFound(args.symbol.clone()))?;
 
-        let market_data = self
+        // 2. 获取 DashMap 的可变锁代理 (RefMut)
+        // 注意：这里 market_data_ptr 持有了分片锁
+        let mut market_data_ptr = self
             .manager
             .registry
-            .get(&symbol)
+            .get_mut(&symbol)
             .ok_or_else(|| ScoringToolError::SymbolNotFound(args.symbol))?;
 
-        let report = self.engine.run(market_data.into());
+        let report = self.engine.run(&mut *market_data_ptr);
 
         Ok(report)
     }

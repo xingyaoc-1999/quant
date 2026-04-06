@@ -14,7 +14,7 @@ rig-core.workspace =true
 
 service = { path = "../service" }
 common = { path = "../common" }
-
+quant  ={path="../quant"}
 storage = { path = "../storage" }
 api_client = { path = "../api_client" }
 notify = { path = "../notify" }

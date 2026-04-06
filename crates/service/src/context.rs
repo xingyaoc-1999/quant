@@ -89,10 +89,7 @@ impl RoleProcessor {
     }
 
     pub fn generate_oi_data(&self, cur_price: f64, cur_oi: f64, cur_oi_val: f64) -> Option<OIData> {
-        if cur_price <= f64::EPSILON
-            || cur_oi <= f64::EPSILON
-            || self.last_anchor_oi <= f64::EPSILON
-        {
+        if cur_price <= f64::EPSILON || cur_oi <= f64::EPSILON {
             return None;
         }
 
@@ -227,10 +224,6 @@ impl FeatureContextManager {
 
                         let feature_set = proc.calculator.next(&closed_bar, proc.interval, g_close);
 
-                        // 【更新锚点数值】
-                        proc.last_anchor_price = current_snap.last_price;
-                        proc.last_anchor_oi = current_snap.current_oi_amount;
-
                         role_updates.push((
                             *role,
                             RoleData {
@@ -327,10 +320,6 @@ impl FeatureContextManager {
                             proc.oi_history.pop_front();
                         }
                         proc.oi_history.push_back(rec.sum_open_interest);
-
-                        // 【修改】Warmup 时同步更新锚点数值
-                        proc.last_anchor_price = candle.close;
-                        proc.last_anchor_oi = rec.sum_open_interest;
                     }
                 }
                 if let Some(last_candle) = seeds.last() {
@@ -346,7 +335,6 @@ impl FeatureContextManager {
                         if let Some(closed_bar) = proc.process_m1(m1) {
                             proc.calculator.next(&closed_bar, proc.interval, g_close);
                             proc.last_processed_ts = closed_bar.timestamp;
-                            proc.last_anchor_price = closed_bar.close;
                         }
                     }
                 }

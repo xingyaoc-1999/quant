@@ -103,6 +103,7 @@ dependencies = [
  "api_client",
  "common",
  "notify",
+ "quant",
  "ractor",
  "rig-core",
  "service",
