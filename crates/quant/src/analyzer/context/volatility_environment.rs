@@ -1,15 +1,7 @@
 use crate::analyzer::{
-    AnalysisError,
-    AnalysisResult,
-    Analyzer,
-    AnalyzerKind,
-    AnalyzerStage,
-    Config,
-    ContextKey, // 确保引入了你定义的 ContextKey
-    MarketContext,
-    Role,
-    SharedAnalysisState,
+    AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, ContextKey, MarketContext, Role,
 };
+use crate::types::TrendStructure; // 假设你有这个枚举
 use serde_json::json;
 
 pub struct VolatilityEnvironmentAnalyzer;
@@ -18,36 +10,16 @@ impl Analyzer for VolatilityEnvironmentAnalyzer {
     fn name(&self) -> &'static str {
         "volatility_env"
     }
-
-    fn stage(&self) -> AnalyzerStage {
-        AnalyzerStage::Context
-    }
-
     fn kind(&self) -> AnalyzerKind {
         AnalyzerKind::Volatility
     }
 
-    fn analyze(
-        &self,
-        ctx: &MarketContext,
-        _config: &Config,
-        shared: &SharedAnalysisState,
-    ) -> Result<AnalysisResult, AnalysisError> {
-        // 1. 获取币种作用域与基础特征
-        let scope = shared.scope(&ctx.symbol);
-        let trend_role = ctx.get_role(Role::Trend)?; // 使用 ? 处理 Result
+    fn analyze(&self, ctx: &mut MarketContext) -> Result<AnalysisResult, AnalysisError> {
+        let trend_role = ctx.get_role(Role::Trend)?;
         let feat = &trend_role.feature_set;
         let last_price = ctx.global.last_price;
 
-        // --- A. 获取基础行情模式 (使用类型安全的 ContextKey) ---
-        let regime_str = scope
-            .get_val(ContextKey::RegimeStructure)
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "Range".to_string());
-
         let vol_p = feat.price_action.volatility_percentile;
-
-        // --- B. 计算动态 ATR 比例并共享 (使用 ContextKey) ---
         let atr = feat.indicators.atr_14.unwrap_or(last_price * 0.005);
         let atr_ratio = if last_price > 0.0 {
             atr / last_price
@@ -55,89 +27,69 @@ impl Analyzer for VolatilityEnvironmentAnalyzer {
             0.005
         };
 
-        scope.insert_ctx(ContextKey::VolAtrRatio, json!(atr_ratio));
-        scope.insert_ctx(ContextKey::VolPercentile, json!(vol_p));
+        // 全局持久化，这步你做得很好
+        ctx.set_cached(ContextKey::VolAtrRatio, json!(atr_ratio));
+        ctx.set_cached(ContextKey::VolPercentile, json!(vol_p));
 
-        // 初始化结果
-        let mut res = AnalysisResult::new(self.kind(), "VOL_ENV".into()).with_desc(format!(
-            "波动率分位: {:.1}% | ATR比例: {:.2}%",
-            vol_p,
-            atr_ratio * 100.0
-        ));
+        let mut res = AnalysisResult::new(self.kind(), "VOL_ENV".into());
 
-        // --- C. 流动性枯竭检测 (一票否决) ---
+        // 2. 深度熔断逻辑：流动性枯竭
         if vol_p < 8.0 {
-            // 写入布尔值标识
-            scope.insert_ctx(ContextKey::VolIsCompressed, json!(false));
-            // 针对当前 AnalyzerKind 设置低倍数
-            scope.set_multiplier(self.kind(), 0.1);
-
             return Ok(res
                 .with_mult(0.1)
-                .because("市场极度冻结 (Vol < 8%)，触发流动性熔断")
+                .because("市场流动性极度匮乏，拒绝所有趋势交易")
                 .violate());
         }
 
-        // --- D. 基于 Regime 的非线性逻辑 ---
-        let mut m_vol_env: f64 = 1.0;
-        let mut m_vol_squeeze: f64 = 1.0;
+        // 3. 获取市场结构（增强鲁棒性）
+        let regime = ctx
+            .get_cached::<TrendStructure>(ContextKey::RegimeStructure)
+            .unwrap_or(TrendStructure::Range);
 
-        // 使用模式匹配让逻辑更清晰
-        match (regime_str.as_str(), vol_p) {
-            // 1. 强趋势环境
-            (s, p) if s.contains("Strong") => {
-                if p > 90.0 {
-                    m_vol_env = 1.1;
-                    res = res.because("强趋势且波动率极高，趋势正在加速爆发");
-                } else if p < 20.0 {
-                    m_vol_env = 0.7;
-                    res = res.because("强趋势但波动率萎缩，面临动力衰竭风险");
+        // 4. 计算动态乘数
+        let mut m_env = 1.0;
+        let mut is_compressed = false;
+
+        // 引入数学公式：波动率对趋势的“确认度”
+        // 逻辑：波动率越接近 50%-70% (健康区)，乘数越高；两极化则压制
+        match regime {
+            TrendStructure::StrongBullish | TrendStructure::StrongBearish => {
+                if vol_p > 90.0 {
+                    m_env = 1.15; // 加速阶段
+                    res = res.because("强趋势加速，波动率共振放大");
+                } else if vol_p < 25.0 {
+                    m_env = 0.65; // 动力不足
+                    res = res.because("强趋势但波动过低，警惕‘诱多/诱空’后撤");
                 } else {
-                    m_vol_env = 1.25;
-                    res = res.because("健康波动率支持强趋势持续");
+                    m_env = 1.3; // 黄金波段
                 }
             }
-            // 2. 震荡环境
-            ("Range", p) => {
-                if p > 85.0 {
-                    m_vol_env = 0.4;
-                    res = res.because("震荡市高波动，易发假突破，调低权重");
-                } else if p < 20.0 {
-                    m_vol_env = 0.7;
-                    m_vol_squeeze = 1.25;
-                    scope.insert_ctx(ContextKey::VolIsCompressed, json!(true));
-                    res = res.because("震荡极度缩量 (Squeeze)，潜在大变盘预警");
-                } else {
-                    m_vol_env = 1.1;
-                    res = res.because("标准震荡波动，适合区间交易");
+            TrendStructure::Range => {
+                if vol_p < 20.0 {
+                    is_compressed = true;
+                    m_env = 0.8; // 压缩态压制当前波动，但开启 Squeeze 标志
+                    res = res.because("进入极度压缩区间 (Squeeze)，等待突破信号");
+                } else if vol_p > 85.0 {
+                    m_env = 0.4; // 震荡市高波动 = 绞肉机
+                    res = res
+                        .because("震荡市极端高波动，属于无效噪音，规避风险")
+                        .violate();
                 }
             }
-            // 3. 默认/普通环境
-            (_, p) => {
-                if p > 92.0 {
-                    m_vol_env = 0.6;
-                    res = res.because("波动率处于极端高位，警惕均值回归反转");
-                } else if p < 15.0 {
-                    m_vol_env = 0.5;
-                    res = res.because("波动率过低，缺乏获利空间");
-                }
+            _ => {
+                // 普通趋势或未知
+                m_env = if vol_p > 92.0 { 0.5 } else { 1.0 };
             }
         }
 
-        // --- E. 状态持久化与最终计算 ---
-        let final_mult = m_vol_env * m_vol_squeeze;
+        ctx.set_cached(ContextKey::VolIsCompressed, json!(is_compressed));
+        ctx.set_multiplier(self.kind(), m_env);
 
-        // 使用框架提供的 set_multiplier
-        scope.set_multiplier(self.kind(), final_mult);
-
-        Ok(res.with_mult(final_mult).debug(json!({
+        Ok(res.with_mult(m_env).debug(json!({
             "vol_p": vol_p,
-            "atr_ratio": atr_ratio,
-            "regime": regime_str,
-            "m_vol_env": m_vol_env,
-            "m_vol_squeeze": m_vol_squeeze,
-            "final_m": final_mult,
-            "is_compressed": vol_p < 20.0 && regime_str == "Range"
+            "regime": format!("{:?}", regime),
+            "final_m": m_env,
+            "is_compressed": is_compressed
         })))
     }
 }

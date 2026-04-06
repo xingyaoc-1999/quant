@@ -1,8 +1,7 @@
 use crate::analyzer::{
-    AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, AnalyzerStage, Config, ContextKey,
-    MarketContext, Role, SharedAnalysisState,
+    AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, ContextKey, MarketContext, Role,
 };
-use crate::types::VolumeState;
+use crate::types::{TrendStructure, VolumeState};
 use serde_json::json;
 
 pub struct VolumeStructureAnalyzer;
@@ -11,106 +10,101 @@ impl Analyzer for VolumeStructureAnalyzer {
     fn name(&self) -> &'static str {
         "volume_structure"
     }
-
-    fn stage(&self) -> AnalyzerStage {
-        // 依然属于 Context 阶段，为 Signal 提供权重
-        AnalyzerStage::Context
-    }
-
     fn kind(&self) -> AnalyzerKind {
         AnalyzerKind::VolumeProfile
     }
 
-    fn analyze(
-        &self,
-        ctx: &MarketContext,
-        _config: &Config,
-        shared: &SharedAnalysisState,
-    ) -> Result<AnalysisResult, AnalysisError> {
-        // 1. 获取币种作用域与特征
-        let scope = shared.scope(&ctx.symbol);
-        let trend_role = ctx.get_role(Role::Trend)?;
-        let feat = &trend_role.feature_set;
+    fn analyze(&self, ctx: &mut MarketContext) -> Result<AnalysisResult, AnalysisError> {
+        // ========== 1. 数据提取阶段 (解开借用绑定) ==========
+        // 我们在一个独立的代码块中获取数据，执行完后 trend_role 和 feat 会被释放
+        let (vol_state, extreme_candle, vol_shrink_3, rsi_ready, dist_sup, dist_res) = {
+            let trend_role = ctx.get_role(Role::Trend)?;
+            let f = &trend_role.feature_set;
+            (
+                f.structure.volume_state.clone(), // Clone 出来，断开引用
+                f.signals.extreme_candle.unwrap_or(false),
+                f.signals.volume_shrink_3.unwrap_or(false),
+                f.signals.rsi_range_3.unwrap_or(false),
+                f.space.dist_to_support.unwrap_or(1.0),
+                f.space.dist_to_resistance.unwrap_or(1.0),
+            )
+        }; // <--- 借用在这里结束了，ctx 现在是自由的了
 
-        // --- A. 从上下文获取波动率状态 ---
-        let is_vol_compressed = scope.get_bool(ContextKey::VolIsCompressed);
+        // ========== 2. 缓存读取 (此时可以安全地操作 ctx) ==========
+        let is_vol_compressed = ctx
+            .get_cached::<bool>(ContextKey::VolIsCompressed)
+            .unwrap_or(false);
+        let vol_p = ctx
+            .get_cached::<f64>(ContextKey::VolPercentile)
+            .unwrap_or(50.0);
+        let regime = ctx
+            .get_cached::<TrendStructure>(ContextKey::RegimeStructure)
+            .unwrap_or(TrendStructure::Range);
 
-        let mut m_vol: f64 = 1.0;
+        let mut m_vol = 1.0;
         let mut res = AnalysisResult::new(self.kind(), "VOL_STRUCT".into());
 
-        // --- B. 核心：成交量状态逻辑 ---
-        if let Some(vol_state) = &feat.structure.volume_state {
-            match vol_state {
-                VolumeState::Expand => {
-                    // 放量：动能强劲
-                    m_vol = 1.35;
-                    res = res
-                        .with_score(15.0)
-                        .because("成交量显著扩张，趋势动能得到燃料支撑");
+        // ========== 3. 核心成交量逻辑 ==========
+        if let Some(vs) = vol_state {
+            // 这里现在可以安全地 set_cached 了，因为上面已经释放了 ctx
+            ctx.set_cached(ContextKey::VolumeState, json!(vs));
 
-                    // 【核心解锁】突破逻辑
-                    // 如果波动率之前是压缩的，现在的放量就是“顶开天花板”的信号
-                    if is_vol_compressed {
-                        // 动态增加后续信号的权重上限
-                        scope.insert_ctx(ContextKey::MultMomentum, json!(1.5));
-                        res = res.because(
-                            "检测到放量突破压缩区 (Volatility Breakout)，解锁更高动能权重",
-                        );
+            match vs {
+                VolumeState::Expand => {
+                    m_vol = if vol_p > 60.0 { 1.35 } else { 1.15 };
+                    if is_vol_compressed && (dist_sup < 0.02 || dist_res < 0.02) {
+                        m_vol *= 1.4;
+                        res = res.because("🚀 爆发信号：放量突破低波压缩区");
                     }
                 }
                 VolumeState::Shrink => {
-                    // 缩量：兴趣减退
-                    m_vol = 0.7;
-                    res = res
-                        .with_score(-5.0)
-                        .because("成交量萎缩，市场参与度下降，谨防虚假波动");
+                    if vol_shrink_3
+                        && dist_sup < 0.012
+                        && matches!(
+                            regime,
+                            TrendStructure::Bullish | TrendStructure::StrongBullish
+                        )
+                    {
+                        m_vol = 1.45;
+                        res = res.because("支撑位缩量回踩：抛压枯竭点");
+                    } else {
+                        m_vol = 0.7;
+                    }
                 }
                 VolumeState::Squeeze => {
-                    // 极致挤压：变盘前夜
-                    // 如果波动率也压缩，那就是双重挤压，爆发潜力巨大
                     m_vol = if is_vol_compressed { 1.2 } else { 0.85 };
-                    res = res.because("成交量进入极致挤压状态，市场正在高度蓄势");
                 }
-                _ => {
-                    m_vol = 1.0;
-                }
+                _ => {}
             }
         }
 
-        // --- C. 智能检测：异常与风险 ---
-
-        // 1. 高潮爆量检测 (Climax/Exhaustion)
-        // 逻辑：如果价格波动极大（Extreme Candle）且成交量也是巨量，通常是反转信号而非持续信号
-        if feat.signals.extreme_candle.unwrap_or(false) {
-            m_vol *= 0.6;
-            res = res
-                .violate()
-                .because("检测到放量力竭 (Volume Climax)，警惕流动性最后喷发后的反转");
-        }
-
-        // 2. “火药桶”模式 (Explosive Setup)
-        // 条件：低波动 + 持续缩量 + RSI走平
-        let rsi_ready = feat.signals.rsi_range_3.unwrap_or(false);
-        let vol_shrink_3 = feat.signals.volume_shrink_3.unwrap_or(false);
-
+        // ========== 4. 极端逻辑与熔断 ==========
         if rsi_ready && vol_shrink_3 && is_vol_compressed {
-            m_vol *= 1.45;
-            res = res.because("确认‘火药桶’蓄势模式：低波+缩量+RSI盘整，极易触发爆发性单边");
+            let bonus = 1.5 + ((100.0 - vol_p) / 200.0);
+            m_vol *= bonus;
+            res = res.because(format!("☢️ 火药桶共振：爆发潜力 x{:.2}", bonus));
         }
 
-    
+        if extreme_candle {
+            if vol_p > 85.0 {
+                m_vol = 0.2;
+                res = res.violate().because("高位力竭：天量换手见顶信号");
+            } else if dist_res < 0.01 {
+                m_vol *= 0.4;
+                res = res.because("阻力位放量滞涨：警惕假突破");
+            }
+        }
 
-        // --- E. 结果持久化 ---
-        scope.set_multiplier(self.kind(), m_vol);
+        // ========== 5. 最终状态持久化 ==========
+        ctx.set_multiplier(self.kind(), m_vol);
 
-        // 额外标记：成交量是否强劲，供 Entry 阶段做最后的门槛检查
-        let is_strong = matches!(feat.structure.volume_state, Some(VolumeState::Expand));
-        scope.insert_ctx(ContextKey::MultOi, json!(if is_strong { 1.1 } else { 0.9 }));
+        let vol_health = if matches!(vol_state, Some(VolumeState::Expand)) && !extreme_candle {
+            1.25
+        } else {
+            1.0
+        };
+        ctx.set_cached(ContextKey::MultOi, json!(vol_health));
 
-        Ok(res.with_mult(m_vol).debug(json!({
-            "final_m_vol": m_vol,
-            "vol_state": format!("{:?}", feat.structure.volume_state),
-            "is_vol_compressed": is_vol_compressed,
-        })))
+        Ok(res.with_mult(m_vol))
     }
 }
