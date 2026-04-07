@@ -456,28 +456,27 @@ impl DataIntegrityManager {
     }
     pub fn start_oi_poller(self: Arc<Self>) {
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                for &symbol in &self.symbols {
-                    let feature_ctx = self.feature_context.clone();
-                    let archive = self.archive_provider.clone();
 
-                    match archive.fetch_open_interest(symbol).await {
-                        Ok(oi_data) => {
-                            // 使用修复后的方法：只传 OI 核心数据
-                            feature_ctx.update_oi_from_poller(
-                                symbol,
-                                oi_data.open_interest,
-                                oi_data.time,
-                            );
+                stream::iter(self.symbols.clone())
+                    .map(|symbol| {
+                        let feature_ctx = self.feature_context.clone();
+                        let archive = self.archive_provider.clone();
+                        async move {
+                            if let Ok(oi_data) = archive.fetch_open_interest(symbol).await {
+                                feature_ctx.update_oi_from_poller(
+                                    symbol,
+                                    oi_data.open_interest,
+                                    oi_data.time,
+                                );
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!("Failed to fetch OI for {}: {}", symbol, e);
-                        }
-                    }
-                }
+                    })
+                    .buffer_unordered(10)
+                    .collect::<Vec<()>>()
+                    .await;
             }
         });
     }

@@ -14,11 +14,18 @@ use std::sync::{
 };
 use tracing::{info, warn};
 
+// ==================== 1. Role 处理器 (逻辑计算单元) ====================
+
 pub struct RoleProcessor {
     pub interval: Interval,
     pub calculator: FeatureCalculator,
     pub current_acc: Option<Candle>,
     pub last_processed_ts: i64,
+
+    // --- 惰性计算相关字段 ---
+    pub last_calc_volume: f64,              // 上次计算时的累积成交量
+    pub last_calc_ts: i64,                  // 上次计算时的 Acc 时间戳
+    pub cached_role_data: Option<RoleData>, // 缓存上一次 Peek 的结果
 
     pub oi_history: VecDeque<f64>,
     pub max_history_size: usize,
@@ -38,63 +45,23 @@ impl RoleProcessor {
             calculator: FeatureCalculator::new(interval),
             current_acc: None,
             last_processed_ts: 0,
-
+            last_calc_volume: -1.0,
+            last_calc_ts: 0,
+            cached_role_data: None,
             oi_history: VecDeque::with_capacity(max_history_size),
             max_history_size,
         }
     }
 
-    pub fn get_volume_projection(&self) -> f64 {
-        let acc = match &self.current_acc {
-            Some(a) => a,
-            None => return 0.0,
-        };
-
-        let interval_ms = self.interval.to_millis();
-        let now_ms = Utc::now().timestamp_millis();
-        let elapsed_ms = (now_ms - acc.timestamp).max(1);
-        let progress = (elapsed_ms as f64 / interval_ms as f64).min(1.0);
-
-        acc.volume / progress
-    }
-
-    fn calculate_oi_metrics(&self, current_oi: f64) -> Vec<f64> {
-        let steps = [1, 3, 7, 14];
-        let len = self.oi_history.len();
-        if len == 0 {
-            return vec![0.0; 4];
+    /// 检查当前累加器数据是否相对于缓存已更新
+    #[inline]
+    pub fn is_dirty(&self) -> bool {
+        if let Some(acc) = &self.current_acc {
+            // 如果时间戳进位了，或者成交量发生了变化，则视为脏数据
+            return acc.timestamp > self.last_calc_ts
+                || (acc.volume - self.last_calc_volume).abs() > f64::EPSILON;
         }
-
-        let is_already_pushed = self
-            .oi_history
-            .back()
-            .map_or(false, |&last| (last - current_oi).abs() < f64::EPSILON);
-        let offset = if is_already_pushed { 1 } else { 0 };
-
-        steps
-            .iter()
-            .map(|&step| {
-                if let Some(idx) = len.checked_sub(step + offset) {
-                    let past_val = self.oi_history[idx];
-                    if past_val > 1e-9 {
-                        let diff = (current_oi - past_val) / past_val;
-                        if diff.is_finite() {
-                            return diff;
-                        }
-                    }
-                }
-                0.0
-            })
-            .collect()
-    }
-
-    pub fn generate_oi_data(&self, cur_price: f64, cur_oi: f64, cur_oi_val: f64) -> Option<OIData> {
-        if cur_price <= f64::EPSILON || cur_oi <= f64::EPSILON {
-            return None;
-        }
-
-        let change_history = self.calculate_oi_metrics(cur_oi);
-        Some(OIData::new(cur_oi, cur_oi_val, change_history))
+        false
     }
 
     pub fn process_m1(&mut self, m1: &Candle) -> Option<Candle> {
@@ -106,11 +73,13 @@ impl RoleProcessor {
 
         if let Some(ref mut acc) = self.current_acc {
             if bucket_ts > acc.timestamp {
+                // 周期切换，返回旧的闭合 Bar
                 return self.current_acc.replace(Candle {
                     timestamp: bucket_ts,
                     ..*m1
                 });
             }
+            // 增量更新当前 Acc
             acc.high = acc.high.max(m1.high);
             acc.low = acc.low.min(m1.low);
             acc.close = m1.close;
@@ -127,6 +96,42 @@ impl RoleProcessor {
             });
             None
         }
+    }
+
+    pub fn generate_oi_data(&self, cur_price: f64, cur_oi: f64, cur_oi_val: f64) -> Option<OIData> {
+        if cur_price <= f64::EPSILON || cur_oi <= f64::EPSILON {
+            return None;
+        }
+
+        let steps = [1, 3, 7, 14];
+        let len = self.oi_history.len();
+        if len == 0 {
+            return Some(OIData::new(cur_oi, cur_oi_val, vec![0.0; 4]));
+        }
+
+        let is_already_pushed = self
+            .oi_history
+            .back()
+            .map_or(false, |&last| (last - cur_oi).abs() < f64::EPSILON);
+        let offset = if is_already_pushed { 1 } else { 0 };
+
+        let change_history = steps
+            .iter()
+            .map(|&step| {
+                if let Some(idx) = len.checked_sub(step + offset) {
+                    let past_val = self.oi_history[idx];
+                    if past_val > 1e-9 {
+                        let diff = (cur_oi - past_val) / past_val;
+                        if diff.is_finite() {
+                            return diff;
+                        }
+                    }
+                }
+                0.0
+            })
+            .collect();
+
+        Some(OIData::new(cur_oi, cur_oi_val, change_history))
     }
 }
 
@@ -179,15 +184,15 @@ impl FeatureContextManager {
         }
     }
 
+    /// 【写优化】实时数据更新：仅做数值累加和闭合判断，不触发 Peek 计算
     pub fn update_realtime_m1(&self, candle: Candle) {
         let symbol = candle.symbol;
         if symbol.is_btc() {
             self.global_btc_price
                 .store(candle.close.to_bits(), Ordering::Relaxed);
         }
-        let g_close = self.get_global_btc();
 
-        // 1. 同步更新快照价格
+        // 更新快照价格
         self.update_price_from_m1(symbol, candle.close, candle.timestamp);
 
         let symbol_ctx = match self.symbol_contexts.get(&symbol) {
@@ -195,83 +200,71 @@ impl FeatureContextManager {
             None => return,
         };
 
-        // 2. 【核心修改】在此处获取唯一的最新快照副本，用于后续所有计算
-        let current_snap = {
-            let snap = symbol_ctx.latest_snap.read().expect("Lock poisoned");
-            snap.clone()
-        };
+        let mut roles_guard = symbol_ctx.roles.write().expect("Lock poisoned");
+        let g_close = self.get_global_btc();
 
-        let mut role_updates = Vec::new();
-        {
-            let mut roles_guard = symbol_ctx.roles.write().expect("Lock poisoned");
-            for (role, proc) in roles_guard.iter_mut() {
-                if let Some(closed_bar) = proc.process_m1(&candle) {
-                    if closed_bar.timestamp > proc.last_processed_ts {
-                        proc.last_processed_ts = closed_bar.timestamp;
+        for (_role, proc) in roles_guard.iter_mut() {
+            if let Some(closed_bar) = proc.process_m1(&candle) {
+                // 只有周期真正闭合时，才执行正式计算同步状态
+                if closed_bar.timestamp > proc.last_processed_ts {
+                    proc.calculator.next(&closed_bar, proc.interval, g_close);
+                    proc.last_processed_ts = closed_bar.timestamp;
+                    // 闭合后缓存失效，确保下一次 get_market_context 重新 Peek
+                    proc.cached_role_data = None;
+                }
+            }
+            // 删除了 else { peek } 逻辑，极大降低了写负载
+        }
+    }
 
-                        // 基于当前快照数值计算 OI 变化
-                        let oi_data = proc.generate_oi_data(
-                            current_snap.last_price,
-                            current_snap.current_oi_amount,
-                            current_snap.current_oi_value,
-                        );
+    pub fn get_market_context(&self, symbol: Symbol) -> Option<MarketContext> {
+        let symbol_ctx = self.symbol_contexts.get(&symbol)?;
+        let g_close = self.get_global_btc();
 
-                        // 更新历史队列
-                        if proc.oi_history.len() >= proc.max_history_size {
-                            proc.oi_history.pop_front();
-                        }
-                        proc.oi_history.push_back(current_snap.current_oi_amount);
+        let snap = symbol_ctx.latest_snap.read().ok()?.clone();
+        let mut roles_guard = symbol_ctx.roles.write().ok()?;
+        let mut current_roles_data = HashMap::new();
 
-                        let feature_set = proc.calculator.next(&closed_bar, proc.interval, g_close);
-
-                        role_updates.push((
-                            *role,
-                            RoleData {
-                                interval: proc.interval,
-                                feature_set,
-                                taker_flow: TakerFlowData::from_candle(&closed_bar),
-                                oi_data,
-                            },
-                        ));
-                    }
-                } else if let Some(acc) = &proc.current_acc {
-                    // Peek 逻辑：不闭合时也使用同一份 current_snap
+        for (role, proc) in roles_guard.iter_mut() {
+            if proc.is_dirty() {
+                // 仅在数据变动时计算
+                if let Some(acc) = &proc.current_acc {
                     let feature_set = proc.calculator.peek(acc, proc.interval, g_close);
                     let oi_data = proc.generate_oi_data(
-                        current_snap.last_price,
-                        current_snap.current_oi_amount,
-                        current_snap.current_oi_value,
+                        snap.last_price,
+                        snap.current_oi_amount,
+                        snap.current_oi_value,
                     );
 
-                    role_updates.push((
-                        *role,
-                        RoleData {
-                            interval: proc.interval,
-                            feature_set,
-                            taker_flow: TakerFlowData::from_candle(acc),
-                            oi_data,
-                        },
-                    ));
+                    let new_data = RoleData {
+                        interval: proc.interval,
+                        feature_set,
+                        taker_flow: TakerFlowData::from_candle(acc),
+                        oi_data,
+                    };
+
+                    // 更新缓存标记
+                    proc.last_calc_ts = acc.timestamp;
+                    proc.last_calc_volume = acc.volume;
+                    proc.cached_role_data = Some(new_data.clone());
+
+                    current_roles_data.insert(*role, new_data);
                 }
+            } else if let Some(cache) = &proc.cached_role_data {
+                // 数据未变，直接返回缓存
+                current_roles_data.insert(*role, cache.clone());
             }
         }
 
-        if !role_updates.is_empty() {
-            self.registry
-                .entry(symbol)
-                .and_modify(|ctx| {
-                    ctx.timestamp = Utc::now();
-                    ctx.global = current_snap.clone();
-                    ctx.roles.extend(role_updates.clone());
-                })
-                .or_insert_with(|| {
-                    let mut ctx = MarketContext::new(symbol, Utc::now());
-                    ctx.global = current_snap;
-                    ctx.roles.extend(role_updates);
-                    ctx
-                });
-        }
+        let mut mc = MarketContext::new(symbol, Utc::now());
+        mc.global = snap;
+        mc.roles = current_roles_data;
+
+        // 同步到 Registry
+        self.registry.insert(symbol, mc.clone());
+        Some(mc)
     }
+
     pub fn warmup_symbols(
         &self,
         history_map: HashMap<Symbol, HashMap<Interval, Vec<Candle>>>,
@@ -281,16 +274,15 @@ impl FeatureContextManager {
             "🚀 Starting parallel warmup for {} symbols...",
             history_map.len()
         );
-
         history_map
             .into_par_iter()
             .for_each(|(symbol, interval_data)| {
                 let oi_data = history_oi_map.get(&symbol);
                 self.warmup_single_symbol(symbol, &interval_data, oi_data);
             });
-
-        info!("✨ All symbols warmed up and Registry is ready.");
+        info!("✨ All symbols warmed up.");
     }
+
     pub fn warmup_single_symbol(
         &self,
         symbol: Symbol,
@@ -304,9 +296,9 @@ impl FeatureContextManager {
         };
 
         let mut roles_guard = symbol_ctx.roles.write().expect("Lock poisoned");
-        let mut latest_role_results = HashMap::new();
 
         for (role, proc) in roles_guard.iter_mut() {
+            // 1. 处理种子数据
             if let Some(seeds) = interval_data_map.get(&proc.interval) {
                 let oi_lookup: HashMap<i64, &OpenInterestRecord> = oi_data_map
                     .and_then(|m| m.get(&proc.interval))
@@ -328,7 +320,7 @@ impl FeatureContextManager {
                 }
             }
 
-            // M1 补全逻辑保持数值更新
+            // 2. 补全 M1 导致的状态切换
             if let Some(m1_candles) = interval_data_map.get(&Interval::M1) {
                 for m1 in m1_candles {
                     if m1.timestamp > proc.last_processed_ts {
@@ -340,33 +332,18 @@ impl FeatureContextManager {
                 }
             }
 
-            // 最终 Peek
+            // 3. 初始计算并填充缓存
             if let Some(acc) = &proc.current_acc {
                 let feature_set = proc.calculator.peek(acc, proc.interval, g_close);
-                latest_role_results.insert(
-                    *role,
-                    RoleData {
-                        interval: proc.interval,
-                        feature_set,
-                        taker_flow: TakerFlowData::from_candle(acc),
-                        oi_data: None, // Warmup 阶段通常不生成瞬时变化
-                    },
-                );
-            }
-        }
-
-        if !latest_role_results.is_empty() {
-            self.registry
-                .entry(symbol)
-                .and_modify(|ctx| {
-                    ctx.timestamp = Utc::now();
-                    ctx.roles.extend(latest_role_results.clone());
-                })
-                .or_insert_with(|| {
-                    let mut ctx = MarketContext::new(symbol, Utc::now());
-                    ctx.roles.extend(latest_role_results);
-                    ctx
+                proc.cached_role_data = Some(RoleData {
+                    interval: proc.interval,
+                    feature_set,
+                    taker_flow: TakerFlowData::from_candle(acc),
+                    oi_data: None,
                 });
+                proc.last_calc_ts = acc.timestamp;
+                proc.last_calc_volume = acc.volume;
+            }
         }
     }
 
@@ -399,27 +376,21 @@ impl FeatureContextManager {
     pub fn update_symbol_config(
         &self,
         symbol: Symbol,
-
         config: HashMap<Role, Interval>,
     ) -> Vec<(Role, Interval)> {
         let mut updated_roles = Vec::new();
-
         if let Some(ctx) = self.symbol_contexts.get(&symbol) {
             let mut roles_guard = ctx.roles.write().expect("Lock poisoned");
-
             for (role, new_interval) in config {
                 let entry = roles_guard
                     .entry(role)
                     .or_insert_with(|| RoleProcessor::new(new_interval));
-
                 if entry.interval != new_interval {
                     updated_roles.push((role, new_interval));
-
                     *entry = RoleProcessor::new(new_interval);
                 }
             }
         }
-
         updated_roles
     }
 }

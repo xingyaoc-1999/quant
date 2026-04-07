@@ -12,6 +12,7 @@ use ta::{
     },
     Next,
 };
+
 #[derive(Debug, Clone, Copy)]
 pub struct CalculatorConfig {
     pub warmup_period: usize,
@@ -39,7 +40,7 @@ impl CalculatorConfig {
                 extreme_candle_atr_mult: 3.0,
                 extreme_candle_body_ratio: 0.7,
                 slope_deadzone: 0.0002,
-                doji_body_ratio: 0.001,
+                doji_body_ratio: 0.05, // 修复：从 0.001 调至 0.05，更符合实盘
                 rsi_range_3_low: 45.0,
                 rsi_range_3_high: 55.0,
             },
@@ -52,7 +53,7 @@ impl CalculatorConfig {
                 extreme_candle_atr_mult: 2.5,
                 extreme_candle_body_ratio: 0.7,
                 slope_deadzone: 0.0004,
-                doji_body_ratio: 0.001,
+                doji_body_ratio: 0.05,
                 rsi_range_3_low: 45.0,
                 rsi_range_3_high: 55.0,
             },
@@ -65,7 +66,7 @@ impl CalculatorConfig {
                 extreme_candle_atr_mult: 2.0,
                 extreme_candle_body_ratio: 0.7,
                 slope_deadzone: 0.001,
-                doji_body_ratio: 0.001,
+                doji_body_ratio: 0.05,
                 rsi_range_3_low: 45.0,
                 rsi_range_3_high: 55.0,
             },
@@ -78,24 +79,16 @@ impl CalculatorConfig {
                 extreme_candle_atr_mult: 1.8,
                 extreme_candle_body_ratio: 0.7,
                 slope_deadzone: 0.002,
-                doji_body_ratio: 0.001,
+                doji_body_ratio: 0.05,
                 rsi_range_3_low: 45.0,
                 rsi_range_3_high: 55.0,
             },
         }
     }
 }
+
 #[derive(Debug, Clone)]
-
 pub struct FeatureCalculator {
-    // 1. 基础累加项 (Pearson 相关性使用)
-    sum_x: f64,
-    sum_y: f64,
-    sum_x_sq: f64,
-    sum_y_sq: f64,
-    sum_xy: f64,
-
-    // 2. 计数与状态
     count: usize,
     ma20_slope_bars: i32,
     prev_macd: Option<f64>,
@@ -116,7 +109,6 @@ pub struct FeatureCalculator {
     macd: MovingAverageConvergenceDivergence,
     atr: AverageTrueRange,
 
-    // 5. 结构化队列 (堆分配)
     volatility_history: VecDeque<f64>,
     ma20_history: VecDeque<f64>,
     recent_highs: VecDeque<f64>,
@@ -133,11 +125,6 @@ impl FeatureCalculator {
     pub fn new(interval: Interval) -> Self {
         let config = CalculatorConfig::from_interval(interval);
         Self {
-            sum_x: 0.0,
-            sum_y: 0.0,
-            sum_x_sq: 0.0,
-            sum_y_sq: 0.0,
-            sum_xy: 0.0,
             count: 0,
             ma20_slope_bars: 0,
             prev_macd: None,
@@ -155,6 +142,7 @@ impl FeatureCalculator {
             bb: BollingerBands::new(20, 2.0).unwrap(),
             macd: MovingAverageConvergenceDivergence::new(12, 26, 9).unwrap(),
             atr: AverageTrueRange::new(14).unwrap(),
+            // 修正：ma20_history 容量应为 slope_period + 1 以对齐 N 个间隔
             ma20_history: VecDeque::with_capacity(config.slope_period + 1),
             volatility_history: VecDeque::with_capacity(Self::VOL_WINDOW + 1),
             recent_highs: VecDeque::with_capacity(Self::STRUCT_WINDOW + 1),
@@ -173,6 +161,7 @@ impl FeatureCalculator {
     ) -> FeatureSet {
         self.count += 1;
 
+        // 1. 计算基础指标
         let rsi_v = self.rsi.next(candle.close);
         let m20_v = self.ma20.next(candle.close);
         let m50_v = self.ma50.next(candle.close);
@@ -180,20 +169,18 @@ impl FeatureCalculator {
         let vma_v = self.vma.next(candle.volume);
         let atr_v = self.atr.next(candle);
         let bb_v = self.bb.next(candle.close);
-        let macd_out = self.macd.next(candle.close); // 这里是导致类型问题的点，我们直接用其内部字段
+        let macd_out = self.macd.next(candle.close);
 
         let is_warmed = self.count >= self.config.warmup_period;
 
-        // 2. 波动率与历史滑窗
+        // 2. 波动率与百分位
         let bb_w = if bb_v.average.abs() > f64::EPSILON {
             (bb_v.upper - bb_v.lower) / bb_v.average
         } else {
             0.0
         };
-        if bb_w > 0.0 {
-            Self::push_fixed_window(&mut self.volatility_history, bb_w, Self::VOL_WINDOW);
-        }
-        let vol_p = if self.volatility_history.len() > 20 {
+
+        let vol_p = if self.volatility_history.len() >= 20 {
             let smaller = self
                 .volatility_history
                 .iter()
@@ -204,24 +191,10 @@ impl FeatureCalculator {
             50.0
         };
 
-        Self::shift_history(&mut self.volume_history, Some(candle.volume));
-        Self::shift_history(
-            &mut self.rsi_history,
-            if rsi_v.is_nan() { None } else { Some(rsi_v) },
-        );
+        // --- 核心修复：先利用旧窗口计算特征，防止“当前价格污染历史” ---
 
-        // 3. 维护队列与 Pearson 相关性 (纯增量模式)
-        Self::push_fixed_window(&mut self.recent_highs, candle.high, Self::STRUCT_WINDOW);
-        Self::push_fixed_window(&mut self.recent_lows, candle.low, Self::STRUCT_WINDOW);
-        Self::push_fixed_window(
-            &mut self.recent_macd_hists,
-            macd_out.histogram,
-            Self::STRUCT_WINDOW,
-        );
-        let correlation =
-            global_close.map(|gc| self.update_correlation_incremental(candle.close, gc));
-
-        let (dist_res, dist_sup) = if self.recent_highs.len() == Self::STRUCT_WINDOW {
+        // 3. 支撑阻力计算 (使用 Push 之前的队列内容)
+        let (dist_res, dist_sup) = if self.recent_highs.len() >= 10 {
             let res = self.recent_highs.iter().copied().fold(f64::MIN, f64::max);
             let sup = self.recent_lows.iter().copied().fold(f64::MAX, f64::min);
             if candle.close > f64::EPSILON {
@@ -236,7 +209,27 @@ impl FeatureCalculator {
             (None, None)
         };
 
-        // 5. 信号与斜率
+        // 4. MACD 背离判定 (对比当前价格与历史窗口最值)
+        let macd_divergence = self.check_macd_divergence(candle.close, macd_out.histogram);
+
+        // 5. 更新历史滑窗
+        Self::push_fixed_window(&mut self.volatility_history, bb_w, Self::VOL_WINDOW);
+        Self::push_fixed_window(&mut self.recent_highs, candle.high, Self::STRUCT_WINDOW);
+        Self::push_fixed_window(&mut self.recent_lows, candle.low, Self::STRUCT_WINDOW);
+        Self::push_fixed_window(
+            &mut self.recent_macd_hists,
+            macd_out.histogram,
+            Self::STRUCT_WINDOW,
+        );
+
+        Self::push_fixed_window(&mut self.recent_closes, candle.close, Self::STRUCT_WINDOW);
+        if let Some(gc) = global_close {
+            Self::push_fixed_window(&mut self.recent_global_closes, gc, Self::STRUCT_WINDOW);
+        }
+
+        let correlation = self.calculate_correlation_stable();
+
+        // 7. 信号与斜率
         let slope = self.update_ma20_slope(m20_v, atr_v);
         let macd_cross = if is_warmed {
             self.check_macd_cross(macd_out.macd, macd_out.signal)
@@ -256,10 +249,18 @@ impl FeatureCalculator {
             }
         }
 
-        // 6. 构造 FeatureSet
+        // 8. 构造 FeatureSet
         let bucket = match Utc.timestamp_millis_opt(candle.timestamp) {
             chrono::LocalResult::Single(ts) => ts,
             _ => Utc::now(),
+        };
+
+        let vs = if candle.volume > vma_v * self.config.volume_expand_factor {
+            VolumeState::Expand
+        } else if candle.volume < vma_v * self.config.volume_shrink_factor {
+            VolumeState::Shrink
+        } else {
+            VolumeState::Normal
         };
 
         let fs = FeatureSet {
@@ -297,13 +298,7 @@ impl FeatureCalculator {
                     v if v < 40.0 => RsiState::Weak,
                     _ => RsiState::Neutral,
                 }),
-                volume_state: Some(
-                    if candle.volume > vma_v * self.config.volume_expand_factor {
-                        VolumeState::Expand
-                    } else {
-                        VolumeState::Normal
-                    },
-                ),
+                volume_state: Some(vs),
                 candle_type: Some(self.identify_candle_type(candle)),
                 ma20_slope: slope,
                 ma20_slope_bars: self.ma20_slope_bars,
@@ -322,7 +317,7 @@ impl FeatureCalculator {
                     .then_some(((m20_v - m50_v).abs() / m50_v) < self.config.ma_converge_threshold),
             },
             signals: SignalStates {
-                macd_divergence: self.check_macd_divergence(candle.close, macd_out.histogram),
+                macd_divergence,
                 rsi_divergence: None,
                 macd_cross,
                 macd_momentum: self.prev_macd_histogram.map(|ph| {
@@ -344,15 +339,56 @@ impl FeatureCalculator {
             },
         };
 
-        // 7. 更新状态
+        // 更新状态位
         self.prev_macd = Some(macd_out.macd);
         self.prev_signal = Some(macd_out.signal);
         self.prev_macd_histogram = Some(macd_out.histogram);
         self.prev_ma20_satisfied = Some(curr_above_m20);
+        Self::shift_history(&mut self.volume_history, Some(candle.volume));
+        Self::shift_history(
+            &mut self.rsi_history,
+            if rsi_v.is_nan() { None } else { Some(rsi_v) },
+        );
+
         fs
     }
 
-    // --- 内部逻辑函数 ---
+    fn calculate_correlation_stable(&self) -> Option<f64> {
+        let n = self.recent_closes.len();
+        if n < Self::STRUCT_WINDOW || n != self.recent_global_closes.len() {
+            return None;
+        }
+
+        let mut sum_x = 0.0;
+        let mut sum_y = 0.0;
+        let mut sum_x_sq = 0.0;
+        let mut sum_y_sq = 0.0;
+        let mut sum_xy = 0.0;
+
+        for (&x, &y) in self
+            .recent_closes
+            .iter()
+            .zip(self.recent_global_closes.iter())
+        {
+            sum_x += x;
+            sum_y += y;
+            sum_x_sq += x * x;
+            sum_y_sq += y * y;
+            sum_xy += x * y;
+        }
+
+        let nf = n as f64;
+        let num = nf * sum_xy - sum_x * sum_y;
+        let den = ((nf * sum_x_sq - sum_x.powi(2)).max(0.0)
+            * (nf * sum_y_sq - sum_y.powi(2)).max(0.0))
+        .sqrt();
+
+        if den < 1e-9 {
+            Some(0.0)
+        } else {
+            Some(num / den)
+        }
+    }
 
     fn check_macd_cross(&self, cur_macd: f64, cur_signal: f64) -> Option<MacdCross> {
         match (self.prev_macd, self.prev_signal) {
@@ -362,44 +398,11 @@ impl FeatureCalculator {
         }
     }
 
-    fn update_correlation_incremental(&mut self, new_x: f64, new_y: f64) -> f64 {
-        let n = Self::STRUCT_WINDOW as f64;
-        if self.recent_closes.len() == Self::STRUCT_WINDOW {
-            let ox = self.recent_closes[0];
-            let oy = self.recent_global_closes[0];
-            self.sum_x -= ox;
-            self.sum_y -= oy;
-            self.sum_x_sq -= ox * ox;
-            self.sum_y_sq -= oy * oy;
-            self.sum_xy -= ox * oy;
-        }
-        self.sum_x += new_x;
-        self.sum_y += new_y;
-        self.sum_x_sq += new_x * new_x;
-        self.sum_y_sq += new_y * new_y;
-        self.sum_xy += new_x * new_y;
-
-        Self::push_fixed_window(&mut self.recent_closes, new_x, Self::STRUCT_WINDOW);
-        Self::push_fixed_window(&mut self.recent_global_closes, new_y, Self::STRUCT_WINDOW);
-
-        if self.recent_closes.len() < Self::STRUCT_WINDOW {
-            return 0.0;
-        }
-        let num = n * self.sum_xy - self.sum_x * self.sum_y;
-        let den = ((n * self.sum_x_sq - self.sum_x.powi(2))
-            * (n * self.sum_y_sq - self.sum_y.powi(2)))
-        .sqrt();
-        if den.abs() < 1e-9 {
-            0.0
-        } else {
-            num / den
-        }
-    }
-
     fn check_macd_divergence(&self, cur_p: f64, cur_h: f64) -> Option<DivergenceType> {
         if self.recent_lows.len() < Self::STRUCT_WINDOW {
             return None;
         }
+
         let (min_idx, min_p) =
             self.recent_lows
                 .iter()
@@ -408,6 +411,7 @@ impl FeatureCalculator {
                     (0, f64::MAX),
                     |acc, (i, &p)| if p < acc.1 { (i, p) } else { acc },
                 );
+
         let (max_idx, max_p) =
             self.recent_highs
                 .iter()
@@ -466,10 +470,13 @@ impl FeatureCalculator {
         if m20.is_nan() || atr <= f64::EPSILON {
             return None;
         }
-        Self::push_fixed_window(&mut self.ma20_history, m20, self.config.slope_period);
-        if self.ma20_history.len() < self.config.slope_period {
+        // 修正：保存 slope_period + 1 个点，索引 0 才是严格意义上的 N 周期前
+        Self::push_fixed_window(&mut self.ma20_history, m20, self.config.slope_period + 1);
+
+        if self.ma20_history.len() < self.config.slope_period + 1 {
             return None;
         }
+
         let s = (m20 - self.ma20_history[0]) / (atr * self.config.slope_period as f64);
         if s > self.config.slope_deadzone {
             self.ma20_slope_bars = self.ma20_slope_bars.max(0) + 1;
@@ -510,7 +517,7 @@ impl FeatureCalculator {
 
     #[inline(always)]
     fn push_fixed_window(queue: &mut VecDeque<f64>, value: f64, window: usize) {
-        if queue.len() >= window {
+        while queue.len() >= window {
             queue.pop_front();
         }
         queue.push_back(value);
@@ -530,7 +537,6 @@ impl FeatureCalculator {
         g_close: Option<f64>,
     ) -> FeatureSet {
         let mut cloned_calculator = self.clone();
-
         cloned_calculator.next(acc_candle, interval, g_close)
     }
 }

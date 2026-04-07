@@ -46,12 +46,12 @@ impl Model {
         definitions: Vec<ToolDefinition>,
         schema: Option<Schema>,
     ) -> Result<OneOrMany<AssistantContent>> {
-        let response = CompletionRequestBuilder::new(model, current_msg)
+        let response = CompletionRequestBuilder::new(model, "你好")
             // .preamble(preamble)
             .messages(history)
             .temperature(0.2)
             .tools(definitions)
-            .tool_choice(ToolChoice::None)
+            .tool_choice(ToolChoice::Auto)
             // .output_schema(schema)
             .send()
             .await
@@ -125,16 +125,16 @@ impl Model {
             });
 
             if tool_calls.is_empty() {
-                chat_history.clear();
-                // chat_history.retain(|msg| match msg {
-                //     Message::User { content } => {
-                //         content.iter().any(|c| matches!(c, UserContent::Text(_)))
-                //     }
-                //     Message::Assistant { content, .. } => content
-                //         .iter()
-                //         .any(|c| matches!(c, AssistantContent::Text(_))),
-                //     Message::System { content } => {true}
-                // });
+                // chat_history.clear();
+                chat_history.retain(|msg| match msg {
+                    Message::User { content } => {
+                        content.iter().any(|c| matches!(c, UserContent::Text(_)))
+                    }
+                    Message::Assistant { content, .. } => content
+                        .iter()
+                        .any(|c| matches!(c, AssistantContent::Text(_))),
+                    Message::System { content } => true,
+                });
 
                 return Ok(current_turn_text);
             }

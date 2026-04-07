@@ -97,7 +97,7 @@ impl BotApp {
 
             // 同步指令菜单
             let _ = bot.set_my_commands(MyCommand::bot_commands()).await;
-            info!("SUCCESS [Bot] Telegram commands synced to server.");
+            info!("[Bot] Telegram commands synced to server.");
 
             let (switch_tx, mut switch_rx) = mpsc::channel(1);
             let app_inner = Arc::clone(&app);
@@ -176,21 +176,26 @@ impl BotApp {
 
             loop {
                 tokio::select! {
-                    Some((_text, _chat_id)) = rx_in.recv() => {
-                    }
-                    _ = switch_rx.recv() => {
-                        info!("🔄 Switch signal received, restarting dispatcher...");
-                        let _ = shutdown_token.shutdown();
-                        let _ = dispatch_task.await;
-                        break;
-                    }
-                    result = &mut dispatch_task => {
-                        match result {
-                            Ok(_) => { info!("Dispatcher finished."); return Ok(()); }
-                            Err(e) => { error!("Dispatcher Task Panic: {:?}", e); break; }
+                        Some((text, chat_id)) = rx_in.recv() => {
+
+                     match bot.send_message(chat_id, &text).await {
+                    Ok(_) => info!("Message sent successfully: {}", text),
+                    Err(e) => error!("Failed to send message: {}", e),
+                }
+                        }
+                        _ = switch_rx.recv() => {
+                            info!("🔄 Switch signal received, restarting dispatcher...");
+                            let _ = shutdown_token.shutdown();
+                            let _ = dispatch_task.await;
+                            break;
+                        }
+                        result = &mut dispatch_task => {
+                            match result {
+                                Ok(_) => { info!("Dispatcher finished."); return Ok(()); }
+                                Err(e) => { error!("Dispatcher Task Panic: {:?}", e); break; }
+                            }
                         }
                     }
-                }
             }
 
             app.switching.store(false, Ordering::SeqCst);

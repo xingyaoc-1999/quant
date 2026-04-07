@@ -59,7 +59,6 @@ pub enum DivergenceType {
 pub enum VolumeState {
     Expand,
     Shrink,
-    Squeeze,
     Normal,
 }
 

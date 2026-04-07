@@ -1,4 +1,7 @@
-use crate::{report::AnalysisAudit, types::{DerivativeSnapshot, Direction, FeatureSet, RoleData}};
+use crate::{
+    report::AnalysisAudit,
+    types::{DerivativeSnapshot, Direction, FeatureSet, RoleData},
+};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use common::{Candle, Interval, Symbol};
@@ -430,7 +433,6 @@ impl AnalysisEngine {
         (normalized * 100.0).round()
     }
 }
-
 #[derive(Debug, thiserror::Error)]
 pub enum AnalysisError {
     #[error("Missing data for role {0:?}")]

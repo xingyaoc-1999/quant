@@ -61,7 +61,6 @@ async fn main() -> Result<()> {
 
     let archive_provider = Arc::new(ArchiveProvider::new(proxy_pool.clone()));
 
-    // ✅ 修复：克隆 ctx_manager 传入数据完整性管理器
     let integrity_manager = Arc::new(DataIntegrityManager::new(
         symbols.clone(),
         ctx_manager.clone(),
@@ -77,7 +76,7 @@ async fn main() -> Result<()> {
     let tg_app = BotApp::new(cfg.telegram.token.clone(), proxy_pool.clone()).await?;
 
     info!("🚀 Starting Telegram Bot...");
-    
+
     let ctx_for_tg = ctx_manager.clone();
     let storage_for_tg = storage.clone();
     let archive_for_tg = archive_provider.clone();
@@ -97,8 +96,8 @@ async fn main() -> Result<()> {
 
     // 6. 初始化 AI Agent 与 分析引擎
     let model = Model::openai(
-        "sk-KL85Y5XsOM7kcm7qzSSFUUJ5iqEAcU3kiV4rAGsWPC6rFlp7",
-        "https://aiberm.com/v1",
+        "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",
+        "https://openrouter.ai/api/v1",
         "openai/gpt-5.4",
     )?;
     let analyzers: Vec<Box<dyn Analyzer>> = vec![
@@ -109,7 +108,6 @@ async fn main() -> Result<()> {
     ];
     let engine = AnalysisEngine::new(Config::default(), analyzers);
 
-    // ✅ 修复：克隆 ctx_manager 给 Tool 使用
     let score_query = ScoreQueryTool::new(ctx_manager.clone(), Arc::new(engine));
 
     let tool_set = ToolSet::builder().static_tool(score_query).build();
@@ -120,7 +118,6 @@ async fn main() -> Result<()> {
         tool_set,
     };
 
-    // 7. 启动 Actor
     let (agent_actor, _agent_handle) = Actor::spawn(
         Some("TechnicalAgent".to_string()),
         TechnicalAgent,
@@ -128,7 +125,6 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    // 8. 消息路由循环
     let mut rx_cmd = rx_from_tg;
     let actor_for_router = agent_actor.clone();
 
@@ -140,7 +136,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 9. 优雅停机等待
     tokio::signal::ctrl_c().await?;
     info!("👋 Shutdown signal received, exiting...");
 

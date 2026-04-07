@@ -30,8 +30,7 @@ impl Analyzer for LevelProximityAnalyzer {
     fn analyze(&self, ctx: &mut MarketContext) -> Result<AnalysisResult, AnalysisError> {
         let last_price = ctx.global.last_price;
 
-        // ========== 1. 纯净提取与计算块 (Scope Block) ==========
-        // 这里产出的都是拥有所有权的数据 (Owned Data)，不带任何 ctx 的引用
+        // ========== 1. 纯净提取与计算块 ==========
         let (m_long_raw, m_short_raw, wells, threshold, ma_dist, regime_desc) = {
             let trend_data = ctx.get_role(Role::Trend)?;
             let filter_data = ctx.get_role(Role::Filter)?;
@@ -39,7 +38,7 @@ impl Analyzer for LevelProximityAnalyzer {
             let t_space = &trend_data.feature_set.space;
             let f_space = &filter_data.feature_set.space;
 
-            // 读取缓存逻辑 (在块内完成)
+            // 读取解耦后的缓存数据
             let vol_p = ctx
                 .get_cached::<f64>(ContextKey::VolPercentile)
                 .unwrap_or(50.0);
@@ -49,9 +48,12 @@ impl Analyzer for LevelProximityAnalyzer {
             let is_compressed = ctx
                 .get_cached::<bool>(ContextKey::VolIsCompressed)
                 .unwrap_or(false);
+
             let regime = ctx
                 .get_cached::<TrendStructure>(ContextKey::RegimeStructure)
                 .unwrap_or(TrendStructure::Range);
+
+            // 安全读取成交量枚举
             let vol_state = ctx
                 .get_cached::<serde_json::Value>(ContextKey::VolumeState)
                 .and_then(|v| serde_json::from_value::<VolumeState>(v).ok());
@@ -85,13 +87,15 @@ impl Analyzer for LevelProximityAnalyzer {
                         strength: intensity * boost,
                     });
 
-                    match (regime, vol_state) {
-                        (TrendStructure::StrongBullish, Some(VolumeState::Expand)) => {
+                    // 【关键修改】: 判定逻辑替换 Squeeze
+                    match (regime, &vol_state, is_compressed) {
+                        (TrendStructure::StrongBullish, Some(VolumeState::Expand), _) => {
+                            // 强多头放量突破阻力：阻力变助推
                             tmp_long *= 1.0 + (0.4 * intensity);
                             tmp_short *= 0.15;
                         }
-                        (TrendStructure::Range, Some(VolumeState::Shrink))
-                        | (_, Some(VolumeState::Squeeze)) => {
+                        // 震荡缩量 或 任何状态下的波动压缩：阻力有效性增强
+                        (TrendStructure::Range, Some(VolumeState::Shrink), _) | (_, _, true) => {
                             tmp_short *= 1.0 + (1.2 * intensity * boost);
                             tmp_long *= 0.4;
                         }
@@ -115,19 +119,24 @@ impl Analyzer for LevelProximityAnalyzer {
                         source: if is_confluent {
                             "MTF_Confluence_Sup"
                         } else {
-                            "Trend_Sup"
+                            "Trend_Res"
                         }
                         .into(),
                         distance_pct: -dist_sup,
                         strength: intensity * boost,
                     });
 
-                    match (regime, vol_state) {
-                        (TrendStructure::StrongBearish, Some(VolumeState::Expand)) => {
+                    // 【关键修改】: 判定逻辑替换 Squeeze
+                    match (regime, &vol_state, is_compressed) {
+                        (TrendStructure::StrongBearish, Some(VolumeState::Expand), _) => {
+                            // 强空头放量击穿支撑
                             tmp_short *= 1.1;
                             tmp_long *= 0.1;
                         }
-                        (TrendStructure::Bullish, _) | (TrendStructure::StrongBullish, _) => {
+                        // 趋势多头支撑位 或 波动压缩态支撑位：支撑有效性极高
+                        (TrendStructure::Bullish, _, _)
+                        | (TrendStructure::StrongBullish, _, _)
+                        | (_, _, true) => {
                             tmp_long *= 1.0 + (1.3 * intensity * boost);
                             tmp_short *= 0.3;
                         }
@@ -139,7 +148,7 @@ impl Analyzer for LevelProximityAnalyzer {
                 }
             }
 
-            // --- 空间几何 (Mean Reversion) ---
+            // --- 空间几何 (均值回归) ---
             let m_dist = t_space.ma20_dist_ratio.unwrap_or(0.0);
             let ma_limit = atr_ratio * 3.5;
             if m_dist.abs() > ma_limit {
@@ -163,9 +172,9 @@ impl Analyzer for LevelProximityAnalyzer {
                 m_dist,
                 format!("{:?}", regime),
             )
-        }; // <--- 所有借用在这里全部释放！ctx 彻底自由
+        };
 
-        // ========== 2. 状态写入与持久化 (此时可以安全 mutable borrow) ==========
+        // ========== 2. 状态写入与持久化 ==========
         let m_long = m_long_raw.clamp(0.05, 4.0);
         let m_short = m_short_raw.clamp(0.05, 4.0);
 
@@ -177,12 +186,11 @@ impl Analyzer for LevelProximityAnalyzer {
         ctx.set_multiplier(self.kind(), final_weight);
 
         let mut res = AnalysisResult::new(self.kind(), "LEVEL_PROX".into());
-        // 这里的 logic description 可以根据 wells 是否为空动态生成
-        if wells.is_empty() {
-            res = res.because("价格处于开阔空间，无临近支撑阻力引力");
+        res = if wells.is_empty() {
+            res.because("价格处于开阔空间，无临近支撑阻力引力")
         } else {
-            res = res.because("触发关键位置引力感应，调整多空博弈权重");
-        }
+            res.because("触发关键位置引力感应，调整多空博弈权重")
+        };
 
         Ok(res.with_mult(final_weight).debug(json!({
             "m_long": m_long,
