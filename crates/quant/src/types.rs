@@ -198,12 +198,20 @@ pub struct FeatureSet {
     pub signals: SignalStates,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema, PartialEq, Eq, Copy)]
+pub enum WellSide {
+    Support,    // 支撑/地板
+    Resistance, // 压力/天花板
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct PriceGravityWell {
-    pub level: f64,
-    pub source: String,    // e.g., "H4_MA200", "Liq_Wall"
-    pub distance_pct: f64, // 距离百分比
-    pub strength: f64,     // 0.0 ~ 1.0
+    pub level: f64,        // 物理价格位点 (例如 72500.5)
+    pub side: WellSide,    // 明确是支撑还是压力
+    pub source: String,    // 来源 (例如 "MTF_Confluence", "D1_EMA200")
+    pub distance_pct: f64, // 距离当前价格的百分比 (支撑为负, 压力为正)
+    pub strength: f64,     // 引力强度 (0.0 ~ 1.0)
+    pub is_active: bool,   // 是否已进入当前感应半径 (即 intensity > 0)
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, Default, PartialEq, Eq)]

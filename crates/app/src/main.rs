@@ -106,10 +106,10 @@ async fn main() -> Result<()> {
         Box::new(VolumeStructureAnalyzer),       // 3. 能量确认
         Box::new(LevelProximityAnalyzer),        // 4. 空间位置
     ];
-    let engine = AnalysisEngine::new(Config::default(), analyzers);
+    let engine = Arc::new(AnalysisEngine::new(Config::default(), analyzers));
 
-    let score_query = ScoreQueryTool::new(ctx_manager.clone(), Arc::new(engine));
-
+    let score_query = ScoreQueryTool::new(ctx_manager.clone(), engine.clone());
+    start_report_monitor(ctx_manager.clone(), engine.clone(), Symbol::BTCUSDT).await;
     let tool_set = ToolSet::builder().static_tool(score_query).build();
 
     let agent_args = TechnicalAgentArgs {
@@ -145,4 +145,23 @@ async fn main() -> Result<()> {
 fn setup_proxy_pool(config: &ProxyConfig) -> CooledProxyPool {
     let cooldown = Duration::from_secs(300);
     CooledProxyPool::new(config.socks_proxy_list.clone(), cooldown)
+}
+pub async fn start_report_monitor(
+    manager: Arc<FeatureContextManager>,
+    engine: Arc<AnalysisEngine>,
+    symbol: Symbol,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    loop {
+        interval.tick().await;
+
+        if let Some(mut ctx) = manager.get_market_context(symbol) {
+            let report = engine.run(&mut ctx);
+
+            println!("----------------------------------");
+            println!("{:#?}", ctx);
+
+            println!("{:#?}", report);
+        }
+    }
 }

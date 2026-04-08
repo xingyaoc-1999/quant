@@ -205,15 +205,12 @@ impl FeatureContextManager {
 
         for (_role, proc) in roles_guard.iter_mut() {
             if let Some(closed_bar) = proc.process_m1(&candle) {
-                // 只有周期真正闭合时，才执行正式计算同步状态
                 if closed_bar.timestamp > proc.last_processed_ts {
                     proc.calculator.next(&closed_bar, proc.interval, g_close);
                     proc.last_processed_ts = closed_bar.timestamp;
-                    // 闭合后缓存失效，确保下一次 get_market_context 重新 Peek
                     proc.cached_role_data = None;
                 }
             }
-            // 删除了 else { peek } 逻辑，极大降低了写负载
         }
     }
 
@@ -350,19 +347,20 @@ impl FeatureContextManager {
     pub fn update_oi_from_poller(&self, symbol: Symbol, amount: f64, ts: i64) {
         if let Some(symbol_ctx) = self.symbol_contexts.get(&symbol) {
             let mut lock = symbol_ctx.latest_snap.write().expect("Lock poisoned");
-            if ts >= lock.timestamp {
-                lock.current_oi_amount = amount;
-                if lock.last_price > 0.0 {
-                    lock.current_oi_value = amount * lock.last_price;
-                }
-                lock.timestamp = ts;
+
+            lock.current_oi_amount = amount;
+            if lock.last_price > 0.0 {
+                lock.current_oi_value = amount * lock.last_price;
             }
+            lock.timestamp = ts;
         }
     }
 
     pub fn update_price_from_m1(&self, symbol: Symbol, price: f64, ts: i64) {
         if let Some(symbol_ctx) = self.symbol_contexts.get(&symbol) {
             let mut lock = symbol_ctx.latest_snap.write().expect("Lock poisoned");
+            info!("{ts}{}", lock.timestamp);
+
             if ts >= lock.timestamp {
                 lock.last_price = price;
                 lock.timestamp = ts;

@@ -4,7 +4,8 @@ use crate::{
 };
 use chrono::Utc;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize}; // 建议引入 chrono 处理时间，或者使用 ctx 内部的时间
+use serde::{Deserialize, Serialize};
+use tracing::info; // 建议引入 chrono 处理时间，或者使用 ctx 内部的时间
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct AnalysisAudit {
@@ -50,7 +51,6 @@ impl AnalysisAudit {
         let trend = ctx.get_role(Role::Trend).ok();
         let filter = ctx.get_role(Role::Filter).ok();
         let entry = ctx.get_role(Role::Entry).ok();
-
         // ========== 2. 构建市场快照 ==========
         let snapshot = MarketSnapshot {
             // 使用当前 UTC 时间，或者如果有回测需求，可从 ctx.global 获取逻辑时间

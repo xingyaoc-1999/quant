@@ -7,8 +7,8 @@ use common::{Candle, Interval};
 use std::collections::VecDeque;
 use ta::{
     indicators::{
-        AverageTrueRange, BollingerBands, MovingAverageConvergenceDivergence,
-        RelativeStrengthIndex, SimpleMovingAverage,
+        AverageTrueRange, BollingerBands, ExponentialMovingAverage,
+        MovingAverageConvergenceDivergence, RelativeStrengthIndex, SimpleMovingAverage,
     },
     Next,
 };
@@ -40,7 +40,7 @@ impl CalculatorConfig {
                 extreme_candle_atr_mult: 3.0,
                 extreme_candle_body_ratio: 0.7,
                 slope_deadzone: 0.0002,
-                doji_body_ratio: 0.05, // 修复：从 0.001 调至 0.05，更符合实盘
+                doji_body_ratio: 0.05,
                 rsi_range_3_low: 45.0,
                 rsi_range_3_high: 55.0,
             },
@@ -102,8 +102,8 @@ pub struct FeatureCalculator {
     config: CalculatorConfig,
     rsi: RelativeStrengthIndex,
     ma20: SimpleMovingAverage,
-    ma50: SimpleMovingAverage,
-    ma200: SimpleMovingAverage,
+    ma50: ExponentialMovingAverage,  // 已修改为 EMA
+    ma200: ExponentialMovingAverage, // 已修改为 EMA
     vma: SimpleMovingAverage,
     bb: BollingerBands,
     macd: MovingAverageConvergenceDivergence,
@@ -136,13 +136,12 @@ impl FeatureCalculator {
             config,
             rsi: RelativeStrengthIndex::new(14).unwrap(),
             ma20: SimpleMovingAverage::new(20).unwrap(),
-            ma50: SimpleMovingAverage::new(50).unwrap(),
-            ma200: SimpleMovingAverage::new(200).unwrap(),
+            ma50: ExponentialMovingAverage::new(50).unwrap(), // 初始化为 EMA
+            ma200: ExponentialMovingAverage::new(200).unwrap(), // 初始化为 EMA
             vma: SimpleMovingAverage::new(20).unwrap(),
             bb: BollingerBands::new(20, 2.0).unwrap(),
             macd: MovingAverageConvergenceDivergence::new(12, 26, 9).unwrap(),
             atr: AverageTrueRange::new(14).unwrap(),
-            // 修正：ma20_history 容量应为 slope_period + 1 以对齐 N 个间隔
             ma20_history: VecDeque::with_capacity(config.slope_period + 1),
             volatility_history: VecDeque::with_capacity(Self::VOL_WINDOW + 1),
             recent_highs: VecDeque::with_capacity(Self::STRUCT_WINDOW + 1),
@@ -190,8 +189,6 @@ impl FeatureCalculator {
         } else {
             50.0
         };
-
-        // --- 核心修复：先利用旧窗口计算特征，防止“当前价格污染历史” ---
 
         // 3. 支撑阻力计算 (使用 Push 之前的队列内容)
         let (dist_res, dist_sup) = if self.recent_highs.len() >= 10 {
@@ -470,7 +467,6 @@ impl FeatureCalculator {
         if m20.is_nan() || atr <= f64::EPSILON {
             return None;
         }
-        // 修正：保存 slope_period + 1 个点，索引 0 才是严格意义上的 N 周期前
         Self::push_fixed_window(&mut self.ma20_history, m20, self.config.slope_period + 1);
 
         if self.ma20_history.len() < self.config.slope_period + 1 {
@@ -498,6 +494,8 @@ impl FeatureCalculator {
         if self.count < 50 {
             return None;
         }
+
+        // 使用 EMA 后，趋势判定依然有效，且响应更加迅速
         if self.count >= 200 {
             if close > m20 && m20 > m50 && m50 > m200 {
                 return Some(TrendStructure::StrongBullish);
@@ -506,6 +504,7 @@ impl FeatureCalculator {
                 return Some(TrendStructure::StrongBearish);
             }
         }
+
         if close > m20 && m20 > m50 {
             Some(TrendStructure::Bullish)
         } else if close < m20 && m20 < m50 {

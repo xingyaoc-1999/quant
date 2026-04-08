@@ -61,7 +61,7 @@ impl Analyzer for VolumeStructureAnalyzer {
                     if is_vol_compressed {
                         // 情景：低波挤压后的首次放量 —— 极强的突破信号
                         m_vol = 1.65;
-                        res = res.because("🚀 爆发确认：成交量打破低波挤压，动能释放");
+                        res = res.because("爆发确认：成交量打破低波挤压，动能释放");
                     } else {
                         // 情景：常规趋势中的放量
                         m_vol = if vol_p > 65.0 { 1.25 } else { 1.1 };
@@ -78,11 +78,11 @@ impl Analyzer for VolumeStructureAnalyzer {
                     {
                         // 情景：多头趋势回调 + 缩量 + 波动收窄 + 支撑位 = VCP埋伏点
                         m_vol = 1.6;
-                        res = res.because("💎 极致缩量挤压：多头趋势中抛压竭尽，关键支撑位蓄势");
+                        res = res.because("极致缩量挤压：多头趋势中抛压竭尽，关键支撑位蓄势");
                     } else if !is_vol_compressed && dist_res < 0.015 {
                         // 情景：阻力位附近的无量反弹
                         m_vol = 0.6;
-                        res = res.because("⚠️ 弱势反弹：接近阻力位但缺乏资金跟进");
+                        res = res.because("弱势反弹：接近阻力位但缺乏资金跟进");
                     } else {
                         m_vol = 0.8; // 常规缩量，代表观望
                     }
@@ -91,7 +91,7 @@ impl Analyzer for VolumeStructureAnalyzer {
                     // 成交量正常，但如果是高度压缩，也给予轻微关注
                     if is_vol_compressed {
                         m_vol = 1.1;
-                        res = res.because("⚖️ 静态平衡：价格高度压缩，等待成交量入场打破僵局");
+                        res = res.because("静态平衡：价格高度压缩，等待成交量入场打破僵局");
                     }
                 }
             }
@@ -104,7 +104,7 @@ impl Analyzer for VolumeStructureAnalyzer {
             // 逻辑：RSI钝化 + 连续3根缩量 + 波动率挤压 = 即将发生的高胜率单边
             let bonus = 1.5 + ((100.0 - vol_p) / 200.0);
             m_vol *= bonus;
-            res = res.because(format!("☢️ 火药桶共振：极致压缩后的爆发潜力 x{:.2}", bonus));
+            res = res.because(format!("火药桶共振：极致压缩后的爆发潜力 x{:.2}", bonus));
         }
 
         // 4.2 极端 K 线判定 (力竭或陷阱)
@@ -114,11 +114,11 @@ impl Analyzer for VolumeStructureAnalyzer {
                 m_vol = 0.15;
                 res = res
                     .violate()
-                    .because("🚫 高位力竭：极端波动下的天量换手，趋势大概率反转");
+                    .because("高位力竭：极端波动下的天量换手，趋势大概率反转");
             } else if dist_res < 0.012 {
                 // 逻辑：阻力位放量大阳线，若不能迅速封死突破，通常是诱多扫损
                 m_vol *= 0.4;
-                res = res.because("🚩 阻力位异常放量：警惕流动性陷阱/假突破");
+                res = res.because("阻力位异常放量：警惕流动性陷阱/假突破");
             }
         }
 

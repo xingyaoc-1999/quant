@@ -6,6 +6,12 @@ use serde_json::json;
 
 pub struct VolatilityEnvironmentAnalyzer;
 
+const VOL_EXTREME_LOW: f64 = 8.0; // 极低波动熔断
+const VOL_SQUEEZE_THRESHOLD: f64 = 20.0; // 进入压缩态阈值
+const VOL_LOW_MOMENTUM: f64 = 25.0; // 趋势中动力不足
+const VOL_MEAT_GRINDER: f64 = 85.0; // 震荡市绞肉机阈值
+const VOL_ACCELERATION: f64 = 90.0; // 趋势加速阈值
+
 impl Analyzer for VolatilityEnvironmentAnalyzer {
     fn name(&self) -> &'static str {
         "volatility_env"
@@ -18,10 +24,8 @@ impl Analyzer for VolatilityEnvironmentAnalyzer {
     fn analyze(&self, ctx: &mut MarketContext) -> Result<AnalysisResult, AnalysisError> {
         let last_price = ctx.global.last_price;
 
-        // ========== 1. 数据提取阶段 (解决借用冲突的核心) ==========
-        // 使用块作用域确保不可变借用在计算和缓存操作前被释放
+        // ========== 1. 数据提取阶段 (保持高效的作用域设计) ==========
         let (vol_p, atr, regime) = {
-            // 获取角色引用
             let trend_role = ctx.get_role(Role::Trend)?;
             let filter_role = ctx
                 .get_role(Role::Filter)
@@ -30,12 +34,9 @@ impl Analyzer for VolatilityEnvironmentAnalyzer {
             let f_filter = &filter_role.feature_set;
             let f_trend = &trend_role.feature_set;
 
-            // 提取我们需要的基础标量数据 (f64/bool) 和 克隆 Enum
-            // 这样我们拿走的是副本，不再依赖 ctx 的借用
             let v_p = f_filter.price_action.volatility_percentile;
             let a = f_filter.indicators.atr_14.unwrap_or(last_price * 0.005);
 
-            // 优先获取特征集中的结构，如果没有再尝试从缓存中获取（此时还在读操作内）
             let reg = f_trend
                 .structure
                 .trend_structure
@@ -46,55 +47,57 @@ impl Analyzer for VolatilityEnvironmentAnalyzer {
                 });
 
             (v_p, a, reg)
-        }; // <--- 不可变借用在这里被 Drop，ctx 变回自由状态
+        };
 
-        // ========== 2. 计算与缓存阶段 ==========
+        // ========== 2. 基础指标计算与状态预设 ==========
         let atr_ratio = if last_price > f64::EPSILON {
             atr / last_price
         } else {
             0.005
         };
+        let mut m_env = 1.0;
+        let mut is_compressed = false;
+        let mut res = AnalysisResult::new(self.kind(), "VOL_ENV".into());
 
-        // 现在可以安全地执行可变操作（Mutable Borrow）
+        // 核心缓存写入
         ctx.set_cached(ContextKey::VolAtrRatio, json!(atr_ratio));
         ctx.set_cached(ContextKey::VolPercentile, json!(vol_p));
 
-        let mut res = AnalysisResult::new(self.kind(), "VOL_ENV".into());
-
-        // 3. 深度熔断逻辑
-        if vol_p < 8.0 {
+        // ========== 3. 熔断逻辑：极低流动性保护 ==========
+        if vol_p < VOL_EXTREME_LOW {
             return Ok(res
                 .with_mult(0.1)
-                .because("Filter周期流动性极度匮乏，拒绝所有趋势交易")
+                .because("市场进入极度低频死寂期，暂停所有信号")
                 .violate());
         }
 
-        // 4. 计算动态乘数
-        let mut m_env = 1.0;
-        let mut is_compressed = false;
-
+        // ========== 4. 动态环境权重匹配 ==========
         match regime {
             TrendStructure::StrongBullish | TrendStructure::StrongBearish => {
-                if vol_p > 90.0 {
-                    m_env = 1.15; // 加速阶段
-                    res = res.because("强趋势加速，局部波动共振放大");
-                } else if vol_p < 25.0 {
-                    m_env = 0.65; // 动力不足
-                    res = res.because("大趋势强但局部波动过低，警惕‘诱多/诱空’后撤");
+                if vol_p > VOL_ACCELERATION {
+                    m_env = 1.15; // 趋势末端加速或过热
+                    res = res.because("强趋势进入放量加速段");
+                } else if vol_p < VOL_LOW_MOMENTUM {
+                    m_env = 0.65; // 趋势背离，缺乏波动支撑
+                    res = res.because("趋势强但局部波动匮乏，预防虚假信号");
                 } else {
-                    m_env = 1.3; // 黄金波段
+                    m_env = 1.3; // 黄金波段 (Goldilocks Zone)
+                    res = res.because("波动率与趋势强度完美匹配，环境极佳");
                 }
             }
             TrendStructure::Range => {
-                if vol_p < 20.0 {
+                if vol_p < VOL_SQUEEZE_THRESHOLD {
                     is_compressed = true;
-                    m_env = 0.8; // 压缩态
-                    res = res.because("局部进入极度压缩区间 (Squeeze)，等待突破信号");
-                } else if vol_p > 85.0 {
-                    m_env = 0.4; // 震荡市高波动 = 绞肉机
+                    m_env = 0.85; // 压缩态，此时评分不宜过高，等待变盘
+                    res = res.because("市场处于波动率极度压缩态 (Squeeze)，蓄势中");
+                } else if vol_p > VOL_MEAT_GRINDER {
+                    m_env = 0.3; // 震荡市高波动 = 散户绞肉机
                     res = res
-                        .because("震荡市局部极端高波动，属于无效噪音，规避风险")
+                        .because("震荡市伴随极端高波动，属于无效噪音干扰")
                         .violate();
+                } else {
+                    m_env = 1.0; // 普通震荡
+                    res = res.because("震荡环境波动适中");
                 }
             }
             _ => {
@@ -102,15 +105,16 @@ impl Analyzer for VolatilityEnvironmentAnalyzer {
             }
         }
 
-        // 5. 状态持久化与结果返回
+        // ========== 5. 持久化与结果返回 ==========
         ctx.set_cached(ContextKey::VolIsCompressed, json!(is_compressed));
         ctx.set_multiplier(self.kind(), m_env);
 
         Ok(res.with_mult(m_env).debug(json!({
-            "filter_vol_p": vol_p,
-            "trend_regime": format!("{:?}", regime),
-            "final_m": m_env,
-            "is_compressed": is_compressed
+            "vol_p": vol_p,
+            "regime": format!("{:?}", regime),
+            "m_env": m_env,
+            "is_compressed": is_compressed,
+            "atr_ratio": atr_ratio
         })))
     }
 }
