@@ -105,9 +105,16 @@ pub struct MarketStructure {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
 pub struct SpaceGeometry {
-    pub ma20_dist_ratio: Option<f64>,
-    pub dist_to_resistance: Option<f64>,
-    pub dist_to_support: Option<f64>,
+    // --- 极值位 (你原有的) ---
+    pub dist_to_resistance: Option<f64>, // 50日最高
+    pub dist_to_support: Option<f64>,    // 50日最低
+
+    // --- 均线动态位 (新增) ---
+    pub ma20_dist_ratio: Option<f64>,  // 月度趋势线 (MA20)
+    pub ma50_dist_ratio: Option<f64>,  // 季度生命线 (MA50)
+    pub ma200_dist_ratio: Option<f64>, // 年度牛熊线 (MA200)
+
+    // --- 状态位 ---
     pub ma_converging: Option<bool>,
 }
 

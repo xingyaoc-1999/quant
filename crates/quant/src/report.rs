@@ -10,7 +10,7 @@ use tracing::info; // 建议引入 chrono 处理时间，或者使用 ctx 内部
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct AnalysisAudit {
     /// 引擎给出的综合判定
-    pub verdict: FinalSignal,
+    pub signal: FinalSignal,
 
     /// 市场当前“物理体温”
     pub snapshot: MarketSnapshot,
@@ -45,7 +45,7 @@ pub struct MarketSnapshot {
 }
 
 impl AnalysisAudit {
-    pub fn build(ctx: &MarketContext, verdict: FinalSignal) -> Self {
+    pub fn build(ctx: &MarketContext, signal: FinalSignal) -> Self {
         // ========== 1. 预提取 Role (性能与借用优化) ==========
         // 这样后续代码中只通过 Option 访问，不再多次进入 ctx 查找
         let trend = ctx.get_role(Role::Trend).ok();
@@ -110,7 +110,7 @@ impl AnalysisAudit {
             .unwrap_or_default();
 
         Self {
-            verdict,
+            signal,
             snapshot,
             gravity_wells,
         }

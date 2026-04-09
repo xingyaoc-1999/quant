@@ -190,7 +190,6 @@ impl FeatureCalculator {
             50.0
         };
 
-        // 3. 支撑阻力计算 (使用 Push 之前的队列内容)
         let (dist_res, dist_sup) = if self.recent_highs.len() >= 10 {
             let res = self.recent_highs.iter().copied().fold(f64::MIN, f64::max);
             let sup = self.recent_lows.iter().copied().fold(f64::MAX, f64::min);
@@ -259,6 +258,16 @@ impl FeatureCalculator {
         } else {
             VolumeState::Normal
         };
+        let space = SpaceGeometry {
+            dist_to_resistance: dist_res,
+            dist_to_support: dist_sup,
+            // 关键修改：计算价格相对于日线均线的偏离度
+            ma20_dist_ratio: (m20_v > 0.0).then_some((candle.close - m20_v) / m20_v),
+            ma50_dist_ratio: (m50_v > 0.0).then_some((candle.close - m50_v) / m50_v),
+            ma200_dist_ratio: (m200_v > 0.0).then_some((candle.close - m200_v) / m200_v),
+            ma_converging: (m50_v > 0.0)
+                .then_some(((m20_v - m50_v).abs() / m50_v) < self.config.ma_converge_threshold),
+        };
 
         let fs = FeatureSet {
             bucket,
@@ -305,14 +314,7 @@ impl FeatureCalculator {
                 ),
                 correlation_with_global: correlation,
             },
-            space: SpaceGeometry {
-                ma20_dist_ratio: (m20_v.abs() > f64::EPSILON)
-                    .then_some((candle.close - m20_v) / m20_v),
-                dist_to_resistance: dist_res,
-                dist_to_support: dist_sup,
-                ma_converging: (m50_v.abs() > f64::EPSILON)
-                    .then_some(((m20_v - m50_v).abs() / m50_v) < self.config.ma_converge_threshold),
-            },
+            space,
             signals: SignalStates {
                 macd_divergence,
                 rsi_divergence: None,

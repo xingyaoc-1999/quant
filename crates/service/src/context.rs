@@ -294,7 +294,7 @@ impl FeatureContextManager {
 
         let mut roles_guard = symbol_ctx.roles.write().expect("Lock poisoned");
 
-        for (role, proc) in roles_guard.iter_mut() {
+        for (_, proc) in roles_guard.iter_mut() {
             // 1. 处理种子数据
             if let Some(seeds) = interval_data_map.get(&proc.interval) {
                 let oi_lookup: HashMap<i64, &OpenInterestRecord> = oi_data_map
@@ -317,8 +317,10 @@ impl FeatureContextManager {
                 }
             }
 
-            // 2. 补全 M1 导致的状态切换
             if let Some(m1_candles) = interval_data_map.get(&Interval::M1) {
+                if let Some(last_m1) = m1_candles.last() {
+                    self.update_price_from_m1(symbol, last_m1.close, last_m1.timestamp);
+                }
                 for m1 in m1_candles {
                     if m1.timestamp > proc.last_processed_ts {
                         if let Some(closed_bar) = proc.process_m1(m1) {
@@ -359,14 +361,11 @@ impl FeatureContextManager {
     pub fn update_price_from_m1(&self, symbol: Symbol, price: f64, ts: i64) {
         if let Some(symbol_ctx) = self.symbol_contexts.get(&symbol) {
             let mut lock = symbol_ctx.latest_snap.write().expect("Lock poisoned");
-            info!("{ts}{}", lock.timestamp);
 
-            if ts >= lock.timestamp {
-                lock.last_price = price;
-                lock.timestamp = ts;
-                if lock.current_oi_amount > 0.0 {
-                    lock.current_oi_value = lock.current_oi_amount * price;
-                }
+            lock.last_price = price;
+            lock.timestamp = ts;
+            if lock.current_oi_amount > 0.0 {
+                lock.current_oi_value = lock.current_oi_amount * price;
             }
         }
     }

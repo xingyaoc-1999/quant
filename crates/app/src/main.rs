@@ -101,10 +101,10 @@ async fn main() -> Result<()> {
         "openai/gpt-5.4",
     )?;
     let analyzers: Vec<Box<dyn Analyzer>> = vec![
-        Box::new(VolatilityEnvironmentAnalyzer), // 1. 环境基调
-        Box::new(MarketRegimeAnalyzer),          // 2. 确定方向
-        Box::new(VolumeStructureAnalyzer),       // 3. 能量确认
-        Box::new(LevelProximityAnalyzer),        // 4. 空间位置
+        Box::new(VolatilityEnvironmentAnalyzer),
+        Box::new(MarketRegimeAnalyzer),
+        Box::new(LevelProximityAnalyzer),
+        Box::new(VolumeStructureAnalyzer),
     ];
     let engine = Arc::new(AnalysisEngine::new(Config::default(), analyzers));
 

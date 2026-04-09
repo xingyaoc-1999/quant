@@ -1,21 +1,20 @@
 use crate::analyzer::{
     AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, ContextKey, MarketContext, Role,
 };
-use crate::types::{PriceGravityWell, TrendStructure, VolumeState, WellSide};
+use crate::types::{PriceGravityWell, TrendStructure, WellSide};
 use serde_json::json;
 
 pub struct LevelProximityAnalyzer;
 
 impl LevelProximityAnalyzer {
-    /// 计算非线性引力强度：采用平方衰减，贴近位点时强度爆发
     #[inline]
-    fn calculate_intensity(dist: f64, threshold: f64) -> f64 {
-        if dist >= threshold || threshold <= 0.0 {
-            0.0
-        } else {
-            let ratio = 1.0 - (dist / threshold);
-            ratio * ratio
+    fn calculate_intensity(dist: f64, sigma: f64) -> f64 {
+        if sigma <= 0.0 {
+            return 0.0;
         }
+        let gauss = (-(dist * dist) / (2.0 * sigma * sigma)).exp();
+        let long_range = 0.05 * (-(dist) / (10.0 * sigma)).exp(); // 长程弱引力
+        gauss.max(long_range)
     }
 }
 
@@ -30,182 +29,209 @@ impl Analyzer for LevelProximityAnalyzer {
 
     fn analyze(&self, ctx: &mut MarketContext) -> Result<AnalysisResult, AnalysisError> {
         let last_price = ctx.global.last_price;
-
-        // ========== 1. 上下文环境提取 ==========
         let vol_p = ctx
             .get_cached::<f64>(ContextKey::VolPercentile)
             .unwrap_or(50.0);
         let atr_ratio = ctx
             .get_cached::<f64>(ContextKey::VolAtrRatio)
             .unwrap_or(0.005);
-        let is_compressed = ctx
-            .get_cached::<bool>(ContextKey::VolIsCompressed)
-            .unwrap_or(false);
         let regime = ctx
             .get_cached::<TrendStructure>(ContextKey::RegimeStructure)
             .unwrap_or(TrendStructure::Range);
-        let vol_state = ctx
-            .get_cached::<serde_json::Value>(ContextKey::VolumeState)
-            .and_then(|v| serde_json::from_value::<VolumeState>(v).ok());
+        let sigma = atr_ratio * (0.8 + (vol_p / 120.0));
+        let confluence_gate = sigma * 0.4;
 
-        // 动态感应半径：压缩态下更灵敏，高波动下网撒得更宽
-        let radius_mult = if is_compressed { 0.5 } else { 0.8 };
-        let current_threshold = atr_ratio * (radius_mult + (vol_p / 200.0));
-        let confluence_gate = current_threshold * 0.25; // 共振判定门槛
-
-        // ========== 2. 空间探测逻辑 ==========
+        let mut wells: Vec<PriceGravityWell> = Vec::new();
         let mut tmp_long: f64 = 1.0;
         let mut tmp_short: f64 = 1.0;
-        let mut wells = Vec::new();
 
         let trend_data = ctx.get_role(Role::Trend)?;
         let filter_data = ctx.get_role(Role::Filter)?;
         let t_space = &trend_data.feature_set.space;
         let f_space = &filter_data.feature_set.space;
+        let mut process_source =
+            |dist_opt: Option<f64>, side_hint: Option<WellSide>, label: &str, weight: f64| {
+                let dist_raw = if let Some(d) = dist_opt {
+                    d
+                } else {
+                    return;
+                };
+                let dist_abs = dist_raw.abs();
+                let intensity = Self::calculate_intensity(dist_abs, sigma);
+                let final_strength = intensity * weight;
 
-        // 闭包：处理单侧（支撑或压力）的位点逻辑
-        let mut process_level = |dist_opt: Option<f64>, f_dist_opt: Option<f64>, side: WellSide| {
-            if let Some(dist) = dist_opt {
-                let intensity = Self::calculate_intensity(dist, current_threshold);
-                let f_dist = f_dist_opt.unwrap_or(f64::INFINITY);
-                let is_confluent = (dist - f_dist).abs() < confluence_gate;
-                let boost = if is_confluent { 1.6 } else { 1.0 };
+                if final_strength < 0.02 && dist_abs > sigma * 4.0 {
+                    return;
+                }
 
-                // 记录逻辑：记录 3 倍半径内的位点，方便 AI 回复远端目标
-                if dist < current_threshold * 3.0 {
+                let current_level = last_price * (1.0 + dist_raw);
+                let side = side_hint.unwrap_or_else(|| {
+                    if dist_raw > 0.0 {
+                        WellSide::Resistance
+                    } else {
+                        WellSide::Support
+                    }
+                });
+
+                let mut merged = false;
+                for existing in wells.iter_mut() {
+                    let level_diff_pct = (existing.level - current_level).abs() / last_price;
+                    if existing.side == side && level_diff_pct < confluence_gate {
+                        existing.strength += final_strength * 0.6;
+                        if !existing.source.contains(label) {
+                            existing.source = format!("{}+{}", existing.source, label);
+                        }
+                        if final_strength > 0.08 {
+                            existing.is_active = true;
+                        }
+                        merged = true;
+                        break;
+                    }
+                }
+
+                if !merged {
                     wells.push(PriceGravityWell {
-                        level: match side {
-                            WellSide::Resistance => last_price * (1.0 + dist),
-                            WellSide::Support => last_price * (1.0 - dist),
-                        },
+                        level: current_level,
                         side,
-                        source: if is_confluent {
-                            "MTF_Confluence".into()
-                        } else {
-                            "Trend_Level".into()
-                        },
-                        distance_pct: if side == WellSide::Support {
-                            -dist
-                        } else {
-                            dist
-                        },
-                        strength: intensity * boost,
-                        is_active: intensity > 0.0,
+                        source: label.into(),
+                        distance_pct: dist_raw,
+                        strength: final_strength,
+                        is_active: final_strength > 0.08,
                     });
                 }
-                return Some((intensity, boost));
-            }
-            None
-        };
-
-        let res_impact = process_level(
+            };
+        process_source(
             t_space.dist_to_resistance,
-            f_space.dist_to_resistance,
-            WellSide::Resistance,
+            Some(WellSide::Resistance),
+            "1D_Ext",
+            1.0,
         );
-        let sup_impact = process_level(
+        process_source(
             t_space.dist_to_support,
-            f_space.dist_to_support,
-            WellSide::Support,
+            Some(WellSide::Support),
+            "1D_Ext",
+            1.0,
         );
+        process_source(t_space.ma20_dist_ratio, None, "1D_MA20", 1.2);
+        process_source(t_space.ma50_dist_ratio, None, "1D_MA50", 1.4);
+        process_source(t_space.ma200_dist_ratio, None, "1D_MA200", 1.8);
+        process_source(
+            f_space.dist_to_resistance,
+            Some(WellSide::Resistance),
+            "4H_Ext",
+            0.7,
+        );
+        process_source(
+            f_space.dist_to_support,
+            Some(WellSide::Support),
+            "4H_Ext",
+            0.7,
+        );
+        process_source(f_space.ma20_dist_ratio, None, "4H_MA20", 0.8);
+        process_source(f_space.ma50_dist_ratio, None, "4H_MA50", 1.0);
+        // ========== 4. 变盘增强逻辑 ==========
+        let is_converging = t_space.ma_converging.unwrap_or(false);
+        if is_converging {
+            for well in wells.iter_mut() {
+                well.strength *= 1.35;
+            }
+        }
+        let total_res = wells
+            .iter()
+            .filter(|w| w.side == WellSide::Resistance)
+            .map(|w| w.strength)
+            .fold(0.0, f64::max)
+            .min(3.0);
+        let total_sup = wells
+            .iter()
+            .filter(|w| w.side == WellSide::Support)
+            .map(|w| w.strength)
+            .fold(0.0, f64::max)
+            .min(3.0);
 
-        // ========== 3. 环境驱动的权重修正 ==========
+        let raw_gravity_score = (total_sup - total_res) * 40.0;
+        let mut final_score = 0.0;
 
-        // 3.1 压力位影响
-        if let Some((intensity, boost)) = res_impact {
-            if intensity > 0.0 {
-                match (regime, &vol_state) {
-                    (TrendStructure::StrongBullish, Some(VolumeState::Expand)) => {
-                        tmp_long *= 1.0 + (0.4 * intensity * boost); // 助推
-                        tmp_short *= 1.0 - (0.5 * intensity);
-                    }
-                    (TrendStructure::Range, _) => {
-                        tmp_short *= 1.0 + (1.2 * intensity * boost); // 强拦截
-                        tmp_long *= 1.0 - (0.6 * intensity);
-                    }
-                    _ => tmp_long *= 1.0 - (0.4 * intensity),
+        match regime {
+            TrendStructure::StrongBullish | TrendStructure::Bullish => {
+                if total_sup > 0.01 {
+                    tmp_long *= 1.0 + (1.7 * total_sup);
+                    tmp_short *= 1.0 - (0.5 * total_sup);
+                    final_score = raw_gravity_score * 1.5;
                 }
+                if total_res > 0.01 {
+                    tmp_long *= 1.0 + (0.4 * total_res);
+                    tmp_short *= 1.0 - (0.4 * total_res);
+                    if final_score == 0.0 {
+                        final_score = raw_gravity_score * 0.3;
+                    }
+                }
+            }
+            TrendStructure::StrongBearish | TrendStructure::Bearish => {
+                if total_res > 0.01 {
+                    tmp_short *= 1.0 + (1.7 * total_res);
+                    tmp_long *= 1.0 - (0.5 * total_res);
+                    final_score = raw_gravity_score * 1.5;
+                }
+                if total_sup > 0.01 {
+                    tmp_short *= 1.0 + (0.4 * total_sup);
+                    tmp_long *= 1.0 - (0.4 * total_sup);
+                    if final_score == 0.0 {
+                        final_score = raw_gravity_score * 0.3;
+                    }
+                }
+            }
+            TrendStructure::Range => {
+                tmp_short *= 1.0 + (1.4 * total_res);
+                tmp_long *= 1.0 + (1.4 * total_sup);
+                final_score = raw_gravity_score;
             }
         }
 
-        // 3.2 支撑位影响
-        if let Some((intensity, boost)) = sup_impact {
-            if intensity > 0.0 {
-                match (regime, &vol_state) {
-                    (TrendStructure::StrongBearish, Some(VolumeState::Expand)) => {
-                        tmp_short *= 1.0 + (0.4 * intensity * boost); // 助推跌破
-                        tmp_long *= 1.0 - (0.5 * intensity);
-                    }
-                    (TrendStructure::StrongBullish | TrendStructure::Bullish, _) => {
-                        tmp_long *= 1.0 + (1.3 * intensity * boost); // 回调买入点
-                        tmp_short *= 1.0 - (0.4 * intensity);
-                    }
-                    _ => tmp_short *= 1.0 - (0.4 * intensity),
-                }
+        if let Some(d) = t_space.ma20_dist_ratio {
+            let limit = atr_ratio * 3.8;
+            if d > limit {
+                tmp_long *= 0.4;
+                final_score = final_score.min(10.0);
+            } else if d < -limit {
+                tmp_short *= 0.4;
+                final_score = final_score.max(-10.0);
             }
         }
 
-        // 3.3 乖离率 (Mean Reversion)
-        let ma_dist = t_space.ma20_dist_ratio.unwrap_or(0.0);
-        let ma_limit = atr_ratio * 3.2;
-        if ma_dist > ma_limit {
-            tmp_long *= 0.6;
-        } else if ma_dist < -ma_limit {
-            tmp_short *= 0.6;
-        }
-
-        // ========== 4. 状态持久化与报告生成 ==========
-        let m_long = tmp_long.clamp(0.1, 4.0);
-        let m_short = tmp_short.clamp(0.1, 4.0);
+        let m_long = tmp_long.clamp(0.2, 3.5);
+        let m_short = tmp_short.clamp(0.2, 3.5);
 
         ctx.set_cached(ContextKey::MultLongSpace, json!(m_long));
         ctx.set_cached(ContextKey::MultShortSpace, json!(m_short));
         ctx.set_cached(ContextKey::SpaceGravityWells, json!(wells));
+        ctx.set_cached(ContextKey::Sigma, json!(sigma));
+        let max_well_strength = wells.iter().map(|w| w.strength).fold(0.0, f64::max);
+        let signal_confidence = (1.0 + max_well_strength * 0.5).clamp(1.0, 2.5);
 
-        let final_weight = m_long.max(m_short);
-        ctx.set_multiplier(self.kind(), final_weight);
-
-        let active_wells: Vec<_> = wells.iter().filter(|w| w.is_active).collect();
-        let reason = if active_wells.is_empty() {
-            if let Some(nearest) = wells.iter().min_by(|a, b| {
-                a.distance_pct
-                    .abs()
-                    .partial_cmp(&b.distance_pct.abs())
-                    .unwrap()
-            }) {
-                format!(
-                    "真空期。远端最近位点: {:.2} ({})",
-                    nearest.level,
-                    if nearest.side == WellSide::Resistance {
-                        "压"
-                    } else {
-                        "支"
-                    }
-                )
-            } else {
-                "处于绝对真空区".to_string()
-            }
+        let active_count = wells.iter().filter(|w| w.is_active).count();
+        let reason = if active_count == 0 {
+            "处于空间真空区".into()
         } else {
+            let top = wells
+                .iter()
+                .max_by(|a, b| a.strength.partial_cmp(&b.strength).unwrap())
+                .unwrap();
             format!(
-                "引力场激活：{}压 / {}支，权重偏向 {:.2}",
-                active_wells
-                    .iter()
-                    .filter(|w| w.side == WellSide::Resistance)
-                    .count(),
-                active_wells
-                    .iter()
-                    .filter(|w| w.side == WellSide::Support)
-                    .count(),
-                final_weight
+                "引力场激活({}). 核心源: {}, 强度: {:.2}",
+                active_count, top.source, top.strength
             )
         };
 
         Ok(AnalysisResult::new(self.kind(), "LEVEL_PROX".into())
-            .with_mult(final_weight)
+            .with_score(final_score.clamp(-100.0, 100.0))
+            .with_mult(signal_confidence) // <-- 这里现在代表模块信心
             .because(reason)
             .debug(json!({
-                "m_long": m_long, "m_short": m_short,
-                "wells": wells, "threshold": current_threshold
+                "m_long_bias": m_long,
+                "m_short_bias": m_short,
+                "signal_confidence": signal_confidence,
+                "is_converging": is_converging
             })))
     }
 }

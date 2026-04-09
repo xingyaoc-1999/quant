@@ -72,6 +72,7 @@ impl DataIntegrityManager {
                 .storage
                 .refresh_all_chunked(start_gap, end_gap, chrono::TimeDelta::days(30))
                 .await;
+            manager.clone().start_oi_poller();
 
             if let Err(e) = manager.execute_cold_start().await {
                 error!("❌ [Cold Start] Warmup failed: {:?}", e);
@@ -80,7 +81,6 @@ impl DataIntegrityManager {
             manager.clone().start_realtime_engine();
 
             manager.clone().start_runtime_checker();
-            manager.clone().start_oi_poller();
 
             info!("✅ [Manager] System is live and background tasks are scheduled.");
         });
