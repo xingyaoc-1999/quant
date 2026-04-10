@@ -105,19 +105,26 @@ pub struct MarketStructure {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
 pub struct SpaceGeometry {
-    // --- 极值位 (你原有的) ---
-    pub dist_to_resistance: Option<f64>, // 50日最高
-    pub dist_to_support: Option<f64>,    // 50日最低
+    // --- 静态价格位 (距离比例) ---
+    pub dist_to_resistance: Option<f64>, // 阻力位距离
+    pub dist_to_support: Option<f64>,    // 支撑位距离
 
-    // --- 均线动态位 (新增) ---
+    // --- 磨损与博弈元数据 (新增核心) ---
+    // 支撑位的触碰统计
+    pub sup_hit_count: u32,
+    pub sup_last_hit: i64,
+    // 阻力位的触碰统计
+    pub res_hit_count: u32,
+    pub res_last_hit: i64,
+
+    // --- 均线动态位 ---
     pub ma20_dist_ratio: Option<f64>,  // 月度趋势线 (MA20)
     pub ma50_dist_ratio: Option<f64>,  // 季度生命线 (MA50)
     pub ma200_dist_ratio: Option<f64>, // 年度牛熊线 (MA200)
 
     // --- 状态位 ---
-    pub ma_converging: Option<bool>,
+    pub ma_converging: Option<bool>, // 均线纠缠状态
 }
-
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
 pub struct SignalStates {
     pub macd_divergence: Option<DivergenceType>,
@@ -157,34 +164,40 @@ pub enum OIPositionState {
 }
 
 impl OIPositionState {
-    /// 物理层：根据价格和持仓变化判定状态
-    pub fn determine(price_change: f64, oi_change: f64) -> Self {
-        // 使用较小的阈值避免微小波动触发状态切换
-        const THRESHOLD: f64 = 1e-6;
-        if oi_change.abs() < THRESHOLD {
+    /// 逻辑层：根据价格变化率和持仓变化比例判定状态
+    /// price_pct: (close - open) / open
+    /// oi_ratio:  delta_oi / total_oi (即 delta_ratio 函数的返回值)
+    pub fn determine(price_pct: f64, oi_ratio: f64) -> Self {
+        // 1. 灵敏度门槛常量（建议根据回测调优）
+        // 只有当持仓变动超过 0.05% 时才认为具有博弈信号，否则视为噪音
+        const OI_SENSITIVITY: f64 = 0.0005;
+        // 只有价格波动超过 0.01% 时才区分方向
+        const PRICE_DEADZONE: f64 = 0.0001;
+
+        // 2. 噪音过滤：如果持仓变动极其微小，返回中性
+        if oi_ratio.abs() < OI_SENSITIVITY {
             return Self::Neutral;
         }
 
-        match (price_change > 0.0, oi_change > 0.0) {
-            (true, true) => Self::LongBuildUp,
-            (false, true) => Self::ShortBuildUp,
-            (false, false) => Self::LongUnwinding,
-            (true, false) => Self::ShortCovering,
-        }
-    }
+        // 3. 极小价格波动的处理：如果持仓在变但价格没动，可能是大宗对冲或挂单密集区
+        let p_dir = if price_pct.abs() < PRICE_DEADZONE {
+            0
+        } else if price_pct > 0.0 {
+            1
+        } else {
+            -1
+        };
+        let o_dir = if oi_ratio > 0.0 { 1 } else { -1 };
 
-    /// 评分层：用于趋势插件和引擎打分
-    pub fn signal_score(&self) -> f64 {
-        match self {
-            Self::LongBuildUp => 1.0,   // 极强多头
-            Self::ShortCovering => 0.5, // 被动多头(空平)
-            Self::Neutral => 0.0,
-            Self::LongUnwinding => -0.5, // 被动空头(多平)
-            Self::ShortBuildUp => -1.0,  // 极强空头
+        match (p_dir, o_dir) {
+            (1, 1) => Self::LongBuildUp,     // 价升量增：多头主动入场 (强)
+            (-1, 1) => Self::ShortBuildUp,   // 价跌量增：空头主动压制 (强)
+            (-1, -1) => Self::LongUnwinding, // 价跌量减：多头止损踩踏 (弱)
+            (1, -1) => Self::ShortCovering,  // 价升量减：空头平仓回补 (弱)
+            _ => Self::Neutral,              // 其他（如价格不动但持仓剧变）
         }
     }
 }
-
 // --- 5. 整合特征集 (The Unified Feature Set) ---
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
@@ -219,6 +232,8 @@ pub struct PriceGravityWell {
     pub distance_pct: f64, // 距离当前价格的百分比 (支撑为负, 压力为正)
     pub strength: f64,     // 引力强度 (0.0 ~ 1.0)
     pub is_active: bool,   // 是否已进入当前感应半径 (即 intensity > 0)
+    pub hit_count: u32,
+    pub last_hit_ts: i64,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, Default, PartialEq, Eq)]
@@ -258,11 +273,16 @@ impl OIData {
         }
     }
 
+    // 建议修改：
     pub fn delta_ratio(&self) -> f64 {
-        if self.change_history.is_empty() {
+        if self.change_history.is_empty() || self.current_oi_amount <= 0.0 {
             return 0.0;
         }
-        self.change_history.last().cloned().unwrap_or(0.0) / self.current_oi_amount.max(1.0)
+        // 获取最新的变化量
+        let last_change = self.change_history.last().cloned().unwrap_or(0.0);
+
+        // 返回百分比变化 (e.g., 0.01 代表持仓增加了 1%)
+        (last_change / self.current_oi_amount).clamp(-0.2, 0.2) // 限制极端值噪音
     }
 }
 #[derive(Debug, Clone, Default)]

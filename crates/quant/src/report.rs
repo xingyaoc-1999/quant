@@ -5,7 +5,6 @@ use crate::{
 use chrono::Utc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tracing::info; // 建议引入 chrono 处理时间，或者使用 ctx 内部的时间
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct AnalysisAudit {
@@ -103,8 +102,6 @@ impl AnalysisAudit {
                 .unwrap_or(0.5),
         };
 
-        // ========== 3. 提取缓存的引力位 ==========
-        // 这里直接拿走 Vec 的所有权（如果缓存存的是 json，内部会反序列化）
         let gravity_wells = ctx
             .get_cached::<Vec<PriceGravityWell>>(ContextKey::SpaceGravityWells)
             .unwrap_or_default();

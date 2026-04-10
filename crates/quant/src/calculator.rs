@@ -99,11 +99,20 @@ pub struct FeatureCalculator {
     volume_history: [Option<f64>; 3],
     rsi_history: [Option<f64>; 3],
 
+    // --- 新增：极值与磨损状态追踪 ---
+    current_res: Option<f64>,
+    res_hit_count: u32,
+    res_last_hit: i64,
+
+    current_sup: Option<f64>,
+    sup_hit_count: u32,
+    sup_last_hit: i64,
+    // ---------------------------------
     config: CalculatorConfig,
     rsi: RelativeStrengthIndex,
     ma20: SimpleMovingAverage,
-    ma50: ExponentialMovingAverage,  // 已修改为 EMA
-    ma200: ExponentialMovingAverage, // 已修改为 EMA
+    ma50: ExponentialMovingAverage,
+    ma200: ExponentialMovingAverage,
     vma: SimpleMovingAverage,
     bb: BollingerBands,
     macd: MovingAverageConvergenceDivergence,
@@ -133,15 +142,25 @@ impl FeatureCalculator {
             prev_ma20_satisfied: None,
             volume_history: [None; 3],
             rsi_history: [None; 3],
+
+            // 初始化极值与磨损状态
+            current_res: None,
+            res_hit_count: 0,
+            res_last_hit: 0,
+            current_sup: None,
+            sup_hit_count: 0,
+            sup_last_hit: 0,
+
             config,
             rsi: RelativeStrengthIndex::new(14).unwrap(),
             ma20: SimpleMovingAverage::new(20).unwrap(),
-            ma50: ExponentialMovingAverage::new(50).unwrap(), // 初始化为 EMA
-            ma200: ExponentialMovingAverage::new(200).unwrap(), // 初始化为 EMA
+            ma50: ExponentialMovingAverage::new(50).unwrap(),
+            ma200: ExponentialMovingAverage::new(200).unwrap(),
             vma: SimpleMovingAverage::new(20).unwrap(),
             bb: BollingerBands::new(20, 2.0).unwrap(),
             macd: MovingAverageConvergenceDivergence::new(12, 26, 9).unwrap(),
             atr: AverageTrueRange::new(14).unwrap(),
+
             ma20_history: VecDeque::with_capacity(config.slope_period + 1),
             volatility_history: VecDeque::with_capacity(Self::VOL_WINDOW + 1),
             recent_highs: VecDeque::with_capacity(Self::STRUCT_WINDOW + 1),
@@ -190,22 +209,53 @@ impl FeatureCalculator {
             50.0
         };
 
-        let (dist_res, dist_sup) = if self.recent_highs.len() >= 10 {
-            let res = self.recent_highs.iter().copied().fold(f64::MIN, f64::max);
-            let sup = self.recent_lows.iter().copied().fold(f64::MAX, f64::min);
-            if candle.close > f64::EPSILON {
-                (
-                    Some((res - candle.close) / candle.close),
-                    Some((candle.close - sup) / candle.close),
-                )
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
+        // 3. 极值状态机与磨损计算
+        let mut dist_res = None;
+        let mut dist_sup = None;
 
-        // 4. MACD 背离判定 (对比当前价格与历史窗口最值)
+        if self.recent_highs.len() >= 10 {
+            // 获取当前滑动窗口的绝对极值
+            let window_res = self.recent_highs.iter().copied().fold(f64::MIN, f64::max);
+            let window_sup = self.recent_lows.iter().copied().fold(f64::MAX, f64::min);
+
+            // 设定触碰判定阈值：0.15% 价格误差 或 当前 ATR，取较大者
+            let hit_margin = atr_v.max(candle.close * 0.0015);
+
+            // --- 阻力位逻辑 ---
+            if window_res > self.current_res.unwrap_or(0.0) + f64::EPSILON {
+                // 出现更高的高点，旧阻力被突破，重置状态
+                self.current_res = Some(window_res);
+                self.res_hit_count = 1;
+                self.res_last_hit = candle.timestamp;
+            } else if let Some(r) = self.current_res {
+                // 阻力位未变，检查是否撞击
+                if candle.high >= r - hit_margin && candle.timestamp != self.res_last_hit {
+                    self.res_hit_count += 1;
+                    self.res_last_hit = candle.timestamp;
+                }
+            }
+
+            // --- 支撑位逻辑 ---
+            if window_sup < self.current_sup.unwrap_or(f64::MAX) - f64::EPSILON {
+                // 出现更低的低点，旧支撑被突破，重置状态
+                self.current_sup = Some(window_sup);
+                self.sup_hit_count = 1;
+                self.sup_last_hit = candle.timestamp;
+            } else if let Some(s) = self.current_sup {
+                // 支撑位未变，检查是否踩踏
+                if candle.low <= s + hit_margin && candle.timestamp != self.sup_last_hit {
+                    self.sup_hit_count += 1;
+                    self.sup_last_hit = candle.timestamp;
+                }
+            }
+
+            if candle.close > f64::EPSILON {
+                dist_res = Some((window_res - candle.close) / candle.close);
+                dist_sup = Some((candle.close - window_sup) / candle.close);
+            }
+        }
+
+        // 4. MACD 背离判定
         let macd_divergence = self.check_macd_divergence(candle.close, macd_out.histogram);
 
         // 5. 更新历史滑窗
@@ -223,6 +273,7 @@ impl FeatureCalculator {
             Self::push_fixed_window(&mut self.recent_global_closes, gc, Self::STRUCT_WINDOW);
         }
 
+        // 6. 相关性计算
         let correlation = self.calculate_correlation_stable();
 
         // 7. 信号与斜率
@@ -258,10 +309,17 @@ impl FeatureCalculator {
         } else {
             VolumeState::Normal
         };
+
         let space = SpaceGeometry {
             dist_to_resistance: dist_res,
             dist_to_support: dist_sup,
-            // 关键修改：计算价格相对于日线均线的偏离度
+
+            // 注入磨损元数据 (Hit counts & Last hits)
+            sup_hit_count: self.sup_hit_count,
+            sup_last_hit: self.sup_last_hit,
+            res_hit_count: self.res_hit_count,
+            res_last_hit: self.res_last_hit,
+
             ma20_dist_ratio: (m20_v > 0.0).then_some((candle.close - m20_v) / m20_v),
             ma50_dist_ratio: (m50_v > 0.0).then_some((candle.close - m50_v) / m50_v),
             ma200_dist_ratio: (m200_v > 0.0).then_some((candle.close - m200_v) / m200_v),
@@ -497,7 +555,6 @@ impl FeatureCalculator {
             return None;
         }
 
-        // 使用 EMA 后，趋势判定依然有效，且响应更加迅速
         if self.count >= 200 {
             if close > m20 && m20 > m50 && m50 > m200 {
                 return Some(TrendStructure::StrongBullish);

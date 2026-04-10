@@ -24,12 +24,15 @@ pub enum ContextKey {
     // 市场结构
     RegimeStructure,
     MarketCorrelation,
+    IsMomentumTsunami,
+    OiPositionState,
+
     // 空间偏见
     MultLongSpace,
     MultShortSpace,
     // 物理引擎数据
     SpaceGravityWells,
-    Sigma,
+    GravitySigma,
 }
 
 #[derive(
@@ -87,10 +90,6 @@ pub enum AnalyzerKind {
     MarketRegime,
 }
 
-// ==========================================
-// 3. 数据报告结构
-// ==========================================
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AnalysisResult {
     pub kind: AnalyzerKind,
@@ -142,10 +141,6 @@ impl AnalysisResult {
     }
 }
 
-// ==========================================
-// 4. 引擎执行逻辑
-// ==========================================
-
 pub struct AnalysisEngine {
     pub analyzers: Vec<Box<dyn Analyzer>>,
     pub config: Config,
@@ -159,7 +154,6 @@ impl AnalysisEngine {
     pub fn run(&self, ctx: &mut MarketContext) -> AnalysisAudit {
         let mut results = Vec::new();
 
-        // 1. 顺序执行所有分析器
         for analyzer in &self.analyzers {
             match analyzer.analyze(ctx) {
                 Ok(res) => results.push(res),
@@ -169,7 +163,6 @@ impl AnalysisEngine {
             }
         }
 
-        // 2. 调用聚合逻辑
         let signal = self.aggregate(ctx, results);
         AnalysisAudit::build(ctx, signal)
     }
@@ -184,7 +177,6 @@ impl AnalysisEngine {
             return FinalSignal::rejected_with_reports(ctx.symbol, &tag, results);
         }
 
-        // B. 获取全局偏见
         let m_long_space = ctx
             .get_cached::<f64>(ContextKey::MultLongSpace)
             .unwrap_or(1.0);
@@ -197,7 +189,6 @@ impl AnalysisEngine {
         let mut pos_weighted_sum = 0.0;
         let mut neg_weighted_sum = 0.0;
 
-        // C. 加权计算
         for res in &results {
             let base_weight = self.config.weights.get(&res.kind).cloned().unwrap_or(1.0);
 
@@ -221,7 +212,6 @@ impl AnalysisEngine {
             }
         }
 
-        // D. 归一化与共振因子
         let net_score = if total_weight > 0.0 {
             total_weighted_score / total_weight
         } else {
@@ -249,10 +239,6 @@ impl AnalysisEngine {
         (normalized * 100.0).round()
     }
 }
-
-// ==========================================
-// 5. 辅助结构定义
-// ==========================================
 
 #[derive(Debug, Clone)]
 pub struct MarketContext {

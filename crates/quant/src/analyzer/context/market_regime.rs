@@ -3,126 +3,222 @@ use crate::analyzer::{
 };
 use crate::types::{OIPositionState, PriceGravityWell, RsiState, TrendStructure};
 use serde_json::json;
+use std::fmt::Write; // 引入 Write trait 用于优化字符串拼接
+
+// ================= 常量配置池 =================
+const MULT_REGIME_TREND: f64 = 1.5;
+const MULT_REGIME_RANGE: f64 = 0.7;
+const MULT_REGIME_NORMAL: f64 = 1.1;
+
+const MOMENTUM_STRONG_BOOST: f64 = 1.3;
+const MOMENTUM_WEAK_PENALTY: f64 = 0.6;
+const MOMENTUM_COMPRESSED_PENALTY: f64 = 0.3;
+const MOMENTUM_RANGE_CONFLUENCE: f64 = 2.0;
+const MOMENTUM_DEAD_ZONE: f64 = 0.1;
+
+const GAME_TAKER_SMOOTH: f64 = 2.5;
+const RANGE_WELL_DIST_THRESHOLD: f64 = 0.015;
+
+const TAKER_TREND_BULL_MIN: f64 = 0.52;
+const TAKER_TREND_BEAR_MAX: f64 = 0.48;
+
+const TSUNAMI_BASE_OI_DELTA: f64 = 0.012;
+const TSUNAMI_BASE_TAKER_RATIO: f64 = 0.55;
+
+const SLOPE_MOMENTUM_BOOST: f64 = 0.15;
+const SLOPE_BARS_THRESHOLD: i32 = 3;
+// =============================================
 
 pub struct MarketRegimeAnalyzer;
 
 impl Analyzer for MarketRegimeAnalyzer {
     fn name(&self) -> &'static str {
-        "market_regime"
+        "market_regime_v2"
     }
     fn kind(&self) -> AnalyzerKind {
         AnalyzerKind::MarketRegime
     }
 
     fn analyze(&self, ctx: &mut MarketContext) -> Result<AnalysisResult, AnalysisError> {
-        let trend = ctx.get_role(Role::Trend)?;
-        let t_feat = &trend.feature_set;
-
+        // 1. 提取基础缓存
         let vol_p = ctx
             .get_cached::<f64>(ContextKey::VolPercentile)
             .unwrap_or(50.0);
         let is_vol_compressed = ctx
             .get_cached::<bool>(ContextKey::VolIsCompressed)
             .unwrap_or(false);
+        // 此处只取引用，避免可能发生的不必要 clone
+        let gravity_wells = ctx.get_cached::<Vec<PriceGravityWell>>(ContextKey::SpaceGravityWells);
 
-        let gravity_wells = ctx
-            .get_cached::<serde_json::Value>(ContextKey::SpaceGravityWells)
-            .and_then(|v| serde_json::from_value::<Vec<PriceGravityWell>>(v).ok());
+        // 2. 核心数据提取作用域 (释放 ctx 借用，减少长路径解引用)
+        let (
+            structure,
+            rsi_state,
+            mtf_aligned,
+            open_price,
+            close_price,
+            oi_delta,
+            taker_ratio,
+            ma20_slope,
+            ma20_slope_bars,
+        ) = {
+            let trend = ctx.get_role(Role::Trend)?;
+            let t_feat = &trend.feature_set;
+            let struct_feat = &t_feat.structure;
 
-        let structure = t_feat
-            .structure
-            .trend_structure
-            .as_ref()
-            .unwrap_or(&TrendStructure::Range);
+            (
+                struct_feat
+                    .trend_structure
+                    .clone()
+                    .unwrap_or(TrendStructure::Range),
+                struct_feat.rsi_state.clone(),
+                struct_feat.mtf_aligned.unwrap_or(true),
+                t_feat.price_action.open,
+                t_feat.price_action.close,
+                trend.oi_data.as_ref().map(|oi| oi.delta_ratio()),
+                trend.taker_flow.taker_buy_ratio,
+                struct_feat.ma20_slope,
+                struct_feat.ma20_slope_bars,
+            )
+        };
 
-        let mut res = AnalysisResult::new(self.kind(), "REGIME_CORE".into())
-            .with_desc(format!("结构: {:?} | 波动分位: {:.1}%", structure, vol_p));
+        // 【优化】使用 String::with_capacity 替代频繁的 format! 宏，极大减少内存再分配开销
+        let mut desc = String::with_capacity(128);
+        let _ = write!(&mut desc, "结构: {:?} | 波动分位: {:.1}%", structure, vol_p);
 
-        let m_regime;
+        let mut m_regime = MULT_REGIME_NORMAL;
         let mut m_momentum = 1.0;
         let mut base_score = 0.0;
 
+        // 3. 基础得分与环境乘数逻辑
         match structure {
             TrendStructure::StrongBullish | TrendStructure::StrongBearish => {
                 let is_bull = matches!(structure, TrendStructure::StrongBullish);
                 base_score = if is_bull { 70.0 } else { -70.0 };
-                m_regime = 1.5;
+                m_regime = MULT_REGIME_TREND;
 
-                if let Some(rsi) = &t_feat.structure.rsi_state {
+                // --- RSI 动量评估 ---
+                if let Some(rsi) = &rsi_state {
                     match rsi {
                         RsiState::Overbought | RsiState::Strong if is_bull => {
-                            m_momentum = 1.3 + (vol_p / 150.0);
+                            m_momentum = MOMENTUM_STRONG_BOOST + (vol_p / 150.0);
                         }
                         RsiState::Oversold | RsiState::Weak if !is_bull => {
-                            m_momentum = 1.3 + (vol_p / 150.0);
+                            m_momentum = MOMENTUM_STRONG_BOOST + (vol_p / 150.0);
                         }
+                        // 【优化/修复】补齐了原代码中遗漏的多空对称逻辑（熊市出现 Strong RSI 同样应受惩罚）
                         RsiState::Weak if is_bull => {
-                            m_momentum = if is_vol_compressed { 0.3 } else { 0.6 };
-                            res = res.violate();
+                            m_momentum = if is_vol_compressed {
+                                MOMENTUM_COMPRESSED_PENALTY
+                            } else {
+                                MOMENTUM_WEAK_PENALTY
+                            };
+                        }
+                        RsiState::Strong if !is_bull => {
+                            m_momentum = if is_vol_compressed {
+                                MOMENTUM_COMPRESSED_PENALTY
+                            } else {
+                                MOMENTUM_WEAK_PENALTY
+                            };
                         }
                         _ => m_momentum = 1.1,
                     }
                 }
+
+                // --- MA20 斜率动量增强 ---
+                if let Some(slope) = ma20_slope {
+                    let slope_aligned = (is_bull && slope > 0.0) || (!is_bull && slope < 0.0);
+                    if slope_aligned {
+                        let slope_strength = slope.abs().min(3.0);
+                        let bars_factor = if ma20_slope_bars >= SLOPE_BARS_THRESHOLD {
+                            1.2
+                        } else {
+                            1.0
+                        };
+                        m_momentum *= 1.0 + slope_strength * SLOPE_MOMENTUM_BOOST * bars_factor;
+                        let _ = write!(&mut desc, " [MA20斜率共振: {:.2}]", slope);
+                    }
+                }
             }
             TrendStructure::Range => {
-                m_regime = 0.7;
-                if let Some(rsi) = &t_feat.structure.rsi_state {
+                m_regime = MULT_REGIME_RANGE;
+                if let Some(rsi) = &rsi_state {
                     match rsi {
                         RsiState::Overbought | RsiState::Oversold => {
                             let in_well = gravity_wells.as_ref().map_or(false, |wells| {
-                                wells.iter().any(|w| w.distance_pct.abs() < 0.012)
+                                wells.iter().any(|w| {
+                                    w.is_active && w.distance_pct.abs() < RANGE_WELL_DIST_THRESHOLD
+                                })
                             });
+
                             base_score = if matches!(rsi, RsiState::Overbought) {
                                 -55.0
                             } else {
                                 55.0
                             };
-                            m_momentum = if in_well { 1.8 } else { 1.2 };
-                            res = res.because("震荡极值+引力井共振：高确定性边界反转");
+                            m_momentum = if in_well {
+                                MOMENTUM_RANGE_CONFLUENCE
+                            } else {
+                                1.2
+                            };
+                            desc.push_str(" [震荡边界共振触发]"); // 纯追加字符串用 push_str 更快
                         }
                         _ => {
                             if is_vol_compressed {
-                                m_momentum = 0.1;
-                                res = res.violate().because("死水区：波动压缩且无边界指示");
+                                m_momentum = MOMENTUM_DEAD_ZONE;
+                                desc.push_str(" [进入死水区]");
                             }
                         }
                     }
                 }
             }
-            _ => {
-                m_regime = 1.1;
-                base_score = if matches!(structure, TrendStructure::Bullish) {
-                    30.0
-                } else {
-                    -30.0
-                };
+            TrendStructure::Bullish | TrendStructure::Bearish => {
+                // 【优化】合并了普通温和趋势的处理分支，消除代码冗余
+                let is_bull = matches!(structure, TrendStructure::Bullish);
+                base_score = if is_bull { 30.0 } else { -30.0 };
+
+                if let Some(slope) = ma20_slope {
+                    let slope_aligned = (is_bull && slope > 0.0) || (!is_bull && slope < 0.0);
+                    if slope_aligned && ma20_slope_bars >= 2 {
+                        m_momentum *= 1.0 + slope.abs().min(2.0) * 0.1;
+                    }
+                }
             }
         }
 
-        let mut m_game = 1.0;
+        // 4. 博弈面修正 (动态海啸 + 主动量分析)
+        let tsunami_oi_threshold =
+            TSUNAMI_BASE_OI_DELTA * (1.0 + (vol_p - 50.0) / 200.0).clamp(0.8, 1.5);
 
-        if let Some(oi) = &trend.oi_data {
-            let oi_change = oi.change_history.last().cloned().unwrap_or(0.0);
-            let price_dir = t_feat.price_action.close - t_feat.price_action.open;
-            let oi_state = OIPositionState::determine(price_dir, oi_change);
+        // 【优化】使用 match 代替 if let/else 组合，结构更清晰
+        let (is_tsunami, oi_state) = match oi_delta {
+            Some(delta) => {
+                let price_pct = (close_price - open_price) / open_price.max(0.0001);
+                let state = OIPositionState::determine(price_pct, delta);
 
-            match oi_state {
-                OIPositionState::LongBuildUp | OIPositionState::ShortBuildUp => {
-                    m_game *= if !is_vol_compressed { 1.35 } else { 1.1 };
-                }
-                OIPositionState::LongUnwinding | OIPositionState::ShortCovering => {
-                    m_game *= 0.7;
-                }
-                _ => {}
+                let tsunami = matches!(state, OIPositionState::LongBuildUp)
+                    && delta > tsunami_oi_threshold
+                    && taker_ratio.unwrap_or(0.5) > TSUNAMI_BASE_TAKER_RATIO;
+
+                (tsunami, state)
             }
+            None => (false, OIPositionState::Neutral),
+        };
+
+        ctx.set_cached(ContextKey::IsMomentumTsunami, is_tsunami);
+        ctx.set_cached(ContextKey::OiPositionState, oi_state);
+
+        if is_tsunami {
+            desc.push_str(" [TSUNAMI: 动能海啸触发]");
+            m_momentum *= 1.8;
         }
 
-        // 3.2 主动流向 (Taker Buy Ratio)
-        if let Some(pct) = trend.taker_flow.taker_buy_ratio {
-            let flow_strength = match structure {
+        // 主动买卖盘博弈：【优化】将其转为 let 绑定，消除 m_game 的 mut 状态
+        let m_game = match taker_ratio {
+            Some(pct) => match structure {
                 TrendStructure::StrongBullish | TrendStructure::Bullish => {
-                    if pct > 0.53 {
-                        1.0 + (pct - 0.5) * 2.5
+                    if pct > TAKER_TREND_BULL_MIN {
+                        1.0 + (pct - 0.5) * GAME_TAKER_SMOOTH
                     } else if pct < 0.45 {
                         0.6
                     } else {
@@ -130,8 +226,8 @@ impl Analyzer for MarketRegimeAnalyzer {
                     }
                 }
                 TrendStructure::StrongBearish | TrendStructure::Bearish => {
-                    if pct < 0.47 {
-                        1.0 + (0.5 - pct) * 2.5
+                    if pct < TAKER_TREND_BEAR_MAX {
+                        1.0 + (0.5 - pct) * GAME_TAKER_SMOOTH
                     } else if pct > 0.55 {
                         0.6
                     } else {
@@ -145,29 +241,35 @@ impl Analyzer for MarketRegimeAnalyzer {
                         0.8
                     }
                 }
-            };
-            m_game *= flow_strength;
-        }
-
-        let m_mtf = if t_feat.structure.mtf_aligned.unwrap_or(true) {
-            1.0
-        } else {
-            0.6
+            },
+            None => 1.0,
         };
 
-        let final_mult = (m_regime * m_momentum * m_game * m_mtf).clamp(0.1, 5.0);
+        // 5. 多周期对齐修正
+        let m_mtf = if mtf_aligned { 1.0 } else { 0.6 };
 
-        ctx.set_cached(ContextKey::RegimeStructure, json!(structure));
+        // 6. 最终乘数计算
+        let raw_mult = m_regime * m_momentum * m_game * m_mtf;
+        let final_mult = raw_mult.clamp(0.1, 5.0);
 
-        Ok(res
+        // 写回 RegimeStructure 供下游使用
+        ctx.set_cached(ContextKey::RegimeStructure, structure);
+
+        Ok(AnalysisResult::new(self.kind(), "REGIME_CORE_V2".into())
+            .with_desc(desc)
             .with_score(base_score)
             .with_mult(final_mult)
             .debug(json!({
                 "m_regime": m_regime,
                 "m_momentum": m_momentum,
                 "m_game": m_game,
-                "is_compressed": is_vol_compressed,
-                "final_mult": final_mult
+                "m_mtf": m_mtf,
+                "raw_mult": raw_mult,
+                "oi_delta": oi_delta,
+                "tsunami_threshold": tsunami_oi_threshold,
+                "ma20_slope": ma20_slope,
+                "ma20_slope_bars": ma20_slope_bars,
+                "is_tsunami": is_tsunami,
             })))
     }
 }

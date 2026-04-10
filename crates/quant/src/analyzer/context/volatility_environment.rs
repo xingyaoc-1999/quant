@@ -23,69 +23,75 @@ impl Analyzer for VolatilityEnvironmentAnalyzer {
     fn analyze(&self, ctx: &mut MarketContext) -> Result<AnalysisResult, AnalysisError> {
         let last_price = ctx.global.last_price;
 
-        let trend_role = ctx.get_role(Role::Trend)?;
-        let filter_role = ctx
-            .get_role(Role::Filter)
-            .or_else(|_| ctx.get_role(Role::Trend))?;
+        // --- 第一步：在一个受限的作用域内完成所有读取操作 ---
+        let (vol_p, atr_ratio, regime, is_compressed) = {
+            let trend_role = ctx.get_role(Role::Trend)?;
+            let filter_role = ctx.get_role(Role::Filter).unwrap_or(trend_role);
 
-        let f_filter = &filter_role.feature_set;
-        let f_trend = &trend_role.feature_set;
+            let f_filter = &filter_role.feature_set;
+            let f_trend = &trend_role.feature_set;
 
-        let vol_p = f_filter.price_action.volatility_percentile;
-        let atr = f_filter.indicators.atr_14.unwrap_or(last_price * 0.005);
-        let regime = f_trend
-            .structure
-            .trend_structure
-            .clone()
-            .unwrap_or(TrendStructure::Range);
+            let vol_p = f_filter.price_action.volatility_percentile;
+            let atr = f_filter.indicators.atr_14.unwrap_or(last_price * 0.005);
+            let regime = f_trend
+                .structure
+                .trend_structure
+                .clone()
+                .unwrap_or(TrendStructure::Range);
 
-        let atr_ratio = if last_price > 0.0 {
-            atr / last_price
-        } else {
-            0.005
+            let atr_ratio = if last_price > 0.0 {
+                atr / last_price
+            } else {
+                0.005
+            };
+            let is_compressed = vol_p < VOL_SQUEEZE_THRESHOLD;
+
+            // 返回所有权，退出此代码块后，trend_role 和 filter_role 的借用生命周期结束
+            (vol_p, atr_ratio, regime, is_compressed)
         };
-        let m_env;
-        let is_compressed = vol_p < VOL_SQUEEZE_THRESHOLD;
-        let mut res = AnalysisResult::new(self.kind(), "VOL_ENV".into());
 
-        ctx.set_cached(ContextKey::VolAtrRatio, json!(atr_ratio));
-        ctx.set_cached(ContextKey::VolPercentile, json!(vol_p));
+        // --- 第二步：现在可以安全地进行可变借用（写入缓存） ---
+        ctx.set_cached(ContextKey::VolAtrRatio, atr_ratio);
+        ctx.set_cached(ContextKey::VolPercentile, vol_p);
+        ctx.set_cached(ContextKey::VolIsCompressed, is_compressed);
+
+        let mut res = AnalysisResult::new(self.kind(), "VOL_ENV".into());
 
         if vol_p < VOL_EXTREME_LOW {
             return Ok(res
                 .with_mult(0.1)
-                .because("1D/4H双重死寂，暂无交易价值")
+                .because("市场进入死寂期，暂无交易价值")
                 .violate());
         }
 
-        match regime {
+        // --- 第三步：逻辑判定 ---
+        let m_env = match regime {
             TrendStructure::StrongBullish | TrendStructure::StrongBearish => {
                 if vol_p > VOL_ACCELERATION {
-                    m_env = 1.1;
-                    res = res.because("强趋势进入4H加速段，警惕乖离");
+                    res = res.because("强趋势进入加速段，警惕乖离");
+                    1.1
                 } else if vol_p < VOL_LOW_MOMENTUM {
-                    m_env = 0.7;
-                    res = res.because("趋势维持但4H波动匮乏，动能不足");
+                    res = res.because("趋势维持但动能不足");
+                    0.7
                 } else {
-                    m_env = 1.35;
-                    res = res.because("4H波动与1D趋势高度共振");
+                    res = res.because("波动与趋势共振环境佳");
+                    1.35
                 }
             }
             TrendStructure::Range => {
                 if is_compressed {
-                    m_env = 0.9;
-                    res = res.because("震荡市波动率极度压缩 (4H Squeeze)");
+                    res = res.because("震荡市波动极度压缩 (Squeeze)");
+                    0.9
                 } else if vol_p > VOL_MEAT_GRINDER {
-                    m_env = 0.25;
-                    res = res.because("4H绞肉机行情，拒绝噪音").violate();
+                    res = res.because("绞肉机行情，拒绝交易").violate();
+                    0.25
                 } else {
-                    m_env = 1.0;
+                    res = res.because("标准震荡波幅");
+                    1.0
                 }
             }
-            _ => m_env = 1.0,
-        }
-
-        ctx.set_cached(ContextKey::VolIsCompressed, json!(is_compressed));
+            _ => 1.0,
+        };
 
         Ok(res.with_mult(m_env).debug(json!({
             "vol_p": vol_p,
