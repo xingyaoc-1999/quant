@@ -57,7 +57,6 @@ impl RoleProcessor {
     #[inline]
     pub fn is_dirty(&self) -> bool {
         if let Some(acc) = &self.current_acc {
-            // 如果时间戳进位了，或者成交量发生了变化，则视为脏数据
             return acc.timestamp > self.last_calc_ts
                 || (acc.volume - self.last_calc_volume).abs() > f64::EPSILON;
         }
@@ -331,7 +330,6 @@ impl FeatureContextManager {
                 }
             }
 
-            // 3. 初始计算并填充缓存
             if let Some(acc) = &proc.current_acc {
                 let feature_set = proc.calculator.peek(acc, proc.interval, g_close);
                 proc.cached_role_data = Some(RoleData {

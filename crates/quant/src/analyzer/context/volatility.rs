@@ -23,7 +23,6 @@ impl Analyzer for VolatilityEnvironmentAnalyzer {
     fn analyze(&self, ctx: &mut MarketContext) -> Result<AnalysisResult, AnalysisError> {
         let last_price = ctx.global.last_price;
 
-        // --- 第一步：在一个受限的作用域内完成所有读取操作 ---
         let (vol_p, atr_ratio, regime, is_compressed) = {
             let trend_role = ctx.get_role(Role::Trend)?;
             let filter_role = ctx.get_role(Role::Filter).unwrap_or(trend_role);
@@ -46,11 +45,9 @@ impl Analyzer for VolatilityEnvironmentAnalyzer {
             };
             let is_compressed = vol_p < VOL_SQUEEZE_THRESHOLD;
 
-            // 返回所有权，退出此代码块后，trend_role 和 filter_role 的借用生命周期结束
             (vol_p, atr_ratio, regime, is_compressed)
         };
 
-        // --- 第二步：现在可以安全地进行可变借用（写入缓存） ---
         ctx.set_cached(ContextKey::VolAtrRatio, atr_ratio);
         ctx.set_cached(ContextKey::VolPercentile, vol_p);
         ctx.set_cached(ContextKey::VolIsCompressed, is_compressed);
@@ -64,7 +61,6 @@ impl Analyzer for VolatilityEnvironmentAnalyzer {
                 .violate());
         }
 
-        // --- 第三步：逻辑判定 ---
         let m_env = match regime {
             TrendStructure::StrongBullish | TrendStructure::StrongBearish => {
                 if vol_p > VOL_ACCELERATION {

@@ -3,7 +3,7 @@ use quant::{analyzer::AnalysisEngine, report::AnalysisAudit};
 use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use service::context::FeatureContextManager;
+use service::integrity::context::FeatureContextManager;
 use std::{str::FromStr, sync::Arc};
 use thiserror::Error;
 use tracing::info;

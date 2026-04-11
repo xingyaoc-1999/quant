@@ -8,160 +8,152 @@ use agent::{
     tool::ScoreQueryTool,
 };
 use anyhow::{Context, Result};
-use quant::analyzer::{
-    context::{
-        level_proximity::LevelProximityAnalyzer, market_regime::MarketRegimeAnalyzer,
-        volatility_environment::VolatilityEnvironmentAnalyzer,
-        volume_structure::VolumeStructureAnalyzer,
-    },
-    AnalysisEngine, Analyzer, Config,
-};
-use rig::tool::ToolSet;
-
 use api_client::http::binance::ArchiveProvider;
 use common::{
     config::{Appconfig, ProxyConfig},
     utils::CooledProxyPool,
     Symbol,
 };
-
 use notify::telegram::BotApp;
+use quant::analyzer::{
+    context::{
+        gravity::GravityAnalyzer, regime::MarketRegimeAnalyzer,
+        volatility::VolatilityEnvironmentAnalyzer, volume::VolumeStructureAnalyzer,
+    },
+    AnalysisEngine, Analyzer, Config,
+};
 use ractor::{cast, Actor};
-use service::{context::FeatureContextManager, integrity_manager::DataIntegrityManager};
+use rig::tool::ToolSet;
+use service::{
+    analysis::AnalysisService,
+    integrity::{context::FeatureContextManager, DataIntegrityManager},
+};
 use storage::postgres::Storage;
-
+use teloxide::types::ChatId;
+use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. 初始化日志
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    init_tracing();
 
-    let cfg = Appconfig::global();
-
-    // 2. 初始化存储层
-    let storage = Storage::new(&cfg.database).context("Failed to connect to database")?;
-    storage
-        .initialize_all()
-        .await
-        .context("Failed to initialize database schema")?;
-    let storage = Arc::new(storage);
-
-    // 3. 初始化核心组件
+    let config = Appconfig::global();
     let symbols = Symbol::all();
-    let proxy_pool = Arc::new(setup_proxy_pool(&cfg.proxy));
 
-    // ctx_manager 是核心共享资源
+    // ========== 基础设施层 ==========
+    let proxy_pool = Arc::new(create_proxy_pool(&config.proxy));
+    let storage = Arc::new(init_storage(&config.database).await?);
+    let archive = Arc::new(ArchiveProvider::new(proxy_pool.clone()));
+
+    // ========== 核心分析层 ==========
     let ctx_manager = Arc::new(FeatureContextManager::new(&symbols));
+    let analyzers: Vec<Box<dyn Analyzer>> = vec![
+        Box::new(VolatilityEnvironmentAnalyzer),
+        Box::new(MarketRegimeAnalyzer),
+        Box::new(GravityAnalyzer),
+        Box::new(VolumeStructureAnalyzer),
+    ];
+    let engine = Arc::new(AnalysisEngine::new(Config::default(), analyzers));
+    let analysis_service = Arc::new(AnalysisService::new(engine.clone()));
 
-    let archive_provider = Arc::new(ArchiveProvider::new(proxy_pool.clone()));
-
-    let integrity_manager = Arc::new(DataIntegrityManager::new(
+    let integrity = Arc::new(DataIntegrityManager::new(
         symbols.clone(),
         ctx_manager.clone(),
         proxy_pool.clone(),
         storage.clone(),
-        archive_provider.clone(),
+        archive.clone(),
+        analysis_service.clone(),
     ));
+    integrity.start();
+    info!("Data integrity manager started");
 
-    // 4. 初始化 Telegram Bot
-    let (tx_to_tg, rx_out) = tokio::sync::mpsc::channel(100);
-    let (tx_in, rx_from_tg) = tokio::sync::mpsc::channel(100);
+    let (tg_tx, mut tg_rx) = mpsc::channel(256);
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(100);
 
-    let tg_app = BotApp::new(cfg.telegram.token.clone(), proxy_pool.clone()).await?;
-
-    info!("🚀 Starting Telegram Bot...");
-
-    let ctx_for_tg = ctx_manager.clone();
-    let storage_for_tg = storage.clone();
-    let archive_for_tg = archive_provider.clone();
+    let bot = BotApp::new(config.telegram.token.clone(), proxy_pool.clone()).await?;
+    let bot_ctx = ctx_manager.clone();
+    let bot_archive = archive.clone();
+    let bot_storage = storage.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = tg_app
-            .run(tx_in, rx_out, ctx_for_tg, archive_for_tg, storage_for_tg)
+        if let Err(e) = bot
+            .run(cmd_tx, tg_rx, bot_ctx, bot_archive, bot_storage)
             .await
         {
-            error!("Telegram Bot Runtime Error: {:?}", e);
+            error!("Telegram bot error: {:?}", e);
         }
     });
+    info!("Telegram bot started");
 
-    // 5. 启动后台服务
-    info!("🚀 Starting Integrity Manager...");
-    integrity_manager.start();
+    let mut analysis_rx = analysis_service.subscribe();
+    let tg_sender = tg_tx.clone();
 
-    // 6. 初始化 AI Agent 与 分析引擎
+    tokio::spawn(async move {
+        info!("Analysis notification worker started");
+        while let Ok(event) = analysis_rx.recv().await {
+            let msg = event.audit.to_markdown_v2();
+            let _ = tg_sender.send((msg, ChatId(1672093956))).await;
+        }
+        info!("Analysis notification worker stopped");
+    });
+
     let model = Model::openai(
         "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",
         "https://openrouter.ai/api/v1",
         "openai/gpt-5.4",
     )?;
-    let analyzers: Vec<Box<dyn Analyzer>> = vec![
-        Box::new(VolatilityEnvironmentAnalyzer),
-        Box::new(MarketRegimeAnalyzer),
-        Box::new(LevelProximityAnalyzer),
-        Box::new(VolumeStructureAnalyzer),
-    ];
-    let engine = Arc::new(AnalysisEngine::new(Config::default(), analyzers));
 
-    let score_query = ScoreQueryTool::new(ctx_manager.clone(), engine.clone());
-    start_report_monitor(ctx_manager.clone(), engine.clone(), Symbol::BTCUSDT).await;
-    let tool_set = ToolSet::builder().static_tool(score_query).build();
+    let score_tool = ScoreQueryTool::new(ctx_manager.clone(), engine.clone());
+    let tool_set = ToolSet::builder().static_tool(score_tool).build();
 
     let agent_args = TechnicalAgentArgs {
         model,
-        tx_out: tx_to_tg,
+        tx_out: tg_tx.clone(),
         tool_set,
     };
-
-    let (agent_actor, _agent_handle) = Actor::spawn(
+    let (agent_actor, _handle) = Actor::spawn(
         Some("TechnicalAgent".to_string()),
         TechnicalAgent,
         agent_args,
     )
     .await?;
+    info!("AI Agent started");
 
-    let mut rx_cmd = rx_from_tg;
-    let actor_for_router = agent_actor.clone();
-
+    // ========== 命令路由 ==========
     tokio::spawn(async move {
-        while let Some((cmd, chat_id)) = rx_cmd.recv().await {
-            info!("📩 Received command from TG: {}", cmd);
-            // 路由指令到 Agent Actor
-            let _ = cast!(actor_for_router, TechnicalAgentMessage::Task(cmd, chat_id));
+        while let Some((cmd, chat_id)) = cmd_rx.recv().await {
+            info!("Received command: {} from {}", cmd, chat_id);
+            let _ = cast!(agent_actor, TechnicalAgentMessage::Task(cmd, chat_id));
         }
     });
 
+    info!("System ready, waiting for Ctrl+C...");
     tokio::signal::ctrl_c().await?;
-    info!("👋 Shutdown signal received, exiting...");
+    info!("Shutting down...");
 
     Ok(())
 }
 
-fn setup_proxy_pool(config: &ProxyConfig) -> CooledProxyPool {
-    let cooldown = Duration::from_secs(300);
-    CooledProxyPool::new(config.socks_proxy_list.clone(), cooldown)
+// ========== 辅助函数 ==========
+
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
 }
-pub async fn start_report_monitor(
-    manager: Arc<FeatureContextManager>,
-    engine: Arc<AnalysisEngine>,
-    symbol: Symbol,
-) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-    loop {
-        interval.tick().await;
 
-        if let Some(mut ctx) = manager.get_market_context(symbol) {
-            let report = engine.run(&mut ctx);
+fn create_proxy_pool(config: &ProxyConfig) -> CooledProxyPool {
+    CooledProxyPool::new(config.socks_proxy_list.clone(), Duration::from_secs(300))
+}
 
-            println!("----------------------------------");
-            println!("{:#?}", ctx);
-
-            println!("{:#?}", report);
-        }
-    }
+async fn init_storage(db_config: &common::config::DatabaseConfig) -> Result<Storage> {
+    let storage = Storage::new(db_config).context("Failed to connect to database")?;
+    storage
+        .initialize_all()
+        .await
+        .context("Failed to initialize database schema")?;
+    Ok(storage)
 }

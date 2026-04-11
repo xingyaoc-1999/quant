@@ -1,5 +1,6 @@
 use crate::telegram::BotApp;
-use service::context::FeatureContextManager;
+
+use service::integrity::context::FeatureContextManager;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::utils::command::BotCommands;

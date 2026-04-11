@@ -31,7 +31,6 @@ impl VolumeStructureAnalyzer {
             1.0
         };
 
-        // 地量保护
         if rvol < 0.2 {
             return 0.0;
         }
@@ -111,7 +110,6 @@ impl Analyzer for VolumeStructureAnalyzer {
         let mut m_vol = 1.0;
         let mut res = AnalysisResult::new(self.kind(), "VSA_PRO_V4".into());
 
-        // 仅关注价格行进方向上的活跃井
         let target_side = if is_up {
             WellSide::Resistance
         } else {
@@ -134,15 +132,12 @@ impl Analyzer for VolumeStructureAnalyzer {
             if in_critical_zone {
                 match well.side {
                     WellSide::Resistance => {
-                        // A. 高效率突破
                         if rvol > rvol_break && efficiency > eff_high {
                             score = 45.0;
                             m_vol = 1.8;
                             res =
                                 res.because(format!("吸收突破: 价格高效贯穿阻力 {}", well.source));
-                        }
-                        // B. 爆量滞涨 (推土机吸收 vs 派发)
-                        else if rvol > rvol_extreme && efficiency < eff_low {
+                        } else if rvol > rvol_extreme && efficiency < eff_low {
                             if matches!(oi_state, Some(OIPositionState::LongBuildUp)) && is_tsunami
                             {
                                 score = 25.0;
@@ -153,9 +148,7 @@ impl Analyzer for VolumeStructureAnalyzer {
                                 m_vol = 0.4;
                                 res = res.violate().because("派发陷阱: 阻力位放量滞涨，供应压制");
                             }
-                        }
-                        // C. 阻力位被动吸收 (强力买盘被挂单压制)
-                        else if taker_ratio.map_or(false, |tr| tr > ABSORPTION_TAKER_BUY_MIN)
+                        } else if taker_ratio.map_or(false, |tr| tr > ABSORPTION_TAKER_BUY_MIN)
                             && oi_delta.map_or(false, |d| d > ABSORPTION_OI_DELTA_MIN)
                             && efficiency < eff_low
                         {
@@ -167,15 +160,12 @@ impl Analyzer for VolumeStructureAnalyzer {
                         }
                     }
                     WellSide::Support => {
-                        // D. 恐慌破位
                         if rvol > rvol_break && efficiency > eff_high {
                             score = -45.0;
                             m_vol = 1.8;
                             res =
                                 res.because(format!("恐慌破位: 卖盘放量贯穿支撑 {}", well.source));
-                        }
-                        // E. 爆量止跌 (挤压 vs 承接)
-                        else if rvol > rvol_extreme && efficiency < eff_low {
+                        } else if rvol > rvol_extreme && efficiency < eff_low {
                             if matches!(oi_state, Some(OIPositionState::ShortBuildUp)) && is_tsunami
                             {
                                 score = -25.0;
@@ -186,9 +176,7 @@ impl Analyzer for VolumeStructureAnalyzer {
                                 m_vol = 2.0;
                                 res = res.because("吸筹承接: 支撑位放量止跌，大资金托盘");
                             }
-                        }
-                        // F. 支撑位被动吸收 (沉重卖盘被主力接走)
-                        else if taker_ratio.map_or(false, |tr| tr < ABSORPTION_TAKER_SELL_MAX)
+                        } else if taker_ratio.map_or(false, |tr| tr < ABSORPTION_TAKER_SELL_MAX)
                             && oi_delta.map_or(false, |d| d > ABSORPTION_OI_DELTA_MIN)
                             && efficiency < eff_low
                         {
@@ -198,17 +186,13 @@ impl Analyzer for VolumeStructureAnalyzer {
                         }
                     }
                     WellSide::Magnet => {
-                        // 磁力井处理：海啸模式下原阻力/支撑转为清算目标，价格逼近即视为强势信号
                         if is_up {
-                            // 多头攻击磁力位（原阻力）
                             if rvol > 0.8 && efficiency > 0.6 {
-                                // 量价配合，预期突破清算
                                 score = 55.0;
                                 m_vol = 1.7;
                                 res = res
                                     .because(format!("磁力推进: 价格逼近清算区 {}", well.source));
                             } else if rvol < 0.5 && efficiency < 0.3 {
-                                // 无量无效率，可能是假突破前兆，降低预期
                                 score = 15.0;
                                 m_vol = 1.2;
                                 res = res.because(format!(
@@ -216,9 +200,7 @@ impl Analyzer for VolumeStructureAnalyzer {
                                     well.source
                                 ));
                             }
-                            // 其余情况保持中性
                         } else {
-                            // 空头攻击磁力位（原支撑）
                             if rvol > 0.8 && efficiency > 0.6 {
                                 score = -55.0;
                                 m_vol = 1.7;

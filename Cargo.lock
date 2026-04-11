@@ -108,6 +108,7 @@ dependencies = [
  "rig-core",
  "service",
  "storage",
+ "teloxide",
  "tokio",
  "tracing",
  "tracing-subscriber",

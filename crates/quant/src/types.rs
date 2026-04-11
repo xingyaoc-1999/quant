@@ -239,15 +239,6 @@ pub struct PriceGravityWell {
     pub last_tested_above: bool, // 是否曾突破（用于假突破检测）
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Direction {
-    #[default]
-    Long,
-    Short,
-    Neutral, // 用于无方向震荡或平仓观望
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default)]
 pub struct DerivativeSnapshot {
     pub timestamp: i64,

@@ -9,7 +9,7 @@ use common::{
 };
 use quant::analyzer::Role;
 use reqwest::Proxy;
-use service::context::FeatureContextManager;
+use service::integrity::context::FeatureContextManager;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -21,7 +21,7 @@ use teloxide::{
     prelude::*,
     types::{CallbackQuery, Message, ParseMode, Update},
     update_listeners,
-    utils::command::BotCommands,
+    utils::{command::BotCommands, markdown::escape},
     Bot, RequestError,
 };
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -178,7 +178,8 @@ impl BotApp {
                 tokio::select! {
                         Some((text, chat_id)) = rx_in.recv() => {
 
-                     match bot.send_message(chat_id, &text).await {
+
+                     match bot.send_message(chat_id, &text).parse_mode(ParseMode::MarkdownV2).await {
                     Ok(_) => info!("Message sent successfully: {}", text),
                     Err(e) => error!("Failed to send message: {}", e),
                 }

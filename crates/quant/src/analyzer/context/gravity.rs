@@ -3,7 +3,6 @@ use crate::analyzer::{
 };
 use crate::types::{PriceGravityWell, TrendStructure, WellSide};
 
-// ================= 物理与磨损常量 =================
 const SIGMA_ATR_MULT: f64 = 0.8;
 const CONFLUENCE_GATE_MULT: f64 = 0.4;
 const ACTIVE_WELL_THRESHOLD: f64 = 0.08;
@@ -11,14 +10,12 @@ const MAX_STRENGTH_CAP: f64 = 3.5;
 const SECONDARY_WELL_WEIGHT: f64 = 0.3;
 const CONVERGENCE_BOOST: f64 = 1.35;
 
-// 磨损配置
+const CRITICAL_HIT_COUNT: f64 = 3.0;
+const STEEPNESS: f64 = 2.0;
 
-const CRITICAL_HIT_COUNT: f64 = 3.0; // 临界撞击次数
-const STEEPNESS: f64 = 2.0; // 曲线陡峭度
+pub struct GravityAnalyzer;
 
-pub struct LevelProximityAnalyzer;
-
-impl LevelProximityAnalyzer {
+impl GravityAnalyzer {
     #[inline]
     fn calculate_intensity(dist: f64, sigma: f64) -> f64 {
         if sigma <= 0.0 {
@@ -34,7 +31,6 @@ impl LevelProximityAnalyzer {
             return 1.0;
         }
         let h = hit_count as f64;
-        // Sigmoid: 1 / (1 + exp(steepness * (h - critical)))
         let wear_factor = 1.0 / (1.0 + (STEEPNESS * (h - CRITICAL_HIT_COUNT)).exp());
 
         let diff_ms = (now - last_hit_ts).max(0);
@@ -57,7 +53,7 @@ impl LevelProximityAnalyzer {
     }
 }
 
-impl Analyzer for LevelProximityAnalyzer {
+impl Analyzer for GravityAnalyzer {
     fn name(&self) -> &'static str {
         "level_proximity_pro_v3"
     }
@@ -69,7 +65,6 @@ impl Analyzer for LevelProximityAnalyzer {
         let last_price = ctx.global.last_price;
         let now = ctx.global.timestamp;
 
-        // 1. 动态感知参数
         let vol_p = ctx
             .get_cached::<f64>(ContextKey::VolPercentile)
             .unwrap_or(50.0);
@@ -79,7 +74,6 @@ impl Analyzer for LevelProximityAnalyzer {
         let sigma = atr_ratio * (SIGMA_ATR_MULT + (vol_p / 120.0));
         let confluence_gate = sigma * CONFLUENCE_GATE_MULT;
 
-        // 2. 提取数据
         let trend_role = ctx.get_role(Role::Trend)?;
         let filter_role = ctx.get_role(Role::Filter).unwrap_or(trend_role);
 
@@ -87,14 +81,12 @@ impl Analyzer for LevelProximityAnalyzer {
         let f_space = &filter_role.feature_set.space;
         let ma_converging = t_space.ma_converging.unwrap_or(false);
 
-        // === 读取上一轮的 wells，用于继承磁力状态（跨 tick 持久化） ===
         let prev_wells: Vec<PriceGravityWell> = ctx
             .get_cached::<Vec<PriceGravityWell>>(ContextKey::SpaceGravityWells)
             .unwrap_or_default();
 
         let mut wells: Vec<PriceGravityWell> = Vec::new();
 
-        // 3. 核心注入闭包
         let mut process_source = |dist_opt: Option<f64>,
                                   side_hint: Option<WellSide>,
                                   label: &str,
@@ -197,7 +189,6 @@ impl Analyzer for LevelProximityAnalyzer {
             process_source(Some(ma_dist_raw), None, "1D_MA20", 1.0, 0, 0);
         }
 
-        // === 继承上一轮的磁力状态（跨 tick 持久化） ===
         for well in wells.iter_mut() {
             for prev_well in prev_wells.iter() {
                 let level_diff = (well.level - prev_well.level).abs() / last_price;
@@ -209,20 +200,17 @@ impl Analyzer for LevelProximityAnalyzer {
             }
         }
 
-        // 5. 均线聚合增强
         if ma_converging {
             for w in wells.iter_mut() {
                 w.strength *= CONVERGENCE_BOOST;
             }
         }
 
-        // 6. 读取海啸与趋势状态
         let is_tsunami = ctx
             .get_cached::<bool>(ContextKey::IsMomentumTsunami)
             .unwrap_or(false);
         let regime = ctx.get_cached::<TrendStructure>(ContextKey::RegimeStructure);
 
-        // 7. 海啸模式下的磁力转换
         if is_tsunami {
             match regime {
                 Some(TrendStructure::StrongBullish) | Some(TrendStructure::Bullish) => {
@@ -245,7 +233,6 @@ impl Analyzer for LevelProximityAnalyzer {
             }
         }
 
-        // 8. 磁力权重分级与回落熔断
         let buffer = sigma * 0.5;
         let mut effective_magnet_strength = 0.0;
 
@@ -255,12 +242,10 @@ impl Analyzer for LevelProximityAnalyzer {
         {
             let dist_pct = (well.level - last_price) / last_price;
 
-            // 更新突破记录
             if dist_pct < -buffer {
                 well.last_tested_above = true;
             }
 
-            // 假突破熔断：曾突破但现价回落
             if well.last_tested_above && dist_pct > buffer {
                 well.side = if regime == Some(TrendStructure::StrongBullish)
                     || regime == Some(TrendStructure::Bullish)
@@ -275,19 +260,17 @@ impl Analyzer for LevelProximityAnalyzer {
                 continue;
             }
 
-            // 磁力权重计算
             let base_weight = if dist_pct < -buffer {
-                1.0 // 已突破
+                1.0
             } else if dist_pct.abs() <= buffer {
-                0.5 // 测试中
+                0.5
             } else {
-                0.2 // 未触及
+                0.2
             };
 
             effective_magnet_strength += well.strength * base_weight;
         }
 
-        // 9. 重新统计各侧强度
         let total_res = Self::calculate_composite_strength(
             wells
                 .iter()

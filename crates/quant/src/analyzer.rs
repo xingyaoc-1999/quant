@@ -12,7 +12,7 @@ use crate::{
     report::AnalysisAudit,
     types::{DerivativeSnapshot, RoleData},
 };
-pub mod audit;
+
 pub mod context;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum ContextKey {
@@ -33,6 +33,10 @@ pub enum ContextKey {
     // 物理引擎数据
     SpaceGravityWells,
     GravitySigma,
+    StopLossLevels,   // Vec<f64>
+    TakeProfitLevels, // Vec<f64>
+    WeightedRR,       // f64
+    PositionSizePct,  // f64
 }
 
 #[derive(

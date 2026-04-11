@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::telegram::BotApp;
 use common::{Interval, Symbol};
 use quant::analyzer::Role;
-use service::context::FeatureContextManager;
+use service::integrity::context::FeatureContextManager;
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, Message, ParseMode};
 

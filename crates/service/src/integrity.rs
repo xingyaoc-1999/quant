@@ -1,15 +1,17 @@
-use crate::context::FeatureContextManager;
+pub mod context;
 use anyhow::Result;
 use api_client::{
     http::binance::ArchiveProvider,
     websocket::{biance::BinanceKlineProtocol, GenericWsClient},
 };
+use context::FeatureContextManager;
 use futures_util::stream::{self, StreamExt};
 
 use chrono::{DateTime, DurationRound, Utc};
 use common::{
     config::Appconfig, utils::CooledProxyPool, Candle, Interval, OpenInterestRecord, Symbol,
 };
+use quant::analyzer::AnalysisEngine;
 use std::{
     collections::HashMap,
     sync::{
@@ -21,6 +23,8 @@ use std::{
 use storage::postgres::Storage;
 use tokio::{sync::mpsc, time::interval};
 use tracing::{error, info, warn};
+
+use crate::{analysis::AnalysisService, types::MarketEvent};
 
 struct PreWarmData {
     // Symbol -> (Interval -> Vec<Candle>)
@@ -35,6 +39,7 @@ pub struct DataIntegrityManager {
     proxy_pool: Arc<CooledProxyPool>,
     storage: Arc<Storage>,
     archive_provider: Arc<ArchiveProvider>,
+    analysis_service: Arc<AnalysisService>,
 }
 
 impl DataIntegrityManager {
@@ -44,6 +49,7 @@ impl DataIntegrityManager {
         proxy_pool: Arc<CooledProxyPool>,
         storage: Arc<Storage>,
         archive_provider: Arc<ArchiveProvider>,
+        analysis_service: Arc<AnalysisService>,
     ) -> Self {
         Self {
             symbols,
@@ -51,6 +57,7 @@ impl DataIntegrityManager {
             feature_context,
             proxy_pool,
             archive_provider,
+            analysis_service,
         }
     }
 
@@ -90,7 +97,6 @@ impl DataIntegrityManager {
         let candle_intervals = vec![config.trend, config.filter, config.entry, Interval::M1];
         let oi_intervals = vec![config.trend, config.filter, config.entry];
 
-        // --- PART A: 获取 OHLCV (1m 为主) ---
         let mut history_map: HashMap<Symbol, HashMap<Interval, Vec<Candle>>> = HashMap::new();
         let mut candle_stream = stream::iter(candle_intervals)
             .map(|interval| {
@@ -175,9 +181,11 @@ impl DataIntegrityManager {
         let pp = Arc::clone(&self.proxy_pool);
         let storage = Arc::clone(&self.storage);
         let symbols = self.symbols.clone();
+        let service = self.analysis_service.clone();
 
         tokio::spawn(async move {
             let (tx, mut rx) = mpsc::channel::<Candle>(2000);
+            let (event_tx, event_rx) = mpsc::channel::<MarketEvent>(256);
 
             let protocol = BinanceKlineProtocol::new(Interval::M1);
             let client = GenericWsClient::new(protocol, pp, symbols.into_iter().collect());
@@ -189,6 +197,8 @@ impl DataIntegrityManager {
                 }
             });
 
+            service.spawn_worker(event_rx, self.feature_context.clone());
+
             let mut buffer = Vec::with_capacity(100);
             let mut flush_interval = interval(Duration::from_secs(5));
             flush_interval.tick().await;
@@ -197,7 +207,11 @@ impl DataIntegrityManager {
                 tokio::select! {
                     biased;
                     Some(candle) = rx.recv() => {
-                        manager.feature_context.update_realtime_m1(candle);
+                        manager.feature_context.update_realtime_m1(candle.clone());
+
+                        let _ = event_tx.send(MarketEvent::KlineClosed {
+                            symbol: candle.symbol
+                        }).await;
 
                         buffer.push(candle);
                         if buffer.len() >= 50 {
