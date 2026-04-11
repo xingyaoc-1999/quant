@@ -12,8 +12,8 @@ use crate::{
     report::AnalysisAudit,
     types::{DerivativeSnapshot, RoleData},
 };
+pub mod audit;
 pub mod context;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum ContextKey {
     // 波动率环境
@@ -88,6 +88,7 @@ pub enum AnalyzerKind {
     SupportResistance,
     Volatility,
     MarketRegime,
+    RiskManagement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -131,10 +132,7 @@ impl AnalysisResult {
         self.weight_multiplier = mult;
         self
     }
-    pub fn with_desc(mut self, desc: impl Into<String>) -> Self {
-        self.description = desc.into();
-        self
-    }
+
     pub fn debug(mut self, data: Value) -> Self {
         self.debug_data = data;
         self

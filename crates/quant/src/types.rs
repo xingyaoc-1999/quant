@@ -222,6 +222,7 @@ pub struct FeatureSet {
 pub enum WellSide {
     Support,    // 支撑/地板
     Resistance, // 压力/天花板
+    Magnet,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
@@ -234,6 +235,8 @@ pub struct PriceGravityWell {
     pub is_active: bool,   // 是否已进入当前感应半径 (即 intensity > 0)
     pub hit_count: u32,
     pub last_hit_ts: i64,
+    pub magnet_activated: bool,  // 是否已被标记为磁力井
+    pub last_tested_above: bool, // 是否曾突破（用于假突破检测）
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, Default, PartialEq, Eq)]

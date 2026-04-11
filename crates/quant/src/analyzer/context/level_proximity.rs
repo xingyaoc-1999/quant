@@ -12,14 +12,13 @@ const SECONDARY_WELL_WEIGHT: f64 = 0.3;
 const CONVERGENCE_BOOST: f64 = 1.35;
 
 // 磨损配置
-const WEAR_DECAY_PER_HIT: f64 = 0.18;
-const MAX_WEAR_CAP: f64 = 0.75;
-const RECOVERY_RATE_PER_HOUR: f64 = 0.05;
+
+const CRITICAL_HIT_COUNT: f64 = 3.0; // 临界撞击次数
+const STEEPNESS: f64 = 2.0; // 曲线陡峭度
 
 pub struct LevelProximityAnalyzer;
 
 impl LevelProximityAnalyzer {
-    /// 高斯引力核心算法
     #[inline]
     fn calculate_intensity(dist: f64, sigma: f64) -> f64 {
         if sigma <= 0.0 {
@@ -30,19 +29,21 @@ impl LevelProximityAnalyzer {
         gauss.max(long_range)
     }
 
-    /// 能量折旧计算
     fn calculate_wear_multiplier(hit_count: u32, last_hit_ts: i64, now: i64) -> f64 {
         if hit_count == 0 {
             return 1.0;
         }
+        let h = hit_count as f64;
+        // Sigmoid: 1 / (1 + exp(steepness * (h - critical)))
+        let wear_factor = 1.0 / (1.0 + (STEEPNESS * (h - CRITICAL_HIT_COUNT)).exp());
+
         let diff_ms = (now - last_hit_ts).max(0);
         let hours_passed = diff_ms as f64 / 3_600_000.0;
-        let recovery = hours_passed * RECOVERY_RATE_PER_HOUR;
-        let wear = ((hit_count as f64 * WEAR_DECAY_PER_HIT) - recovery).clamp(0.0, MAX_WEAR_CAP);
-        1.0 - wear
+        let recovery = hours_passed * 0.05;
+
+        (wear_factor + recovery).min(1.0)
     }
 
-    /// 复合强度：处理多个引力源共振
     fn calculate_composite_strength(side_wells: Vec<&PriceGravityWell>) -> f64 {
         if side_wells.is_empty() {
             return 0.0;
@@ -58,7 +59,7 @@ impl LevelProximityAnalyzer {
 
 impl Analyzer for LevelProximityAnalyzer {
     fn name(&self) -> &'static str {
-        "level_proximity_pro"
+        "level_proximity_pro_v3"
     }
     fn kind(&self) -> AnalyzerKind {
         AnalyzerKind::SupportResistance
@@ -86,9 +87,14 @@ impl Analyzer for LevelProximityAnalyzer {
         let f_space = &filter_role.feature_set.space;
         let ma_converging = t_space.ma_converging.unwrap_or(false);
 
+        // === 读取上一轮的 wells，用于继承磁力状态（跨 tick 持久化） ===
+        let prev_wells: Vec<PriceGravityWell> = ctx
+            .get_cached::<Vec<PriceGravityWell>>(ContextKey::SpaceGravityWells)
+            .unwrap_or_default();
+
         let mut wells: Vec<PriceGravityWell> = Vec::new();
 
-        // 3. 核心注入闭包 (修复方向逻辑)
+        // 3. 核心注入闭包
         let mut process_source = |dist_opt: Option<f64>,
                                   side_hint: Option<WellSide>,
                                   label: &str,
@@ -100,7 +106,6 @@ impl Analyzer for LevelProximityAnalyzer {
                 None => return,
             };
 
-            // 计算强度：使用绝对值，因为引力双向作用
             let wear_mult = Self::calculate_wear_multiplier(hits, last_ts, now);
             let final_strength =
                 Self::calculate_intensity(dist_raw.abs(), sigma) * weight * wear_mult;
@@ -109,25 +114,19 @@ impl Analyzer for LevelProximityAnalyzer {
                 return;
             }
 
-            // 计算该水平位的绝对价格：Price * (1 + 偏移%)
-            // 支撑位偏移应为负 (如 -0.02)，阻力位偏移应为正 (如 0.02)
             let current_level = last_price * (1.0 + dist_raw);
 
-            // 判定 Side：优先使用 hint，否则根据偏移正负自动判定
             let side = side_hint.unwrap_or(if dist_raw >= 0.0 {
                 WellSide::Resistance
             } else {
                 WellSide::Support
             });
 
-            // 检查共振合并
             let mut merged = false;
             for existing in wells.iter_mut() {
                 let diff = (existing.level - current_level).abs() / last_price;
                 if existing.side == side && diff < confluence_gate {
                     existing.strength += final_strength * 0.6;
-
-                    // 优化：只有不包含时才拼接字符串，减少分配
                     if !existing.source.contains(label) {
                         if !existing.source.is_empty() {
                             existing.source.push('+');
@@ -152,13 +151,13 @@ impl Analyzer for LevelProximityAnalyzer {
                     is_active: final_strength > ACTIVE_WELL_THRESHOLD,
                     hit_count: hits,
                     last_hit_ts: last_ts,
+                    magnet_activated: false,
+                    last_tested_above: false,
                 });
             }
         };
 
-        // 4. 多维度数据喂入 (修复支撑位负号)
-
-        // 阻力位：dist_to_resistance 在 FeatureSet 中是正数，保持正号
+        // 4. 多维度数据喂入
         process_source(
             t_space.dist_to_resistance,
             Some(WellSide::Resistance),
@@ -176,7 +175,6 @@ impl Analyzer for LevelProximityAnalyzer {
             f_space.res_last_hit,
         );
 
-        // 支撑位：dist_to_support 在 FeatureSet 中是正数，必须取反传给闭包
         process_source(
             t_space.dist_to_support.map(|d| -d),
             Some(WellSide::Support),
@@ -194,11 +192,21 @@ impl Analyzer for LevelProximityAnalyzer {
             f_space.sup_last_hit,
         );
 
-        // MA 距离：FeatureSet 提供的是 (Price - MA)/MA，需要转换为 (MA - Price)/Price
         if let Some(ratio) = t_space.ma20_dist_ratio {
-            // 换算公式: dist_raw = (MA/Price) - 1 = 1/(ratio + 1) - 1
             let ma_dist_raw = 1.0 / (ratio + 1.0) - 1.0;
             process_source(Some(ma_dist_raw), None, "1D_MA20", 1.0, 0, 0);
+        }
+
+        // === 继承上一轮的磁力状态（跨 tick 持久化） ===
+        for well in wells.iter_mut() {
+            for prev_well in prev_wells.iter() {
+                let level_diff = (well.level - prev_well.level).abs() / last_price;
+                if well.side == prev_well.side && level_diff < confluence_gate {
+                    well.magnet_activated = prev_well.magnet_activated;
+                    well.last_tested_above = prev_well.last_tested_above;
+                    break;
+                }
+            }
         }
 
         // 5. 均线聚合增强
@@ -208,7 +216,78 @@ impl Analyzer for LevelProximityAnalyzer {
             }
         }
 
-        // 6. 计算净场强
+        // 6. 读取海啸与趋势状态
+        let is_tsunami = ctx
+            .get_cached::<bool>(ContextKey::IsMomentumTsunami)
+            .unwrap_or(false);
+        let regime = ctx.get_cached::<TrendStructure>(ContextKey::RegimeStructure);
+
+        // 7. 海啸模式下的磁力转换
+        if is_tsunami {
+            match regime {
+                Some(TrendStructure::StrongBullish) | Some(TrendStructure::Bullish) => {
+                    for well in wells.iter_mut() {
+                        if well.side == WellSide::Resistance {
+                            well.side = WellSide::Magnet;
+                            well.magnet_activated = true;
+                        }
+                    }
+                }
+                Some(TrendStructure::StrongBearish) | Some(TrendStructure::Bearish) => {
+                    for well in wells.iter_mut() {
+                        if well.side == WellSide::Support {
+                            well.side = WellSide::Magnet;
+                            well.magnet_activated = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 8. 磁力权重分级与回落熔断
+        let buffer = sigma * 0.5;
+        let mut effective_magnet_strength = 0.0;
+
+        for well in wells
+            .iter_mut()
+            .filter(|w| w.side == WellSide::Magnet && w.is_active)
+        {
+            let dist_pct = (well.level - last_price) / last_price;
+
+            // 更新突破记录
+            if dist_pct < -buffer {
+                well.last_tested_above = true;
+            }
+
+            // 假突破熔断：曾突破但现价回落
+            if well.last_tested_above && dist_pct > buffer {
+                well.side = if regime == Some(TrendStructure::StrongBullish)
+                    || regime == Some(TrendStructure::Bullish)
+                {
+                    WellSide::Resistance
+                } else {
+                    WellSide::Support
+                };
+                well.hit_count += 5;
+                well.magnet_activated = false;
+                well.last_tested_above = false;
+                continue;
+            }
+
+            // 磁力权重计算
+            let base_weight = if dist_pct < -buffer {
+                1.0 // 已突破
+            } else if dist_pct.abs() <= buffer {
+                0.5 // 测试中
+            } else {
+                0.2 // 未触及
+            };
+
+            effective_magnet_strength += well.strength * base_weight;
+        }
+
+        // 9. 重新统计各侧强度
         let total_res = Self::calculate_composite_strength(
             wells
                 .iter()
@@ -222,19 +301,14 @@ impl Analyzer for LevelProximityAnalyzer {
                 .collect(),
         );
 
-        // 7. 推土机自适应评分
-        let is_tsunami = ctx
-            .get_cached::<bool>(ContextKey::IsMomentumTsunami)
-            .unwrap_or(false);
-        let regime = ctx.get_cached::<TrendStructure>(ContextKey::RegimeStructure);
-
+        // 10. 自适应评分
         let raw_score = if is_tsunami {
             match regime {
                 Some(TrendStructure::StrongBullish) | Some(TrendStructure::Bullish) => {
-                    (total_sup + total_res * 0.75) * 40.0
+                    (total_sup + effective_magnet_strength) * 40.0
                 }
                 Some(TrendStructure::StrongBearish) | Some(TrendStructure::Bearish) => {
-                    (-total_res - total_sup * 0.75) * 40.0
+                    -(total_res + effective_magnet_strength) * 40.0
                 }
                 _ => (total_sup * 0.3 - total_res * 0.3) * 40.0,
             }
@@ -248,18 +322,22 @@ impl Analyzer for LevelProximityAnalyzer {
         ctx.set_cached(ContextKey::SpaceGravityWells, wells);
         ctx.set_cached(ContextKey::GravitySigma, sigma);
 
+        let mode_str = if is_tsunami {
+            if effective_magnet_strength > 0.0 {
+                "磁力清算"
+            } else {
+                "突破/推土"
+            }
+        } else {
+            "标准/拦截"
+        };
+
         Ok(
-            AnalysisResult::new(self.kind(), "LEVEL_PROX_ADAPTIVE".into())
+            AnalysisResult::new(self.kind(), "LEVEL_PROX_ADAPTIVE_V3".into())
                 .with_score(final_score)
                 .because(format!(
-                    "模式:{} | 净场强 S:{:.2} R:{:.2}",
-                    if is_tsunami {
-                        "突破/推土"
-                    } else {
-                        "标准/拦截"
-                    },
-                    total_sup,
-                    total_res
+                    "模式:{} | S:{:.2} R:{:.2} M:{:.2}",
+                    mode_str, total_sup, total_res, effective_magnet_strength
                 )),
         )
     }
