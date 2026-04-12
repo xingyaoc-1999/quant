@@ -1,3 +1,5 @@
+use std::f64;
+
 use crate::analyzer::{
     AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, ContextKey, MarketContext, Role,
 };
@@ -38,7 +40,7 @@ impl Analyzer for VolatilityEnvironmentAnalyzer {
                 .clone()
                 .unwrap_or(TrendStructure::Range);
 
-            let atr_ratio = if last_price > 0.0 {
+            let atr_ratio = if last_price > f64::EPSILON {
                 atr / last_price
             } else {
                 0.005

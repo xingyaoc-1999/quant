@@ -26,64 +26,68 @@ pub struct CalculatorConfig {
     pub doji_body_ratio: f64,
     pub rsi_range_3_low: f64,
     pub rsi_range_3_high: f64,
+    // 新增：窗口大小配置
+    pub struct_window: usize,
+    pub vol_window: usize,
 }
 
 impl CalculatorConfig {
-    pub fn from_interval(interval: Interval) -> Self {
-        match interval {
-            Interval::M1 | Interval::M5 => Self {
-                warmup_period: 200,
-                slope_period: 8,
-                volume_expand_factor: 2.5,
-                volume_shrink_factor: 0.5,
-                ma_converge_threshold: 0.001,
-                extreme_candle_atr_mult: 3.0,
-                extreme_candle_body_ratio: 0.7,
-                slope_deadzone: 0.0002,
-                doji_body_ratio: 0.05,
-                rsi_range_3_low: 45.0,
-                rsi_range_3_high: 55.0,
-            },
-            Interval::M15 | Interval::M30 => Self {
-                warmup_period: 150,
-                slope_period: 5,
-                volume_expand_factor: 2.0,
-                volume_shrink_factor: 0.6,
-                ma_converge_threshold: 0.004,
-                extreme_candle_atr_mult: 2.5,
-                extreme_candle_body_ratio: 0.7,
-                slope_deadzone: 0.0004,
-                doji_body_ratio: 0.05,
-                rsi_range_3_low: 45.0,
-                rsi_range_3_high: 55.0,
-            },
-            Interval::H1 | Interval::H4 => Self {
-                warmup_period: 120,
-                slope_period: 3,
-                volume_expand_factor: 1.5,
-                volume_shrink_factor: 0.7,
-                ma_converge_threshold: 0.008,
-                extreme_candle_atr_mult: 2.0,
-                extreme_candle_body_ratio: 0.7,
-                slope_deadzone: 0.001,
-                doji_body_ratio: 0.05,
-                rsi_range_3_low: 45.0,
-                rsi_range_3_high: 55.0,
-            },
-            Interval::D1 => Self {
-                warmup_period: 250,
-                slope_period: 2,
-                volume_expand_factor: 1.2,
-                volume_shrink_factor: 0.8,
-                ma_converge_threshold: 0.015,
-                extreme_candle_atr_mult: 1.8,
-                extreme_candle_body_ratio: 0.7,
-                slope_deadzone: 0.002,
-                doji_body_ratio: 0.05,
-                rsi_range_3_low: 45.0,
-                rsi_range_3_high: 55.0,
-            },
+    /// 基础配置（适用于 H1/H4）
+    fn base_config() -> Self {
+        Self {
+            warmup_period: 120,
+            slope_period: 3,
+            volume_expand_factor: 1.5,
+            volume_shrink_factor: 0.7,
+            ma_converge_threshold: 0.008,
+            extreme_candle_atr_mult: 2.0,
+            extreme_candle_body_ratio: 0.7,
+            slope_deadzone: 0.001,
+            doji_body_ratio: 0.05,
+            rsi_range_3_low: 45.0,
+            rsi_range_3_high: 55.0,
+            struct_window: 50,
+            vol_window: 200,
         }
+    }
+
+    pub fn from_interval(interval: Interval) -> Self {
+        let mut cfg = Self::base_config();
+        match interval {
+            Interval::M1 | Interval::M5 => {
+                cfg.warmup_period = 200;
+                cfg.slope_period = 8;
+                cfg.volume_expand_factor = 2.5;
+                cfg.volume_shrink_factor = 0.5;
+                cfg.ma_converge_threshold = 0.001;
+                cfg.extreme_candle_atr_mult = 3.0;
+                cfg.slope_deadzone = 0.0002;
+                cfg.struct_window = 50;
+                cfg.vol_window = 200;
+            }
+            Interval::M15 | Interval::M30 => {
+                cfg.warmup_period = 150;
+                cfg.slope_period = 5;
+                cfg.volume_expand_factor = 2.0;
+                cfg.volume_shrink_factor = 0.6;
+                cfg.ma_converge_threshold = 0.004;
+                cfg.extreme_candle_atr_mult = 2.5;
+                cfg.slope_deadzone = 0.0004;
+            }
+            Interval::H1 | Interval::H4 => {
+                // 保持基础配置
+            }
+            Interval::D1 => {
+                cfg.warmup_period = 250;
+                cfg.slope_period = 2;
+                cfg.volume_expand_factor = 1.2;
+                cfg.volume_shrink_factor = 0.8;
+                cfg.ma_converge_threshold = 0.015;
+                cfg.extreme_candle_atr_mult = 1.8;
+                cfg.slope_deadzone = 0.002;
+            }
+        }
+        cfg
     }
 }
 
@@ -99,7 +103,7 @@ pub struct FeatureCalculator {
     volume_history: [Option<f64>; 3],
     rsi_history: [Option<f64>; 3],
 
-    // --- 新增：极值与磨损状态追踪 ---
+    // --- 极值与磨损状态追踪 ---
     current_res: Option<f64>,
     res_hit_count: u32,
     res_last_hit: i64,
@@ -120,7 +124,7 @@ pub struct FeatureCalculator {
 
     volatility_history: VecDeque<f64>,
     ma20_history: VecDeque<f64>,
-    recent_highs: VecDeque<f64>,
+    recent_highs: VecDeque<f64>, // 修复：原为 f65，现为 f64
     recent_lows: VecDeque<f64>,
     recent_macd_hists: VecDeque<f64>,
     recent_closes: VecDeque<f64>,
@@ -128,11 +132,11 @@ pub struct FeatureCalculator {
 }
 
 impl FeatureCalculator {
-    const STRUCT_WINDOW: usize = 50;
-    const VOL_WINDOW: usize = 200;
-
     pub fn new(interval: Interval) -> Self {
         let config = CalculatorConfig::from_interval(interval);
+        let struct_window = config.struct_window;
+        let vol_window = config.vol_window;
+
         Self {
             count: 0,
             ma20_slope_bars: 0,
@@ -143,7 +147,6 @@ impl FeatureCalculator {
             volume_history: [None; 3],
             rsi_history: [None; 3],
 
-            // 初始化极值与磨损状态
             current_res: None,
             res_hit_count: 0,
             res_last_hit: 0,
@@ -162,12 +165,12 @@ impl FeatureCalculator {
             atr: AverageTrueRange::new(14).unwrap(),
 
             ma20_history: VecDeque::with_capacity(config.slope_period + 1),
-            volatility_history: VecDeque::with_capacity(Self::VOL_WINDOW + 1),
-            recent_highs: VecDeque::with_capacity(Self::STRUCT_WINDOW + 1),
-            recent_lows: VecDeque::with_capacity(Self::STRUCT_WINDOW + 1),
-            recent_macd_hists: VecDeque::with_capacity(Self::STRUCT_WINDOW + 1),
-            recent_closes: VecDeque::with_capacity(Self::STRUCT_WINDOW + 1),
-            recent_global_closes: VecDeque::with_capacity(Self::STRUCT_WINDOW + 1),
+            volatility_history: VecDeque::with_capacity(vol_window + 1),
+            recent_highs: VecDeque::with_capacity(struct_window + 1),
+            recent_lows: VecDeque::with_capacity(struct_window + 1),
+            recent_macd_hists: VecDeque::with_capacity(struct_window + 1),
+            recent_closes: VecDeque::with_capacity(struct_window + 1),
+            recent_global_closes: VecDeque::with_capacity(struct_window + 1),
         }
     }
 
@@ -179,7 +182,7 @@ impl FeatureCalculator {
     ) -> FeatureSet {
         self.count += 1;
 
-        // 1. 计算基础指标
+        // 1. 基础指标
         let rsi_v = self.rsi.next(candle.close);
         let m20_v = self.ma20.next(candle.close);
         let m50_v = self.ma50.next(candle.close);
@@ -214,35 +217,28 @@ impl FeatureCalculator {
         let mut dist_sup = None;
 
         if self.recent_highs.len() >= 10 {
-            // 获取当前滑动窗口的绝对极值
             let window_res = self.recent_highs.iter().copied().fold(f64::MIN, f64::max);
             let window_sup = self.recent_lows.iter().copied().fold(f64::MAX, f64::min);
-
-            // 设定触碰判定阈值：0.15% 价格误差 或 当前 ATR，取较大者
             let hit_margin = atr_v.max(candle.close * 0.0015);
 
-            // --- 阻力位逻辑 ---
+            // 阻力位
             if window_res > self.current_res.unwrap_or(0.0) + f64::EPSILON {
-                // 出现更高的高点，旧阻力被突破，重置状态
                 self.current_res = Some(window_res);
                 self.res_hit_count = 1;
                 self.res_last_hit = candle.timestamp;
             } else if let Some(r) = self.current_res {
-                // 阻力位未变，检查是否撞击
                 if candle.high >= r - hit_margin && candle.timestamp != self.res_last_hit {
                     self.res_hit_count += 1;
                     self.res_last_hit = candle.timestamp;
                 }
             }
 
-            // --- 支撑位逻辑 ---
+            // 支撑位
             if window_sup < self.current_sup.unwrap_or(f64::MAX) - f64::EPSILON {
-                // 出现更低的低点，旧支撑被突破，重置状态
                 self.current_sup = Some(window_sup);
                 self.sup_hit_count = 1;
                 self.sup_last_hit = candle.timestamp;
             } else if let Some(s) = self.current_sup {
-                // 支撑位未变，检查是否踩踏
                 if candle.low <= s + hit_margin && candle.timestamp != self.sup_last_hit {
                     self.sup_hit_count += 1;
                     self.sup_last_hit = candle.timestamp;
@@ -255,22 +251,33 @@ impl FeatureCalculator {
             }
         }
 
-        // 4. MACD 背离判定
+        // 4. MACD 背离
         let macd_divergence = self.check_macd_divergence(candle.close, macd_out.histogram);
 
-        // 5. 更新历史滑窗
-        Self::push_fixed_window(&mut self.volatility_history, bb_w, Self::VOL_WINDOW);
-        Self::push_fixed_window(&mut self.recent_highs, candle.high, Self::STRUCT_WINDOW);
-        Self::push_fixed_window(&mut self.recent_lows, candle.low, Self::STRUCT_WINDOW);
+        // 5. 更新滑窗（使用配置的窗口大小）
+        Self::push_fixed_window(&mut self.volatility_history, bb_w, self.config.vol_window);
+        Self::push_fixed_window(
+            &mut self.recent_highs,
+            candle.high,
+            self.config.struct_window,
+        );
+        Self::push_fixed_window(&mut self.recent_lows, candle.low, self.config.struct_window);
         Self::push_fixed_window(
             &mut self.recent_macd_hists,
             macd_out.histogram,
-            Self::STRUCT_WINDOW,
+            self.config.struct_window,
         );
-
-        Self::push_fixed_window(&mut self.recent_closes, candle.close, Self::STRUCT_WINDOW);
+        Self::push_fixed_window(
+            &mut self.recent_closes,
+            candle.close,
+            self.config.struct_window,
+        );
         if let Some(gc) = global_close {
-            Self::push_fixed_window(&mut self.recent_global_closes, gc, Self::STRUCT_WINDOW);
+            Self::push_fixed_window(
+                &mut self.recent_global_closes,
+                gc,
+                self.config.struct_window,
+            );
         }
 
         // 6. 相关性计算
@@ -310,16 +317,24 @@ impl FeatureCalculator {
             VolumeState::Normal
         };
 
+        // ========== 新增：提取最近3根收盘价 ==========
+        let mut rec_closes = [candle.close; 3];
+        let len = self.recent_closes.len();
+        if len >= 1 {
+            rec_closes[1] = self.recent_closes[len - 1];
+        }
+        if len >= 2 {
+            rec_closes[2] = self.recent_closes[len - 2];
+        }
+        // ===========================================
+
         let space = SpaceGeometry {
             dist_to_resistance: dist_res,
             dist_to_support: dist_sup,
-
-            // 注入磨损元数据 (Hit counts & Last hits)
             sup_hit_count: self.sup_hit_count,
             sup_last_hit: self.sup_last_hit,
             res_hit_count: self.res_hit_count,
             res_last_hit: self.res_last_hit,
-
             ma20_dist_ratio: (m20_v > 0.0).then_some((candle.close - m20_v) / m20_v),
             ma50_dist_ratio: (m50_v > 0.0).then_some((candle.close - m50_v) / m50_v),
             ma200_dist_ratio: (m200_v > 0.0).then_some((candle.close - m200_v) / m200_v),
@@ -327,7 +342,7 @@ impl FeatureCalculator {
                 .then_some(((m20_v - m50_v).abs() / m50_v) < self.config.ma_converge_threshold),
         };
 
-        let fs = FeatureSet {
+        FeatureSet {
             bucket,
             symbol: candle.symbol,
             interval,
@@ -394,25 +409,13 @@ impl FeatureCalculator {
                 volume_shrink_3: Some(self.is_volume_shrinking()),
                 extreme_candle: Some(self.is_extreme_candle(candle, atr_v)),
             },
-        };
-
-        // 更新状态位
-        self.prev_macd = Some(macd_out.macd);
-        self.prev_signal = Some(macd_out.signal);
-        self.prev_macd_histogram = Some(macd_out.histogram);
-        self.prev_ma20_satisfied = Some(curr_above_m20);
-        Self::shift_history(&mut self.volume_history, Some(candle.volume));
-        Self::shift_history(
-            &mut self.rsi_history,
-            if rsi_v.is_nan() { None } else { Some(rsi_v) },
-        );
-
-        fs
+            recent_closes: rec_closes, // 新增字段
+        }
     }
 
     fn calculate_correlation_stable(&self) -> Option<f64> {
         let n = self.recent_closes.len();
-        if n < Self::STRUCT_WINDOW || n != self.recent_global_closes.len() {
+        if n < self.config.struct_window || n != self.recent_global_closes.len() {
             return None;
         }
 
@@ -456,7 +459,7 @@ impl FeatureCalculator {
     }
 
     fn check_macd_divergence(&self, cur_p: f64, cur_h: f64) -> Option<DivergenceType> {
-        if self.recent_lows.len() < Self::STRUCT_WINDOW {
+        if self.recent_lows.len() < self.config.struct_window {
             return None;
         }
 

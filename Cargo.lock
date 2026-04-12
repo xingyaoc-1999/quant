@@ -2377,6 +2377,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "api_client",
+ "chrono",
  "common",
  "quant",
  "reqwest 0.12.28",

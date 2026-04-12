@@ -30,31 +30,36 @@ impl AnalysisService {
     pub async fn analyze(
         &self,
         manager: &FeatureContextManager,
-
         symbol: Symbol,
     ) -> Option<AnalysisAudit> {
         let mut ctx = manager.get_market_context(symbol)?;
         let mut audit = self.engine.run(&mut ctx);
 
-        let direction = match audit.signal.net_score {
-            s if s > 15.0 => TradeDirection::Long,
-            s if s < -15.0 => TradeDirection::Short,
-            _ => TradeDirection::None,
+        // --- 修改点 1: 同步 TradeDirection 的变更 ---
+        // 现在的逻辑：根据分数产生 Some(方向) 或 None
+        let direction = if audit.signal.net_score > 15.0 {
+            Some(TradeDirection::Long)
+        } else if audit.signal.net_score < -15.0 {
+            Some(TradeDirection::Short)
+        } else {
+            None
         };
 
+        // --- 修改点 2: 匹配新的 attach_risk 签名 ---
+        // 我们之前将 attach_risk 改为了接收 Option<TradeDirection>
         audit.attach_risk(&ctx, direction);
 
         info!(
             symbol = %symbol,
             score = audit.signal.net_score,
-            direction = ?direction,
+            direction = ?direction, // 使用 ? 打印 Option (显示 Some(Long) 或 None)
             has_risk = audit.risk_assessment.is_some(),
-
         );
 
         let _ = self.event_tx.send(AnalysisEvent {
             audit: audit.clone(),
         });
+
         Some(audit)
     }
 

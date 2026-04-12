@@ -11,7 +11,6 @@ use chrono::{DateTime, DurationRound, Utc};
 use common::{
     config::Appconfig, utils::CooledProxyPool, Candle, Interval, OpenInterestRecord, Symbol,
 };
-use quant::analyzer::AnalysisEngine;
 use std::{
     collections::HashMap,
     sync::{

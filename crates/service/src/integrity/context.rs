@@ -223,7 +223,6 @@ impl FeatureContextManager {
 
         for (role, proc) in roles_guard.iter_mut() {
             if proc.is_dirty() {
-                // 仅在数据变动时计算
                 if let Some(acc) = &proc.current_acc {
                     let feature_set = proc.calculator.peek(acc, proc.interval, g_close);
                     let oi_data = proc.generate_oi_data(
@@ -239,7 +238,6 @@ impl FeatureContextManager {
                         oi_data,
                     };
 
-                    // 更新缓存标记
                     proc.last_calc_ts = acc.timestamp;
                     proc.last_calc_volume = acc.volume;
                     proc.cached_role_data = Some(new_data.clone());
@@ -247,7 +245,6 @@ impl FeatureContextManager {
                     current_roles_data.insert(*role, new_data);
                 }
             } else if let Some(cache) = &proc.cached_role_data {
-                // 数据未变，直接返回缓存
                 current_roles_data.insert(*role, cache.clone());
             }
         }

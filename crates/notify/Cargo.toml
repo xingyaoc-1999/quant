@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+chrono.workspace=true
 reqwest.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

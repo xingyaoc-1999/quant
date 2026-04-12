@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, f64, str::FromStr};
-use tracing::{error, warn};
+use tracing::warn;
 
 use crate::{
     report::AnalysisAudit,
@@ -14,6 +14,7 @@ use crate::{
 };
 
 pub mod context;
+pub mod signal;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum ContextKey {
     // 波动率环境
@@ -36,7 +37,9 @@ pub enum ContextKey {
     StopLossLevels,   // Vec<f64>
     TakeProfitLevels, // Vec<f64>
     WeightedRR,       // f64
-    PositionSizePct,  // f64
+    PositionSizePct,
+    LastEfficiency,
+    LastRVol,
 }
 
 #[derive(
@@ -93,6 +96,7 @@ pub enum AnalyzerKind {
     Volatility,
     MarketRegime,
     RiskManagement,
+    Fakeout,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -301,6 +305,7 @@ impl Default for Config {
         weights.insert(AnalyzerKind::Divergence, 0.8);
         weights.insert(AnalyzerKind::SupportResistance, 0.8);
         weights.insert(AnalyzerKind::Volatility, 0.5);
+        weights.insert(AnalyzerKind::Fakeout, 1.2);
 
         Self {
             weights,

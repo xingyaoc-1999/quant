@@ -241,7 +241,7 @@ impl Analyzer for MarketRegimeAnalyzer {
 
         let m_mtf = if mtf_aligned { 1.0 } else { 0.6 };
 
-        let raw_mult = m_regime * m_momentum * m_game * m_mtf;
+        let raw_mult = m_regime + m_momentum + m_game + m_mtf - 3.0;
         let final_mult = raw_mult.clamp(0.1, 5.0);
 
         ctx.set_cached(ContextKey::RegimeStructure, structure);

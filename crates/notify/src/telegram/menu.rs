@@ -20,7 +20,6 @@ impl BotApp {
             let context = entry.value();
             let roles_guard = context.roles.read().expect("Lock poisoned");
 
-            // 2. 遍历锁内部的 HashMap
             for (role, processor) in roles_guard.iter() {
                 display_data.push((*symbol, *role, processor.interval));
             }

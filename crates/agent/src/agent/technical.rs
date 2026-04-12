@@ -1,4 +1,5 @@
 use anyhow::Result;
+use common::Symbol;
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use rig::message::Message;
 use rig::tool::ToolSet;
@@ -20,7 +21,7 @@ pub struct TechnicalAgent;
 pub struct TechnicalAgentState {
     conversation_history: Vec<Message>,
     model: Model,
-    tx_out: Sender<(String, ChatId)>,
+    tx_out: Sender<(String, ChatId, Symbol)>,
     tool_set: ToolSet,
 }
 
@@ -43,7 +44,7 @@ impl TechnicalAgentState {
 
 pub struct TechnicalAgentArgs {
     pub model: Model,
-    pub tx_out: Sender<(String, ChatId)>,
+    pub tx_out: Sender<(String, ChatId, Symbol)>,
     pub tool_set: ToolSet,
 }
 
@@ -84,20 +85,20 @@ impl Actor for TechnicalAgent {
                     .get_name()
                     .unwrap_or_else(|| "Anonymous ".to_string());
                 debug!("[{}] Received task: {}", actor_name, task);
-                match state.process_task(&task).await {
-                    Ok(output) => {
-                        if let Err(e) = state.tx_out.send((output, chat_id)).await {
-                            error!("[{}] Failed to send response: {:?}", actor_name, e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("[{}] Task processing error: {:?}", actor_name, e);
-                        let error_msg = format!("处理失败: {}", e);
-                        if let Err(e) = state.tx_out.send((error_msg, chat_id)).await {
-                            error!("[{}] Failed to send response: {}", actor_name, e);
-                        }
-                    }
-                };
+                // match state.process_task(&task).await {
+                //     Ok(output) => {
+                //         if let Err(e) = state.tx_out.send((output, chat_id)).await {
+                //             error!("[{}] Failed to send response: {:?}", actor_name, e);
+                //         }
+                //     }
+                //     Err(e) => {
+                //         error!("[{}] Task processing error: {:?}", actor_name, e);
+                //         let error_msg = format!("处理失败: {}", e);
+                //         if let Err(e) = state.tx_out.send((error_msg, chat_id)).await {
+                //             error!("[{}] Failed to send response: {}", actor_name, e);
+                //         }
+                //     }
+                // };
                 Ok(())
             }
             TechnicalAgentMessage::Shutdown => {

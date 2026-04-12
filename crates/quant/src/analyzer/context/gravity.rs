@@ -3,26 +3,32 @@ use crate::analyzer::{
 };
 use crate::types::{PriceGravityWell, TrendStructure, WellSide};
 
+// ========== 算法常量配置 ==========
 const SIGMA_ATR_MULT: f64 = 0.8;
 const CONFLUENCE_GATE_MULT: f64 = 0.4;
 const ACTIVE_WELL_THRESHOLD: f64 = 0.08;
 const MAX_STRENGTH_CAP: f64 = 3.5;
 const SECONDARY_WELL_WEIGHT: f64 = 0.3;
-const CONVERGENCE_BOOST: f64 = 1.35;
+const CONVERGENCE_BOOST: f64 = 1.35; // 均线收敛时的强度加成
 
 const CRITICAL_HIT_COUNT: f64 = 3.0;
 const STEEPNESS: f64 = 2.0;
+
+// 磁力井确认逻辑
+const MAGNET_CONFIRM_MS: i64 = 180_000; // 3分钟确认
+const MIN_HOLD_MS: i64 = 30_000; // 30秒过滤毛刺
+const MIN_BUFFER_PCT: f64 = 0.001; // 0.1% 最低缓冲区
 
 pub struct GravityAnalyzer;
 
 impl GravityAnalyzer {
     #[inline]
     fn calculate_intensity(dist: f64, sigma: f64) -> f64 {
-        if sigma <= 0.0 {
+        if sigma <= 1e-9 {
             return 0.0;
         }
         let gauss = (-(dist * dist) / (2.0 * sigma * sigma)).exp();
-        let long_range = 0.05 * (-(dist) / (10.0 * sigma)).exp();
+        let long_range = 0.05 * (-dist / (10.0 * sigma)).exp();
         gauss.max(long_range)
     }
 
@@ -32,11 +38,7 @@ impl GravityAnalyzer {
         }
         let h = hit_count as f64;
         let wear_factor = 1.0 / (1.0 + (STEEPNESS * (h - CRITICAL_HIT_COUNT)).exp());
-
-        let diff_ms = (now - last_hit_ts).max(0);
-        let hours_passed = diff_ms as f64 / 3_600_000.0;
-        let recovery = hours_passed * 0.05;
-
+        let recovery = ((now - last_hit_ts).max(0) as f64 / 3_600_000.0) * 0.05;
         (wear_factor + recovery).min(1.0)
     }
 
@@ -46,7 +48,6 @@ impl GravityAnalyzer {
         }
         let mut strengths: Vec<f64> = side_wells.iter().map(|w| w.strength).collect();
         strengths.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-
         let primary = strengths[0];
         let secondary_sum: f64 = strengths.iter().skip(1).sum();
         (primary + secondary_sum * SECONDARY_WELL_WEIGHT).min(MAX_STRENGTH_CAP)
@@ -55,7 +56,7 @@ impl GravityAnalyzer {
 
 impl Analyzer for GravityAnalyzer {
     fn name(&self) -> &'static str {
-        "level_proximity_pro_v3"
+        "level_proximity_pro_v4_final"
     }
     fn kind(&self) -> AnalyzerKind {
         AnalyzerKind::SupportResistance
@@ -65,6 +66,11 @@ impl Analyzer for GravityAnalyzer {
         let last_price = ctx.global.last_price;
         let now = ctx.global.timestamp;
 
+        if last_price <= 0.0 {
+            return Ok(AnalysisResult::new(self.kind(), "LEVEL_PROX_V4".into()).with_score(0.0));
+        }
+
+        // 1. 环境因子获取
         let vol_p = ctx
             .get_cached::<f64>(ContextKey::VolPercentile)
             .unwrap_or(50.0);
@@ -76,17 +82,20 @@ impl Analyzer for GravityAnalyzer {
 
         let trend_role = ctx.get_role(Role::Trend)?;
         let filter_role = ctx.get_role(Role::Filter).unwrap_or(trend_role);
-
         let t_space = &trend_role.feature_set.space;
         let f_space = &filter_role.feature_set.space;
+
+        // 提取均线收敛状态
         let ma_converging = t_space.ma_converging.unwrap_or(false);
 
+        // 2. 继承旧能级状态
         let prev_wells: Vec<PriceGravityWell> = ctx
             .get_cached::<Vec<PriceGravityWell>>(ContextKey::SpaceGravityWells)
             .unwrap_or_default();
 
         let mut wells: Vec<PriceGravityWell> = Vec::new();
 
+        // 3. 构造/合并能级
         let mut process_source = |dist_opt: Option<f64>,
                                   side_hint: Option<WellSide>,
                                   label: &str,
@@ -97,17 +106,14 @@ impl Analyzer for GravityAnalyzer {
                 Some(d) => d,
                 None => return,
             };
-
             let wear_mult = Self::calculate_wear_multiplier(hits, last_ts, now);
             let final_strength =
                 Self::calculate_intensity(dist_raw.abs(), sigma) * weight * wear_mult;
-
             if final_strength < 0.02 {
                 return;
             }
 
             let current_level = last_price * (1.0 + dist_raw);
-
             let side = side_hint.unwrap_or(if dist_raw >= 0.0 {
                 WellSide::Resistance
             } else {
@@ -132,7 +138,6 @@ impl Analyzer for GravityAnalyzer {
                     break;
                 }
             }
-
             if !merged {
                 wells.push(PriceGravityWell {
                     level: current_level,
@@ -145,11 +150,12 @@ impl Analyzer for GravityAnalyzer {
                     last_hit_ts: last_ts,
                     magnet_activated: false,
                     last_tested_above: false,
+                    last_tested_below: false,
+                    cross_ts: 0,
                 });
             }
         };
 
-        // 4. 多维度数据喂入
         process_source(
             t_space.dist_to_resistance,
             Some(WellSide::Resistance),
@@ -166,7 +172,6 @@ impl Analyzer for GravityAnalyzer {
             f_space.res_hit_count,
             f_space.res_last_hit,
         );
-
         process_source(
             t_space.dist_to_support.map(|d| -d),
             Some(WellSide::Support),
@@ -183,57 +188,55 @@ impl Analyzer for GravityAnalyzer {
             f_space.sup_hit_count,
             f_space.sup_last_hit,
         );
-
         if let Some(ratio) = t_space.ma20_dist_ratio {
-            let ma_dist_raw = 1.0 / (ratio + 1.0) - 1.0;
-            process_source(Some(ma_dist_raw), None, "1D_MA20", 1.0, 0, 0);
+            process_source(Some(1.0 / (ratio + 1.0) - 1.0), None, "1D_MA20", 1.0, 0, 0);
         }
 
+        // 4. 状态继承与增强处理
         for well in wells.iter_mut() {
-            for prev_well in prev_wells.iter() {
-                let level_diff = (well.level - prev_well.level).abs() / last_price;
-                if well.side == prev_well.side && level_diff < confluence_gate {
-                    well.magnet_activated = prev_well.magnet_activated;
-                    well.last_tested_above = prev_well.last_tested_above;
-                    break;
-                }
+            if let Some(prev) = prev_wells.iter().find(|p| {
+                p.side == well.side
+                    && (p.level - well.level).abs() / last_price < confluence_gate * 1.5
+            }) {
+                well.magnet_activated = prev.magnet_activated;
+                well.last_tested_above = prev.last_tested_above;
+                well.last_tested_below = prev.last_tested_below;
+                well.cross_ts = prev.cross_ts;
+            }
+
+            // --- 此处补全 CONVERGENCE_BOOST 逻辑 ---
+            if ma_converging {
+                well.strength *= CONVERGENCE_BOOST;
             }
         }
 
-        if ma_converging {
-            for w in wells.iter_mut() {
-                w.strength *= CONVERGENCE_BOOST;
-            }
-        }
-
+        // 5. 海啸与磁力转换逻辑 (省略重复注释，保持与上一版逻辑一致)
         let is_tsunami = ctx
             .get_cached::<bool>(ContextKey::IsMomentumTsunami)
             .unwrap_or(false);
         let regime = ctx.get_cached::<TrendStructure>(ContextKey::RegimeStructure);
 
         if is_tsunami {
-            match regime {
-                Some(TrendStructure::StrongBullish) | Some(TrendStructure::Bullish) => {
-                    for well in wells.iter_mut() {
-                        if well.side == WellSide::Resistance {
-                            well.side = WellSide::Magnet;
-                            well.magnet_activated = true;
-                        }
+            for well in wells.iter_mut() {
+                match regime {
+                    Some(TrendStructure::StrongBullish) | Some(TrendStructure::Bullish)
+                        if well.side == WellSide::Resistance =>
+                    {
+                        well.side = WellSide::Magnet;
+                        well.magnet_activated = true;
                     }
-                }
-                Some(TrendStructure::StrongBearish) | Some(TrendStructure::Bearish) => {
-                    for well in wells.iter_mut() {
-                        if well.side == WellSide::Support {
-                            well.side = WellSide::Magnet;
-                            well.magnet_activated = true;
-                        }
+                    Some(TrendStructure::StrongBearish) | Some(TrendStructure::Bearish)
+                        if well.side == WellSide::Support =>
+                    {
+                        well.side = WellSide::Magnet;
+                        well.magnet_activated = true;
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
-        let buffer = sigma * 0.5;
+        let buffer = (sigma * 0.5).max(MIN_BUFFER_PCT);
         let mut effective_magnet_strength = 0.0;
 
         for well in wells
@@ -242,24 +245,62 @@ impl Analyzer for GravityAnalyzer {
         {
             let dist_pct = (well.level - last_price) / last_price;
 
+            // 状态机核心更新
             if dist_pct < -buffer {
-                well.last_tested_above = true;
-            }
-
-            if well.last_tested_above && dist_pct > buffer {
-                well.side = if regime == Some(TrendStructure::StrongBullish)
-                    || regime == Some(TrendStructure::Bullish)
-                {
-                    WellSide::Resistance
-                } else {
-                    WellSide::Support
-                };
-                well.hit_count += 5;
-                well.magnet_activated = false;
+                if !well.last_tested_below {
+                    well.last_tested_below = true;
+                    well.last_tested_above = false;
+                    well.cross_ts = now;
+                }
+            } else if dist_pct > buffer {
+                if !well.last_tested_above {
+                    well.last_tested_above = true;
+                    well.last_tested_below = false;
+                    well.cross_ts = now;
+                }
+            } else if (well.last_tested_below && dist_pct > -buffer * 0.5)
+                || (well.last_tested_above && dist_pct < buffer * 0.5)
+            {
+                well.last_tested_below = false;
                 well.last_tested_above = false;
-                continue;
+                well.cross_ts = 0;
             }
 
+            // 检查确认转换
+            if well.cross_ts > 0 {
+                let duration = now - well.cross_ts;
+                let mut should_convert = false;
+                if dist_pct > buffer && well.last_tested_below {
+                    if duration >= MAGNET_CONFIRM_MS {
+                        should_convert = true;
+                    } else if duration < MIN_HOLD_MS {
+                        well.cross_ts = 0;
+                        well.last_tested_below = false;
+                    }
+                } else if dist_pct < -buffer && well.last_tested_above {
+                    if duration >= MAGNET_CONFIRM_MS {
+                        should_convert = true;
+                    } else if duration < MIN_HOLD_MS {
+                        well.cross_ts = 0;
+                        well.last_tested_above = false;
+                    }
+                }
+
+                if should_convert {
+                    well.side = if matches!(
+                        regime,
+                        Some(TrendStructure::StrongBullish) | Some(TrendStructure::Bullish)
+                    ) {
+                        WellSide::Resistance
+                    } else {
+                        WellSide::Support
+                    };
+                    well.hit_count += 2;
+                    well.magnet_activated = false;
+                    well.cross_ts = 0;
+                    continue;
+                }
+            }
             let base_weight = if dist_pct < -buffer {
                 1.0
             } else if dist_pct.abs() <= buffer {
@@ -267,10 +308,10 @@ impl Analyzer for GravityAnalyzer {
             } else {
                 0.2
             };
-
             effective_magnet_strength += well.strength * base_weight;
         }
 
+        // 6. 最终评分输出
         let total_res = Self::calculate_composite_strength(
             wells
                 .iter()
@@ -284,7 +325,6 @@ impl Analyzer for GravityAnalyzer {
                 .collect(),
         );
 
-        // 10. 自适应评分
         let raw_score = if is_tsunami {
             match regime {
                 Some(TrendStructure::StrongBullish) | Some(TrendStructure::Bullish) => {
@@ -293,34 +333,23 @@ impl Analyzer for GravityAnalyzer {
                 Some(TrendStructure::StrongBearish) | Some(TrendStructure::Bearish) => {
                     -(total_res + effective_magnet_strength) * 40.0
                 }
-                _ => (total_sup * 0.3 - total_res * 0.3) * 40.0,
+                _ => (total_sup - total_res) * 40.0,
             }
         } else {
             (total_sup - total_res) * 40.0
         };
 
-        let sensitivity_mult = if is_tsunami { 0.6 } else { 1.0 };
-        let final_score = (raw_score * sensitivity_mult).clamp(-100.0, 100.0);
+        let final_score = (raw_score * if is_tsunami { 0.7 } else { 1.0 }).clamp(-100.0, 100.0);
 
         ctx.set_cached(ContextKey::SpaceGravityWells, wells);
         ctx.set_cached(ContextKey::GravitySigma, sigma);
 
-        let mode_str = if is_tsunami {
-            if effective_magnet_strength > 0.0 {
-                "磁力清算"
-            } else {
-                "突破/推土"
-            }
-        } else {
-            "标准/拦截"
-        };
-
         Ok(
-            AnalysisResult::new(self.kind(), "LEVEL_PROX_ADAPTIVE_V3".into())
+            AnalysisResult::new(self.kind(), "LEVEL_PROX_V4_FINAL".into())
                 .with_score(final_score)
                 .because(format!(
-                    "模式:{} | S:{:.2} R:{:.2} M:{:.2}",
-                    mode_str, total_sup, total_res, effective_magnet_strength
+                    "S:{:.1} R:{:.1} M:{:.1} CVG:{}",
+                    total_sup, total_res, effective_magnet_strength, ma_converging
                 )),
         )
     }

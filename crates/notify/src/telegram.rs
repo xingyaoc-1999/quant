@@ -19,7 +19,10 @@ use storage::postgres::Storage;
 use teloxide::{
     dispatching::{Dispatcher, HandlerExt, UpdateFilterExt},
     prelude::*,
-    types::{CallbackQuery, Message, ParseMode, Update},
+    types::{
+        CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageId, ParseMode,
+        Update,
+    },
     update_listeners,
     utils::{command::BotCommands, markdown::escape},
     Bot, RequestError,
@@ -77,7 +80,7 @@ impl BotApp {
     pub async fn run(
         &self,
         tx_in: Sender<(String, ChatId)>,
-        mut rx_in: Receiver<(String, ChatId)>,
+        mut rx_in: Receiver<(String, ChatId, Symbol)>,
         manager: Arc<FeatureContextManager>,
         archive_provider: Arc<ArchiveProvider>,
         storage: Arc<Storage>,
@@ -102,7 +105,6 @@ impl BotApp {
             let (switch_tx, mut switch_rx) = mpsc::channel(1);
             let app_inner = Arc::clone(&app);
 
-            // 错误处理器：检测网络错误并触发代理切换
             let switching_err = app_inner.switching.clone();
             let switch_tx_err = switch_tx.clone();
             let error_handler = Arc::new(move |error: RequestError| {
@@ -173,30 +175,66 @@ impl BotApp {
                     )
                     .await
             });
-
+            let mut last_message_ids: HashMap<(Symbol, ChatId), MessageId> = HashMap::new();
             loop {
                 tokio::select! {
-                        Some((text, chat_id)) = rx_in.recv() => {
+                    Some((text, chat_id,symbol)) = rx_in.recv() => {
 
+                        let key = (symbol.clone(), chat_id);
+                        let mut update_success = false;
 
-                     match bot.send_message(chat_id, &text).parse_mode(ParseMode::MarkdownV2).await {
-                    Ok(_) => info!("Message sent successfully: {}", text),
-                    Err(e) => error!("Failed to send message: {}", e),
-                }
+                        let now = chrono::Local::now();
+                        let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
+                        let final_text = format!("{}\n\n🕒 最后更新: `{}`", text, timestamp);
+
+                        let audit_button = InlineKeyboardButton::callback("🔍 AI 深度审计", format!("audit_{}", symbol));
+                        let keyboard = InlineKeyboardMarkup::new(vec![vec![audit_button]]);
+
+                        if let Some(&msg_id) = last_message_ids.get(&key) {
+                            match bot.edit_message_text(chat_id, msg_id, &final_text)
+                                .parse_mode(ParseMode::MarkdownV2)
+                                .reply_markup(keyboard.clone()) // 添加按钮
+                                .await
+                            {
+                                Ok(_) => {
+                                    info!("Updated [{}] with button in {:?}", symbol, chat_id);
+                                    update_success = true;
+                                }
+                                Err(e) => {
+                                    warn!("Edit failed for {}, Error: {}", symbol, e);
+                                }
+                            }
                         }
-                        _ = switch_rx.recv() => {
-                            info!("🔄 Switch signal received, restarting dispatcher...");
-                            let _ = shutdown_token.shutdown();
-                            let _ = dispatch_task.await;
-                            break;
-                        }
-                        result = &mut dispatch_task => {
-                            match result {
-                                Ok(_) => { info!("Dispatcher finished."); return Ok(()); }
-                                Err(e) => { error!("Dispatcher Task Panic: {:?}", e); break; }
+
+                        if !update_success {
+                            match bot.send_message(chat_id, &final_text)
+                                .parse_mode(ParseMode::MarkdownV2)
+                                .reply_markup(keyboard)
+                                .await
+                            {
+                                Ok(message) => {
+                                    info!("Sent new message for [{}] with button", symbol);
+                                    last_message_ids.insert(key, message.id);
+                                }
+                                Err(e) => {
+                                    error!("Failed to send message: {}", e);
+                                }
                             }
                         }
                     }
+                    _ = switch_rx.recv() => {
+                        info!("🔄 Switch signal received, restarting dispatcher...");
+                        let _ = shutdown_token.shutdown();
+                        let _ = dispatch_task.await;
+                        break;
+                    }
+                    result = &mut dispatch_task => {
+                        match result {
+                            Ok(_) => { info!("Dispatcher finished."); return Ok(()); }
+                            Err(e) => { error!("Dispatcher Task Panic: {:?}", e); break; }
+                        }
+                    }
+                }
             }
 
             app.switching.store(false, Ordering::SeqCst);
@@ -219,14 +257,12 @@ impl BotApp {
 
         bot.answer_callback_query(q.id).await?;
 
-        // 处理返回主菜单
         if data == "LST:BACK" {
             bot.delete_message(chat_id, msg_id).await?;
             Self::send_config_list(&bot, chat_id, manager).await?;
             return Ok(());
         }
 
-        // 1. 进入特定 Role 的周期选择界面
         if let Some(payload) = data.strip_prefix("INT:") {
             let parts: Vec<&str> = payload.split(':').collect();
             if parts.len() == 2 {

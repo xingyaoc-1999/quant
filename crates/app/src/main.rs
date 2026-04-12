@@ -20,6 +20,7 @@ use quant::analyzer::{
         gravity::GravityAnalyzer, regime::MarketRegimeAnalyzer,
         volatility::VolatilityEnvironmentAnalyzer, volume::VolumeStructureAnalyzer,
     },
+    signal::fakeout_detector::FakeoutDetector,
     AnalysisEngine, Analyzer, Config,
 };
 use ractor::{cast, Actor};
@@ -29,7 +30,7 @@ use service::{
     integrity::{context::FeatureContextManager, DataIntegrityManager},
 };
 use storage::postgres::Storage;
-use teloxide::types::ChatId;
+use teloxide::types::{ChatId, UserId};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -53,6 +54,7 @@ async fn main() -> Result<()> {
         Box::new(MarketRegimeAnalyzer),
         Box::new(GravityAnalyzer),
         Box::new(VolumeStructureAnalyzer),
+        Box::new(FakeoutDetector),
     ];
     let engine = Arc::new(AnalysisEngine::new(Config::default(), analyzers));
     let analysis_service = Arc::new(AnalysisService::new(engine.clone()));
@@ -68,7 +70,7 @@ async fn main() -> Result<()> {
     integrity.start();
     info!("Data integrity manager started");
 
-    let (tg_tx, mut tg_rx) = mpsc::channel(256);
+    let (tg_tx, tg_rx) = mpsc::channel(256);
     let (cmd_tx, mut cmd_rx) = mpsc::channel(100);
 
     let bot = BotApp::new(config.telegram.token.clone(), proxy_pool.clone()).await?;
@@ -93,7 +95,13 @@ async fn main() -> Result<()> {
         info!("Analysis notification worker started");
         while let Ok(event) = analysis_rx.recv().await {
             let msg = event.audit.to_markdown_v2();
-            let _ = tg_sender.send((msg, ChatId(1672093956))).await;
+            let _ = tg_sender
+                .send((
+                    msg,
+                    ChatId::from(UserId(5943539337)),
+                    event.audit.signal.symbol,
+                ))
+                .await;
         }
         info!("Analysis notification worker stopped");
     });
