@@ -24,7 +24,7 @@ pub struct GravityAnalyzer;
 impl GravityAnalyzer {
     #[inline]
     fn calculate_intensity(dist: f64, sigma: f64) -> f64 {
-        if sigma <= 1e-9 {
+        if sigma <= f64::EPSILON {
             return 0.0;
         }
         let gauss = (-(dist * dist) / (2.0 * sigma * sigma)).exp();
@@ -70,7 +70,6 @@ impl Analyzer for GravityAnalyzer {
             return Ok(AnalysisResult::new(self.kind(), "LEVEL_PROX_V4".into()).with_score(0.0));
         }
 
-        // 1. 环境因子获取
         let vol_p = ctx
             .get_cached::<f64>(ContextKey::VolPercentile)
             .unwrap_or(50.0);

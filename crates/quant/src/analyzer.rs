@@ -28,9 +28,6 @@ pub enum ContextKey {
     IsMomentumTsunami,
     OiPositionState,
 
-    // 空间偏见
-    MultLongSpace,
-    MultShortSpace,
     // 物理引擎数据
     SpaceGravityWells,
     GravitySigma,
@@ -183,13 +180,6 @@ impl AnalysisEngine {
             return FinalSignal::rejected_with_reports(ctx.symbol, &tag, results);
         }
 
-        let m_long_space = ctx
-            .get_cached::<f64>(ContextKey::MultLongSpace)
-            .unwrap_or(1.0);
-        let m_short_space = ctx
-            .get_cached::<f64>(ContextKey::MultShortSpace)
-            .unwrap_or(1.0);
-
         let mut total_weighted_score = 0.0;
         let mut total_weight = 0.0;
         let mut pos_weighted_sum = 0.0;
@@ -198,15 +188,7 @@ impl AnalysisEngine {
         for res in &results {
             let base_weight = self.config.weights.get(&res.kind).cloned().unwrap_or(1.0);
 
-            let space_bias = if res.score > 0.0 {
-                m_long_space
-            } else if res.score < 0.0 {
-                m_short_space
-            } else {
-                1.0
-            };
-
-            let final_weight = base_weight * space_bias * res.weight_multiplier;
+            let final_weight = base_weight * res.weight_multiplier;
 
             total_weighted_score += res.score * final_weight;
             total_weight += final_weight;

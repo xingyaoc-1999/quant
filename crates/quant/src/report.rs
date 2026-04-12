@@ -205,7 +205,7 @@ impl AnalysisAudit {
         lines.push("━━━━━━━━━━━━━━━".to_string());
 
         lines.push(format!(
-            "Score: `{score}` {status}  │  Vol: `{vol}%`  │  OI: `{oi}%`",
+            "S: `{score}` {status}  │  V:`{vol}%`  │  OI: `{oi}%`",
             score = fmt_raw(signal.net_score, 1),
             status = status_icon,
             vol = fmt_raw(snapshot.filter_vol_percentile, 0),
