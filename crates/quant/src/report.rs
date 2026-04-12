@@ -7,6 +7,7 @@ use chrono::Utc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
+use tracing::info;
 
 // ================= 审计快照 =================
 
@@ -169,8 +170,10 @@ impl AnalysisAudit {
 
         let dir_icon = if signal.net_score > 0.0 {
             "📈"
-        } else {
+        } else if signal.net_score < 0.0 {
             "📉"
+        } else {
+            "➖"
         };
         let status_icon = if signal.is_rejected { "❌" } else { "✅" };
 
@@ -180,7 +183,6 @@ impl AnalysisAudit {
             .map_or(false, |r| r.is_tsunami);
         let tsunami_tag = if is_tsunami { " 🌊 *TSUNAMI*" } else { "" };
 
-        // 重力井：图标 + 价格 · 强度（使用 · 避免转义问题）
         let wells_str = self
             .gravity_wells
             .iter()
