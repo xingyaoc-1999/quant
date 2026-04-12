@@ -299,10 +299,8 @@ impl Default for Config {
     fn default() -> Self {
         let mut weights = HashMap::new();
         weights.insert(AnalyzerKind::MarketRegime, 1.5);
-        weights.insert(AnalyzerKind::TrendStrength, 1.2);
         weights.insert(AnalyzerKind::Momentum, 1.0);
         weights.insert(AnalyzerKind::VolumeProfile, 1.0);
-        weights.insert(AnalyzerKind::Divergence, 0.8);
         weights.insert(AnalyzerKind::SupportResistance, 0.8);
         weights.insert(AnalyzerKind::Volatility, 0.5);
         weights.insert(AnalyzerKind::Fakeout, 1.2);

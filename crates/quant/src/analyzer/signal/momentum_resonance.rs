@@ -1,145 +1,110 @@
-use crate::analyzer::{
-    AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, AnalyzerStage, Config, MarketContext,
-    Role, SharedAnalysisState,
-};
-use crate::types::{MacdCross, MacdMomentum};
-use common::Interval;
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, MarketContext, Role};
+use crate::types::{DivergenceType, MacdCross, MacdMomentum};
 use serde_json::json;
-use std::borrow::Cow;
 
-pub struct ResonanceAnalyzer {
-    default_aging_threshold: i32,
-}
-
-impl ResonanceAnalyzer {
-    pub fn new() -> Self {
-        Self {
-            default_aging_threshold: 36,
-        }
-    }
-}
+pub struct ResonanceAnalyzer;
 
 impl Analyzer for ResonanceAnalyzer {
     fn name(&self) -> &'static str {
         "momentum_resonance"
     }
-    fn stage(&self) -> AnalyzerStage {
-        AnalyzerStage::Signal
-    }
+
     fn kind(&self) -> AnalyzerKind {
         AnalyzerKind::Momentum
     }
 
-    fn analyze(
-        &self,
-        ctx: &MarketContext,
-        _config: &Config,
-        shared: &SharedAnalysisState,
-    ) -> Result<AnalysisResult, AnalysisError> {
-        let trend_data = ctx.get_role(Role::Trend);
-        let feat = &trend_data.feature_set;
+    fn analyze(&self, ctx: &mut MarketContext) -> Result<AnalysisResult, AnalysisError> {
+        let entry_data = ctx.get_role(Role::Entry)?;
+        let feat = &entry_data.feature_set;
 
-        // --- 1. 核心信号判定 (Trigger Identification) ---
         let is_reclaim = feat.signals.ma20_reclaim.unwrap_or(false);
         let is_breakdown = feat.signals.ma20_breakdown.unwrap_or(false);
         let macd_cross = feat.signals.macd_cross;
 
-        // 确定基础方向
+        if !is_reclaim && !is_breakdown && macd_cross.is_none() {
+            return Ok(AnalysisResult::new(self.kind(), "RESONANCE_V2".into()).with_score(0.0));
+        }
+
         let direction = if is_reclaim || macd_cross == Some(MacdCross::Golden) {
-            1.0 // Long
-        } else if is_breakdown || macd_cross == Some(MacdCross::Death) {
-            -1.0 // Short
+            1.0
         } else {
-            // 无基础触发信号，直接返回
-            return Ok(AnalysisResult::default());
+            -1.0
         };
+        let is_long = direction > 0.0;
 
-        let mut description: Vec<Cow<'static, str>> = Vec::new();
-        let mut m_resonance: f64 = 1.0; // 核心：共振质量乘数
+        let mut description: Vec<String> = Vec::new();
+        let mut m_resonance: f64 = 1.0;
+        let mut extra_score: f64 = 0.0;
 
-        // --- 2. 基础得分分配 (Base Signal Strength) ---
-        // 价格收复均线 (Reclaim) 的权重通常高于单纯的 MACD 交叉
+        // --- 2. 基础得分 ---
         let base_score = if is_reclaim || is_breakdown {
-            description.push(Cow::Borrowed("TRIGGER:MA20_STRUCT_CHANGE"));
+            description.push("TRIGGER:MA20_RECLAIM".to_string());
             45.0
         } else {
-            description.push(Cow::Borrowed("TRIGGER:MACD_CROSS"));
+            description.push("TRIGGER:MACD_CROSS".to_string());
             30.0
         };
 
-        // --- 3. 趋势阶段评估 (Aging & Early Bird Logic) ---
         let slope_bars = feat.structure.ma20_slope_bars.abs();
-        let aging_threshold = match trend_data.interval {
-            Interval::M15 => 24,
-            Interval::H1 => 48,
-            _ => self.default_aging_threshold,
-        };
 
         if slope_bars < 12 {
-            // 趋势初期：高爆发潜力
             m_resonance *= 1.3;
-            description.push(Cow::Borrowed("QUALITY:EARLY_TREND_PREMIUM"));
-        } else if slope_bars > aging_threshold {
-            // 趋势老化：胜率衰减
-            let penalty = 1.0 - ((slope_bars - aging_threshold) as f64 / 30.0).min(0.7);
+            description.push("EARLY_TREND".to_string());
+        } else if slope_bars > 24 {
+            let penalty = 1.0 - ((slope_bars - 24) as f64 / 30.0).min(0.7);
             m_resonance *= penalty;
-            description.push(Cow::Owned(format!(
-                "QUALITY:AGING_TREND({:.0}%)",
-                penalty * 100.0
-            )));
+            description.push(format!("AGING({:.0}%)", penalty * 100.0));
         }
 
-        // --- 4. 动能一致性确认 (Momentum Confirmation) ---
         if let Some(macd_mom) = feat.signals.macd_momentum {
-            let mom_confirmed = (direction > 0.0 && macd_mom == MacdMomentum::Increasing)
-                || (direction < 0.0 && macd_mom == MacdMomentum::Decreasing);
-
+            let mom_confirmed = (is_long && macd_mom == MacdMomentum::Increasing)
+                || (!is_long && macd_mom == MacdMomentum::Decreasing);
             if mom_confirmed {
                 m_resonance *= 1.25;
-                description.push(Cow::Borrowed("CONFIRM:MOMENTUM_ALIGNED"));
+                description.push("MOMENTUM_OK".to_string());
             } else {
                 m_resonance *= 0.8;
-                description.push(Cow::Borrowed("WARNING:MOMENTUM_DIVERGENT"));
+                description.push("MOMENTUM_DIV".to_string());
             }
         }
 
-        // --- 5. 市场 Beta 相关性过滤 ---
-        if let Some(correlation) = feat.structure.correlation_with_global {
-            if correlation > 0.90 {
-                // 相关性过高说明只是随大盘波动，独立动能不足
-                m_resonance *= 0.75;
-                description.push(Cow::Borrowed("BETA:HIGH_MARKET_CORR"));
+        if let Some(div) = &feat.signals.macd_divergence {
+            match (div, is_long) {
+                (DivergenceType::Bearish, true) => {
+                    m_resonance *= 0.6;
+                    extra_score -= 30.0;
+                    description.push("BEAR_DIV:LONG_WEAK".to_string());
+                }
+                (DivergenceType::Bearish, false) => {
+                    m_resonance *= 1.3;
+                    extra_score += 20.0;
+                    description.push("BEAR_DIV:SHORT_OK".to_string());
+                }
+                (DivergenceType::Bullish, true) => {
+                    m_resonance *= 1.3;
+                    extra_score += 20.0;
+                    description.push("BULL_DIV:LONG_OK".to_string());
+                }
+                (DivergenceType::Bullish, false) => {
+                    m_resonance *= 0.6;
+                    extra_score -= 30.0;
+                    description.push("BULL_DIV:SHORT_WEAK".to_string());
+                }
             }
         }
 
-        // --- 6. 持久化核心 Action 和 维度乘数 ---
-        let action_str = if direction > 0.0 { "BUY" } else { "SELL" };
+        let final_score = base_score * direction + extra_score;
 
-        // 关键：写入全局 Action，供后续 DivergenceAnalyzer 等读取
-        shared
-            .data
-            .insert("signal:action".into(), json!(action_str));
-
-        // 关键：写入维度乘数 (使用 resonance_{action} 细分)
-        shared.data.insert(
-            format!("multiplier:signal:resonance_{}", action_str.to_lowercase()),
-            json!(m_resonance),
-        );
-
-        // --- 7. 返回结果 ---
-        Ok(AnalysisResult {
-            // Score 代表信号原始冲力
-            score: base_score * direction,
-            // Multiplier 代表该信号的置信度/质量
-            weight_multiplier: m_resonance,
-            description: description.join(" | "),
-            debug_data: json!({
-                "direction": action_str,
-                "m_resonance": m_resonance,
-                "slope_bars": slope_bars,
-                "base_score": base_score
-            }),
-            ..Default::default()
-        })
+        Ok(AnalysisResult::new(self.kind(), "RESONANCE_V2".into())
+            .with_score(final_score)
+            .with_mult(m_resonance)
+            .because(description.join(" | "))
+            .debug(json!({
+                  "direction": if is_long { "BUY" } else { "SELL" },
+                  "m_resonance": m_resonance,
+                  "slope_bars": slope_bars,
+                  "base_score": base_score,
+                  "extra_score": extra_score,
+            })))
     }
 }

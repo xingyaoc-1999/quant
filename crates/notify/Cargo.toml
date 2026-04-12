@@ -11,6 +11,7 @@ anyhow.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 teloxide.workspace=true
+futures-util.workspace = true
 common = { path = "../common" }
 service = { path = "../service" }
 quant = { path = "../quant" }

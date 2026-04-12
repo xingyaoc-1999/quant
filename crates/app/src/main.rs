@@ -20,7 +20,7 @@ use quant::analyzer::{
         gravity::GravityAnalyzer, regime::MarketRegimeAnalyzer,
         volatility::VolatilityEnvironmentAnalyzer, volume::VolumeStructureAnalyzer,
     },
-    signal::fakeout_detector::FakeoutDetector,
+    signal::{fakeout_detector::FakeoutDetector, momentum_resonance::ResonanceAnalyzer},
     AnalysisEngine, Analyzer, Config,
 };
 use ractor::{cast, Actor};
@@ -30,7 +30,6 @@ use service::{
     integrity::{context::FeatureContextManager, DataIntegrityManager},
 };
 use storage::postgres::Storage;
-use teloxide::types::{ChatId, UserId};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -54,6 +53,7 @@ async fn main() -> Result<()> {
         Box::new(MarketRegimeAnalyzer),
         Box::new(GravityAnalyzer),
         Box::new(VolumeStructureAnalyzer),
+        Box::new(ResonanceAnalyzer),
         Box::new(FakeoutDetector),
     ];
     let engine = Arc::new(AnalysisEngine::new(Config::default(), analyzers));
@@ -70,24 +70,22 @@ async fn main() -> Result<()> {
     integrity.start();
     info!("Data integrity manager started");
 
-    let (tg_tx, tg_rx) = mpsc::channel(256);
+    // 修改通道类型：只需发送 (String, Symbol)
+    let (tg_tx, tg_rx) = mpsc::channel::<(String, Symbol)>(256);
+    // 命令通道保持不变（如果需要）
     let (cmd_tx, mut cmd_rx) = mpsc::channel(100);
 
+    // 创建 BotApp（简化版仅需 proxy_pool 和 token）
     let bot = BotApp::new(config.telegram.token.clone(), proxy_pool.clone()).await?;
-    let bot_ctx = ctx_manager.clone();
-    let bot_archive = archive.clone();
-    let bot_storage = storage.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = bot
-            .run(cmd_tx, tg_rx, bot_ctx, bot_archive, bot_storage)
-            .await
-        {
+        if let Err(e) = bot.run(tg_rx).await {
             error!("Telegram bot error: {:?}", e);
         }
     });
     info!("Telegram bot started");
 
+    // 分析结果订阅转发至广播通道
     let mut analysis_rx = analysis_service.subscribe();
     let tg_sender = tg_tx.clone();
 
@@ -95,17 +93,13 @@ async fn main() -> Result<()> {
         info!("Analysis notification worker started");
         while let Ok(event) = analysis_rx.recv().await {
             let msg = event.audit.to_markdown_v2();
-            let _ = tg_sender
-                .send((
-                    msg,
-                    ChatId::from(UserId(5943539337)),
-                    event.audit.signal.symbol,
-                ))
-                .await;
+            // 只发送消息文本和 Symbol，广播由 BotApp 内部处理订阅者列表
+            let _ = tg_sender.send((msg, event.audit.signal.symbol)).await;
         }
         info!("Analysis notification worker stopped");
     });
 
+    // AI Agent 初始化
     let model = Model::openai(
         "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",
         "https://openrouter.ai/api/v1",
@@ -128,7 +122,7 @@ async fn main() -> Result<()> {
     .await?;
     info!("AI Agent started");
 
-    // ========== 命令路由 ==========
+    // 命令路由（将用户命令转发给 Agent）
     tokio::spawn(async move {
         while let Some((cmd, chat_id)) = cmd_rx.recv().await {
             info!("Received command: {} from {}", cmd, chat_id);

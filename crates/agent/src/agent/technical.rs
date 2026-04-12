@@ -21,7 +21,7 @@ pub struct TechnicalAgent;
 pub struct TechnicalAgentState {
     conversation_history: Vec<Message>,
     model: Model,
-    tx_out: Sender<(String, ChatId, Symbol)>,
+    tx_out: Sender<(String, Symbol)>,
     tool_set: ToolSet,
 }
 
@@ -44,7 +44,7 @@ impl TechnicalAgentState {
 
 pub struct TechnicalAgentArgs {
     pub model: Model,
-    pub tx_out: Sender<(String, ChatId, Symbol)>,
+    pub tx_out: Sender<(String, Symbol)>,
     pub tool_set: ToolSet,
 }
 

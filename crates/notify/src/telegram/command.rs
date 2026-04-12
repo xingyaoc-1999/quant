@@ -1,20 +1,20 @@
-use crate::telegram::BotApp;
-
-use service::integrity::context::FeatureContextManager;
+use crate::telegram::subscription::SubscriptionManager;
+use anyhow::Result;
+use common::Symbol;
 use std::sync::Arc;
-use teloxide::prelude::*;
-use teloxide::utils::command::BotCommands;
-use tokio::sync::mpsc::Sender;
-use tracing::error;
+use teloxide::{prelude::*, utils::command::BotCommands};
 
-#[derive(BotCommands, Clone, Debug)]
+#[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
 pub enum MyCommand {
-    Ai(String),
+    #[command(description = "开始使用")]
     Start,
+    #[command(description = "帮助信息")]
     Help,
-    #[command(description = "查看/快捷修改现有配置")]
-    List,
+    #[command(description = "订阅交易对")]
+    Subscribe { symbol: Symbol },
+    #[command(description = "取消订阅")]
+    Unsubscribe { symbol: Symbol },
 }
 
 impl MyCommand {
@@ -22,31 +22,33 @@ impl MyCommand {
         self,
         bot: &Bot,
         chat_id: ChatId,
-        sender: Sender<(String, ChatId)>,
-        manager: Arc<FeatureContextManager>,
-    ) -> ResponseResult<()> {
+
+        subs: Arc<SubscriptionManager>,
+    ) -> Result<()> {
         match self {
-            MyCommand::Ai(args) => {
-                if args.is_empty() {
-                    bot.send_message(chat_id, "请在 /ai 后输入文字。").await?;
+            Self::Start => {
+                bot.send_message(chat_id, "👋 欢迎！使用 /subscribe BTCUSDT 订阅信号。")
+                    .await?;
+            }
+            Self::Help => {
+                bot.send_message(chat_id, Self::descriptions().to_string())
+                    .await?;
+            }
+            Self::Subscribe { symbol } => {
+                subs.add(symbol, chat_id).await;
+                bot.send_message(chat_id, format!("✅ 已订阅 {}", symbol))
+                    .await?;
+            }
+            Self::Unsubscribe { symbol } => {
+                if subs.remove(&symbol, chat_id).await {
+                    bot.send_message(chat_id, format!("❌ 已取消订阅 {}", symbol))
+                        .await?;
                 } else {
-                    // 保留你原来的异步发送逻辑
-                    if let Err(err) = sender.send((args.clone(), chat_id)).await {
-                        error!("Channel send error: {:?}", err);
-                    }
-                    bot.send_message(chat_id, format!("🤖 AI 正在分析：{}...", args))
+                    bot.send_message(chat_id, format!("⚠️ 你未订阅 {}", symbol))
                         .await?;
                 }
             }
-            MyCommand::Start => {
-                bot.send_message(chat_id, "✅ 交易助手已就绪。\n/add <币种> - 新增\n/list - 查看与快速修改\n/ai - 智能分析").await?;
-            }
-            MyCommand::Help => {
-                bot.send_message(chat_id, "命令说明：\n/list - 显示所有已配置的币种，点击按钮直接修改周期\n/add BTCUSDT - 直接为 BTCUSDT 设置新角色\n/ai <文字> - 提交分析请求").await?;
-            }
-            MyCommand::List => {
-                BotApp::send_config_list(bot, chat_id, manager).await?;
-            }
+            _ => {}
         }
         Ok(())
     }

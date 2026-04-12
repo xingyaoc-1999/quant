@@ -107,12 +107,15 @@ impl Analyzer for GravityAnalyzer {
                 None => return,
             };
             let wear_mult = Self::calculate_wear_multiplier(hits, last_ts, now);
-            let final_strength =
+            let mut final_strength =
                 Self::calculate_intensity(dist_raw.abs(), sigma) * weight * wear_mult;
+
+            if ma_converging {
+                final_strength *= CONVERGENCE_BOOST;
+            }
             if final_strength < 0.02 {
                 return;
             }
-
             let current_level = last_price * (1.0 + dist_raw);
             let side = side_hint.unwrap_or(if dist_raw >= 0.0 {
                 WellSide::Resistance
@@ -203,14 +206,8 @@ impl Analyzer for GravityAnalyzer {
                 well.last_tested_below = prev.last_tested_below;
                 well.cross_ts = prev.cross_ts;
             }
-
-            // --- 此处补全 CONVERGENCE_BOOST 逻辑 ---
-            if ma_converging {
-                well.strength *= CONVERGENCE_BOOST;
-            }
         }
 
-        // 5. 海啸与磁力转换逻辑 (省略重复注释，保持与上一版逻辑一致)
         let is_tsunami = ctx
             .get_cached::<bool>(ContextKey::IsMomentumTsunami)
             .unwrap_or(false);

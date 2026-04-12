@@ -7,10 +7,13 @@ use quant::{
     types::{DerivativeSnapshot, OIData, RoleData, TakerFlowData},
 };
 use rayon::prelude::*;
-use std::collections::{HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     RwLock,
+};
+use std::{
+    collections::{HashMap, VecDeque},
+    f64,
 };
 use tracing::{info, warn};
 
@@ -119,7 +122,7 @@ impl RoleProcessor {
             .map(|&step| {
                 if let Some(idx) = len.checked_sub(step + offset) {
                     let past_val = self.oi_history[idx];
-                    if past_val > 1e-9 {
+                    if past_val > f64::EPSILON {
                         let diff = (cur_oi - past_val) / past_val;
                         if diff.is_finite() {
                             return diff;
@@ -183,7 +186,6 @@ impl FeatureContextManager {
         }
     }
 
-    /// 【写优化】实时数据更新：仅做数值累加和闭合判断，不触发 Peek 计算
     pub fn update_realtime_m1(&self, candle: Candle) {
         let symbol = candle.symbol;
         if symbol.is_btc() {
@@ -291,7 +293,6 @@ impl FeatureContextManager {
         let mut roles_guard = symbol_ctx.roles.write().expect("Lock poisoned");
 
         for (_, proc) in roles_guard.iter_mut() {
-            // 1. 处理种子数据
             if let Some(seeds) = interval_data_map.get(&proc.interval) {
                 let oi_lookup: HashMap<i64, &OpenInterestRecord> = oi_data_map
                     .and_then(|m| m.get(&proc.interval))

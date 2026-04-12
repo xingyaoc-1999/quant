@@ -254,10 +254,8 @@ impl RiskManager {
             }
         }
 
-        // 7) 融合信号总分 net_score（-100..100 映射到 -0.2..0.2）
         let normalized_net = (net_score / 100.0).clamp(-1.0, 1.0);
         conf_score += normalized_net * 0.15;
-        audit_tags.push(format!("NET_SCORE:{:.0}", net_score));
 
         // 最终置信度钳位 (0.05 ~ 0.95)
         conf_score = conf_score.clamp(0.05, 0.95);

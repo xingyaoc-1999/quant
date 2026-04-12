@@ -20,9 +20,9 @@ pub mod utils;
 pub enum Symbol {
     BTCUSDT,
     ETHUSDT,
-    // BNBUSDT,
-    // SOLUSDT,
-    // XRPUSDT,
+    BNBUSDT,
+    SOLUSDT,
+    XRPUSDT,
 }
 
 impl Symbol {
@@ -33,9 +33,9 @@ impl Symbol {
         let symbols = &[
             Self::BTCUSDT,
             Self::ETHUSDT,
-            // Self::BNBUSDT,
-            // Self::SOLUSDT,
-            // Self::XRPUSDT,
+            Self::BNBUSDT,
+            Self::SOLUSDT,
+            Self::XRPUSDT,
         ];
         symbols.to_vec()
     }
@@ -44,9 +44,9 @@ impl Symbol {
         match self {
             Symbol::BTCUSDT => "BTCUSDT",
             Symbol::ETHUSDT => "ETHUSDT",
-            // Symbol::BNBUSDT => "BNBUSDT",
-            // Symbol::SOLUSDT => "SOLUSDT",
-            // Symbol::XRPUSDT => "XRPUSDT",
+            Symbol::BNBUSDT => "BNBUSDT",
+            Symbol::SOLUSDT => "SOLUSDT",
+            Symbol::XRPUSDT => "XRPUSDT",
         }
     }
 }
@@ -58,9 +58,9 @@ impl FromStr for Symbol {
         match s.to_uppercase().as_str() {
             "BTCUSDT" | "BTC" => Ok(Symbol::BTCUSDT),
             "ETHUSDT" | "ETH" => Ok(Symbol::ETHUSDT),
-            // "BNBUSDT" | "BNB" => Ok(Symbol::BNBUSDT),
-            // "SOLUSDT" | "SOL" => Ok(Symbol::SOLUSDT),
-            // "XRPUSDT" | "XRP" => Ok(Symbol::XRPUSDT),
+            "BNBUSDT" | "BNB" => Ok(Symbol::BNBUSDT),
+            "SOLUSDT" | "SOL" => Ok(Symbol::SOLUSDT),
+            "XRPUSDT" | "XRP" => Ok(Symbol::XRPUSDT),
             _ => Err(format!("Unsupported symbol: {}", s)),
         }
     }

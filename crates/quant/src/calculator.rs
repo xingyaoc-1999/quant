@@ -4,7 +4,7 @@ use crate::types::{
 };
 use chrono::{TimeZone, Utc};
 use common::{Candle, Interval};
-use std::collections::VecDeque;
+use std::{collections::VecDeque, f64};
 use ta::{
     indicators::{
         AverageTrueRange, BollingerBands, ExponentialMovingAverage,
@@ -233,7 +233,6 @@ impl FeatureCalculator {
                 }
             }
 
-            // 支撑位
             if window_sup < self.current_sup.unwrap_or(f64::MAX) - f64::EPSILON {
                 self.current_sup = Some(window_sup);
                 self.sup_hit_count = 1;
@@ -254,7 +253,6 @@ impl FeatureCalculator {
         // 4. MACD 背离
         let macd_divergence = self.check_macd_divergence(candle.close, macd_out.histogram);
 
-        // 5. 更新滑窗（使用配置的窗口大小）
         Self::push_fixed_window(&mut self.volatility_history, bb_w, self.config.vol_window);
         Self::push_fixed_window(
             &mut self.recent_highs,
@@ -412,41 +410,36 @@ impl FeatureCalculator {
             recent_closes: rec_closes, // 新增字段
         }
     }
-
     fn calculate_correlation_stable(&self) -> Option<f64> {
         let n = self.recent_closes.len();
         if n < self.config.struct_window || n != self.recent_global_closes.len() {
             return None;
         }
 
-        let mut sum_x = 0.0;
-        let mut sum_y = 0.0;
-        let mut sum_x_sq = 0.0;
-        let mut sum_y_sq = 0.0;
-        let mut sum_xy = 0.0;
-
-        for (&x, &y) in self
+        let (sum_x, sum_y, sum_x_sq, sum_y_sq, sum_xy) = self
             .recent_closes
             .iter()
-            .zip(self.recent_global_closes.iter())
-        {
-            sum_x += x;
-            sum_y += y;
-            sum_x_sq += x * x;
-            sum_y_sq += y * y;
-            sum_xy += x * y;
-        }
+            .zip(&self.recent_global_closes)
+            .fold((0.0, 0.0, 0.0, 0.0, 0.0), |acc, (&x, &y)| {
+                (
+                    acc.0 + x,
+                    acc.1 + y,
+                    acc.2 + x * x,
+                    acc.3 + y * y,
+                    acc.4 + x * y,
+                )
+            });
 
-        let nf = n as f64;
-        let num = nf * sum_xy - sum_x * sum_y;
-        let den = ((nf * sum_x_sq - sum_x.powi(2)).max(0.0)
-            * (nf * sum_y_sq - sum_y.powi(2)).max(0.0))
+        let n_f64 = n as f64;
+        let numerator = n_f64 * sum_xy - sum_x * sum_y;
+        let denominator = ((n_f64 * sum_x_sq - sum_x.powi(2)).max(0.0)
+            * (n_f64 * sum_y_sq - sum_y.powi(2)).max(0.0))
         .sqrt();
 
-        if den < 1e-9 {
+        if denominator < f64::EPSILON {
             Some(0.0)
         } else {
-            Some(num / den)
+            Some(numerator / denominator)
         }
     }
 
@@ -582,13 +575,6 @@ impl FeatureCalculator {
             queue.pop_front();
         }
         queue.push_back(value);
-    }
-
-    #[inline(always)]
-    fn shift_history(history: &mut [Option<f64>; 3], new_val: Option<f64>) {
-        history[2] = history[1];
-        history[1] = history[0];
-        history[0] = new_val;
     }
 
     pub fn peek(

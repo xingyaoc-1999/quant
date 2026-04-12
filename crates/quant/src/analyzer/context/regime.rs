@@ -80,7 +80,6 @@ impl Analyzer for MarketRegimeAnalyzer {
             )
         };
 
-        // 初始化结果，写入基础状态描述
         let mut res = AnalysisResult::new(self.kind(), "REGIME_CORE_V2".into())
             .because(format!("结构: {:?} | 波动分位: {:.1}%", structure, vol_p));
 
@@ -182,7 +181,6 @@ impl Analyzer for MarketRegimeAnalyzer {
             }
         }
 
-        // 4. 博弈面修正 (动态海啸)
         let tsunami_oi_threshold =
             TSUNAMI_BASE_OI_DELTA * (1.0 + (vol_p - 50.0) / 200.0).clamp(0.8, 1.5);
 

@@ -1,21 +1,19 @@
 mod command;
 mod menu;
+mod subscription;
 
 use anyhow::{Context, Result};
-use api_client::http::binance::ArchiveProvider;
 use common::{
     utils::{retry_with_proxy_rotation_cooled, CooledProxyPool, ShouldRotate},
-    Interval, Symbol,
+    Symbol,
 };
-use quant::analyzer::Role;
+use futures_util::future::join_all;
 use reqwest::Proxy;
-use service::integrity::context::FeatureContextManager;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::{collections::HashMap, str::FromStr};
-use storage::postgres::Storage;
 use teloxide::{
     dispatching::{Dispatcher, HandlerExt, UpdateFilterExt},
     prelude::*,
@@ -24,13 +22,14 @@ use teloxide::{
         Update,
     },
     update_listeners,
-    utils::{command::BotCommands, markdown::escape},
+    utils::command::BotCommands,
     Bot, RequestError,
 };
-use tokio::sync::mpsc::{self, Receiver, Sender};
-use tracing::{error, info, warn};
+use tokio::sync::mpsc::{self, Receiver};
+use tokio::sync::Mutex as TokioMutex;
+use tracing::{debug, error, info, warn};
 
-use crate::telegram::command::MyCommand;
+use crate::telegram::{command::MyCommand, subscription::SubscriptionManager};
 
 struct BotRotator;
 impl ShouldRotate<RequestError> for BotRotator {
@@ -43,14 +42,24 @@ pub struct BotApp {
     proxy_pool: Arc<CooledProxyPool>,
     token: String,
     switching: Arc<AtomicBool>,
+    subscriptions: Arc<SubscriptionManager>,
 }
 
 impl BotApp {
     pub async fn new(token: String, proxy_pool: Arc<CooledProxyPool>) -> Result<Self> {
+        let subscriptions = Arc::new(SubscriptionManager::new());
+
+        let all_symbols = Symbol::all();
+        for symbol in all_symbols {
+            subscriptions.add(symbol, ChatId(5943539337)).await;
+            subscriptions.add(symbol, ChatId(454287823)).await;
+        }
+
         Ok(Self {
             proxy_pool,
             token,
             switching: Arc::new(AtomicBool::new(false)),
+            subscriptions,
         })
     }
 
@@ -77,14 +86,7 @@ impl BotApp {
         retry_with_proxy_rotation_cooled(&self.proxy_pool, request_fn, BotRotator).await
     }
 
-    pub async fn run(
-        &self,
-        tx_in: Sender<(String, ChatId)>,
-        mut rx_in: Receiver<(String, ChatId, Symbol)>,
-        manager: Arc<FeatureContextManager>,
-        archive_provider: Arc<ArchiveProvider>,
-        storage: Arc<Storage>,
-    ) -> Result<()> {
+    pub async fn run(&self, mut rx_in: Receiver<(String, Symbol)>) -> Result<()> {
         let app = Arc::new(self);
 
         loop {
@@ -98,7 +100,6 @@ impl BotApp {
                 }
             };
 
-            // 同步指令菜单
             let _ = bot.set_my_commands(MyCommand::bot_commands()).await;
             info!("[Bot] Telegram commands synced to server.");
 
@@ -123,21 +124,16 @@ impl BotApp {
                 }
             });
 
-            let manager_for_cmd = manager.clone();
-            let tx_in_msg = tx_in.clone();
-            let storage = storage.clone();
-            let manager_for_cb = manager.clone();
-            let provider_for_cb = archive_provider.clone();
+            let subs_for_cmd = Arc::clone(&app.subscriptions);
+
             let handler = dptree::entry()
                 .branch(
                     Update::filter_message()
                         .filter_command::<MyCommand>()
                         .endpoint(move |bot: Bot, msg: Message, cmd: MyCommand| {
-                            let manager = manager_for_cmd.clone();
-                            let tx_in = tx_in_msg.clone();
+                            let subs = Arc::clone(&subs_for_cmd);
                             async move {
-                                if let Err(e) = cmd.handle(&bot, msg.chat.id, tx_in, manager).await
-                                {
+                                if let Err(e) = cmd.handle(&bot, msg.chat.id, subs).await {
                                     error!("❌ [Command Error] {:#}", e);
                                 }
                                 Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
@@ -145,21 +141,13 @@ impl BotApp {
                         }),
                 )
                 .branch(Update::filter_callback_query().endpoint(
-                    move |bot: Bot, q: CallbackQuery| {
-                        let manager = manager_for_cb.clone();
-                        let storage = storage.clone();
-                        let provider = provider_for_cb.clone();
-                        async move {
-                            if let Err(e) =
-                                BotApp::handle_callback_query(bot, q, manager, provider, storage)
-                                    .await
-                            {
-                                error!("❌ [Callback Error] {:#}", e);
-                            }
-                            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-                        }
+                    move |bot: Bot, q: CallbackQuery| async move {
+                        let _ = bot;
+                        let _ = q;
+                        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
                     },
                 ));
+
             let mut dispatcher = Dispatcher::builder(bot.clone(), handler)
                 .enable_ctrlc_handler()
                 .build();
@@ -175,51 +163,76 @@ impl BotApp {
                     )
                     .await
             });
-            let mut last_message_ids: HashMap<(Symbol, ChatId), MessageId> = HashMap::new();
+
+            let last_message_ids = Arc::new(TokioMutex::new(
+                HashMap::<(Symbol, ChatId), MessageId>::new(),
+            ));
+
             loop {
                 tokio::select! {
-                    Some((text, chat_id,symbol)) = rx_in.recv() => {
-
-                        let key = (symbol.clone(), chat_id);
-                        let mut update_success = false;
-
-                        let now = chrono::Local::now();
-                        let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
-                        let final_text = format!("{}\n\n🕒 最后更新: `{}`", text, timestamp);
-
-                        let audit_button = InlineKeyboardButton::callback("🔍 AI 深度审计", format!("audit_{}", symbol));
-                        let keyboard = InlineKeyboardMarkup::new(vec![vec![audit_button]]);
-
-                        if let Some(&msg_id) = last_message_ids.get(&key) {
-                            match bot.edit_message_text(chat_id, msg_id, &final_text)
-                                .parse_mode(ParseMode::MarkdownV2)
-                                .reply_markup(keyboard.clone()) // 添加按钮
-                                .await
-                            {
-                                Ok(_) => {
-                                    info!("Updated [{}] with button in {:?}", symbol, chat_id);
-                                    update_success = true;
-                                }
-                                Err(e) => {
-                                    warn!("Edit failed for {}, Error: {}", symbol, e);
-                                }
-                            }
+                                  Some((text, symbol)) = rx_in.recv() => {
+                        let subscribers = app.subscriptions.get_subscribers(&symbol).await;
+                        if subscribers.is_empty() {
+                            continue;
                         }
 
-                        if !update_success {
-                            match bot.send_message(chat_id, &final_text)
-                                .parse_mode(ParseMode::MarkdownV2)
-                                .reply_markup(keyboard)
-                                .await
-                            {
-                                Ok(message) => {
-                                    info!("Sent new message for [{}] with button", symbol);
-                                    last_message_ids.insert(key, message.id);
+
+                        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+                        let final_text = format!("{}\n\n🕒 最后更新: `{}`", text, timestamp);
+
+                        let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                            InlineKeyboardButton::callback("🔍 AI 深度审计", format!("audit_{}", symbol))
+                        ]]);
+
+                        for chat_id in subscribers {
+                            let bot = bot.clone();
+                            let text = final_text.clone();
+                            let kb = keyboard.clone();
+                            let storage = Arc::clone(&last_message_ids);
+                            let sym = symbol.clone();
+
+                            tokio::spawn(async move {
+                                let key = (sym, chat_id);
+
+                                // 1. Get old_id and immediately drop the lock
+                                let old_id = storage.lock().await.get(&key).copied();
+
+                                // 2. Logic Flow: Try Edit -> (If deleted) Clear Cache -> (If no id) Send New
+                                if let Some(msg_id) = old_id {
+                                    match bot.edit_message_text(chat_id, msg_id, &text)
+                                        .parse_mode(ParseMode::MarkdownV2)
+                                        .reply_markup(kb.clone())
+                                        .await
+                                    {
+                                        Ok(_) => return, // Success: Exit task
+                                        Err(RequestError::Api(teloxide::ApiError::MessageNotModified)) => return, // No change: Exit task
+                                        Err(RequestError::Api(teloxide::ApiError::MessageToEditNotFound)) => {
+                                            // Message was deleted: Clear cache and CONTINUE to send_message
+                                            info!("Message for [{}] not found (deleted), will resend.", key.0);
+                                            storage.lock().await.remove(&key);
+                                        }
+                                        Err(e) => {
+                                            error!("Edit failed for [{}]: {:?}", key.0, e);
+                                            return; // Critical error: Exit task
+                                        }
+                                    }
                                 }
-                                Err(e) => {
-                                    error!("Failed to send message: {}", e);
+
+                                // 3. Send new message:
+                                // This part runs IF old_id was None OR the edit failed with MessageToEditNotFound
+                                match bot.send_message(chat_id, &text)
+                                    .parse_mode(ParseMode::MarkdownV2)
+                                    .reply_markup(kb)
+                                    .await
+                                {
+                                    Ok(msg) => {
+                                        storage.lock().await.insert(key, msg.id);
+                                        info!("Resent/Pushed new message for [{}].", key.0);
+                                    }
+                                    Err(e) => error!("Send failed for [{}]: {:?}", key.0, e),
                                 }
-                            }
+                            });
                         }
                     }
                     _ = switch_rx.recv() => {
@@ -240,129 +253,6 @@ impl BotApp {
             app.switching.store(false, Ordering::SeqCst);
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
-    }
-    async fn handle_callback_query(
-        bot: Bot,
-        q: CallbackQuery,
-        manager: Arc<FeatureContextManager>,
-        archive_provider: Arc<ArchiveProvider>,
-        storage: Arc<Storage>,
-    ) -> Result<()> {
-        let data = q.data.as_ref().context("Callback data is missing")?;
-        let (chat_id, msg_id) = q
-            .message
-            .as_ref()
-            .map(|m| (m.chat().id, m.id()))
-            .context("Callback message is missing or inaccessible")?;
-
-        bot.answer_callback_query(q.id).await?;
-
-        if data == "LST:BACK" {
-            bot.delete_message(chat_id, msg_id).await?;
-            Self::send_config_list(&bot, chat_id, manager).await?;
-            return Ok(());
-        }
-
-        if let Some(payload) = data.strip_prefix("INT:") {
-            let parts: Vec<&str> = payload.split(':').collect();
-            if parts.len() == 2 {
-                let (symbol, role) = (parts[0], parts[1]);
-                bot.edit_message_text(
-                    chat_id,
-                    msg_id,
-                    format!("⚙️ 设置 *{}* 的 *{}* 周期:", symbol, role),
-                )
-                .parse_mode(ParseMode::MarkdownV2)
-                .reply_markup(Self::make_interval_keyboard(symbol, role))
-                .await?;
-            }
-        } else if let Some(payload) = data.strip_prefix("SET:") {
-            let parts: Vec<&str> = payload.split(':').collect();
-            if parts.len() == 3 {
-                let (s_str, r_str, i_str) = (parts[0], parts[1], parts[2]);
-
-                let symbol = Symbol::from_str(s_str)
-                    .map_err(anyhow::Error::msg)
-                    .context("Invalid symbol")?;
-
-                let role = r_str
-                    .parse::<Role>()
-                    .map_err(anyhow::Error::msg)
-                    .context("Invalid role")?;
-
-                let interval = Interval::from_str(i_str)
-                    .map_err(anyhow::Error::msg)
-                    .context("Invalid interval")?;
-
-                let mut config = HashMap::new();
-                config.insert(role, interval);
-                let changed_roles = manager.update_symbol_config(symbol, config);
-
-                if !changed_roles.is_empty() {
-                    for (changed_role, target_interval) in changed_roles {
-                        let m_clone = manager.clone();
-                        let s_clone = storage.clone();
-                        let p_clone = archive_provider.clone();
-                        let symbol_clone = symbol;
-
-                        tokio::spawn(async move {
-                            info!(
-                                "🚀 [Warmup] Starting: {} | {} -> {:?}",
-                                symbol_clone, changed_role, target_interval
-                            );
-
-                            let res: anyhow::Result<()> = async {
-                // 1. 必填数据：只 try_join K 线数据，如果 K 线都拿不到，那预热没法做
-                let (seeds_res, m1_res) = tokio::try_join!(
-                    s_clone.get_latest_candles(&symbol_clone, target_interval, 200),
-                    s_clone.get_latest_candles(&symbol_clone, Interval::M1, 1000),
-                )?;
-
-                // 2. 选填数据：单独抓取 OI，失败仅打印警告，不中断流程
-                let oi_res = p_clone.fetch_open_interest_hist(symbol_clone, target_interval).await;
-
-                // 3. 组装 Seeds Map
-                let mut seeds_map = HashMap::new();
-                seeds_map.insert(target_interval, seeds_res);
-                seeds_map.insert(Interval::M1, m1_res);
-
-                // 4. 组装 OI Map (关键：适配 Option 签名)
-                let mut oi_map = HashMap::new();
-                let oi_param = match oi_res {
-                    Ok(data) => {
-                        oi_map.insert(target_interval, data);
-                        Some(&oi_map) // 抓取成功，传数据
-                    }
-                    Err(e) => {
-                        warn!("⚠️ [Warmup] OI fetch failed for {}, proceeding with K-lines only: {:?}", symbol_clone, e);
-                        None // 抓取失败或没数据，传 None
-                    }
-                };
-
-                // 5. 执行预热 (现在的实现即便 oi_param 是 None 也会算出指标)
-                m_clone.warmup_single_symbol(symbol_clone, &seeds_map, oi_param);
-
-                info!("✅ [Warmup] Success: {}'s {} updated", symbol_clone, changed_role);
-                Ok(())
-            }
-            .await;
-
-                            if let Err(e) = res {
-                                error!(
-                                    "❌ [Warmup] Critical error for {} {}: {:?}",
-                                    symbol_clone, changed_role, e
-                                );
-                            }
-                        });
-                    }
-                }
-
-                bot.delete_message(chat_id, msg_id).await?;
-                Self::send_config_list(&bot, chat_id, manager).await?;
-            }
-        }
-
-        Ok(())
     }
 
     pub fn is_network_error(e: &RequestError) -> bool {

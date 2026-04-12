@@ -6,10 +6,7 @@ use crate::{
 use chrono::Utc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::fmt::Write;
-use tracing::info;
-
-// ================= 审计快照 =================
+use tracing::{debug, info};
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct MarketSnapshot {
@@ -23,8 +20,6 @@ pub struct MarketSnapshot {
     pub entry_taker_ratio: f64,
 }
 
-// ================= 完整审计记录 =================
-
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct AnalysisAudit {
     pub signal: FinalSignal,
@@ -34,7 +29,6 @@ pub struct AnalysisAudit {
 }
 
 impl AnalysisAudit {
-    /// 从市场上下文构建审计快照（不包含风险评估）
     pub fn build(ctx: &MarketContext, signal: FinalSignal) -> Self {
         let trend = ctx.get_role(Role::Trend).ok();
         let filter = ctx.get_role(Role::Filter).ok();
@@ -98,7 +92,6 @@ impl AnalysisAudit {
         }
     }
 
-    /// 附加风险评估（需在 build 之后调用）
     pub fn attach_risk(
         &mut self,
         ctx: &MarketContext,
@@ -148,6 +141,7 @@ impl AnalysisAudit {
     }
 
     pub fn to_markdown_v2(&self) -> String {
+        debug!(?self);
         let signal = &self.signal;
         let snapshot = &self.snapshot;
 
@@ -194,7 +188,7 @@ impl AnalysisAudit {
                     WellSide::Resistance => "🔴",
                     WellSide::Magnet => "🧲",
                 };
-                format!("{}{}·{}", icon, fmt_esc(w.level, 1), fmt_esc(w.strength, 1))
+                format!("{}{}·{}", icon, fmt_esc(w.level, 2), fmt_esc(w.strength, 1))
             })
             .collect::<Vec<_>>()
             .join("  ");
@@ -242,7 +236,6 @@ impl AnalysisAudit {
             ));
         }
 
-        // 成交量效率
         if let Some(eff) = efficiency {
             let eff_pct = (eff * 100.0).round() as i32;
             let eff_icon = if eff > 0.6 { "⚡" } else { "🐢" };
