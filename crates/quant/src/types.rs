@@ -89,6 +89,7 @@ pub struct TechnicalIndicators {
     pub macd: Option<f64>,
     pub macd_signal: Option<f64>,
     pub macd_histogram: Option<f64>,
+    pub atr_median_20: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]

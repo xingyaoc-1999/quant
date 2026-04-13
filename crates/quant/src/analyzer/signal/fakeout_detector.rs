@@ -6,7 +6,7 @@ use serde_json::json;
 
 // ========== 常量配置 ==========
 /// 突破阈值（ATR倍数），超过此幅度才算有效刺破
-const BREACH_ATR_MULT: f64 = 0.5;
+const BREACH_ATR_MULT: f64 = 0.25;
 /// 假突破判定：收盘价回到井内的距离阈值（相对于井水平）
 const CLOSE_RETURN_THRESHOLD: f64 = 0.001; // 0.1%
 /// 假突破基础扣分（乘以井强度）
@@ -89,7 +89,7 @@ impl Analyzer for FakeoutDetector {
 
     fn analyze(&self, ctx: &mut MarketContext) -> Result<AnalysisResult, AnalysisError> {
         // 1. 获取趋势角色特征集
-        let trend_role = ctx.get_role(Role::Trend)?;
+        let trend_role = ctx.get_role(Role::Entry)?;
         let fs = &trend_role.feature_set;
         let price_action = &fs.price_action;
         let current_high = price_action.high;

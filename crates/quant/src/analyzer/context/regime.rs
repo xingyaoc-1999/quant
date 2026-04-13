@@ -26,6 +26,11 @@ const TSUNAMI_BASE_TAKER_RATIO: f64 = 0.55;
 
 const SLOPE_MOMENTUM_BOOST: f64 = 0.15;
 const SLOPE_BARS_THRESHOLD: i32 = 3;
+
+// 乘数上限（防止过度叠加）
+const MAX_MULT_CAP: f64 = 3.0;
+// 缺少期货数据时 taker_ratio 的权重折扣
+const TAKER_WEIGHT_NO_FUTURES: f64 = 0.6;
 // =============================================
 
 pub struct MarketRegimeAnalyzer;
@@ -91,7 +96,16 @@ impl Analyzer for MarketRegimeAnalyzer {
         match structure {
             TrendStructure::StrongBullish | TrendStructure::StrongBearish => {
                 let is_bull = matches!(structure, TrendStructure::StrongBullish);
-                base_score = if is_bull { 70.0 } else { -70.0 };
+                // 改进1：基础得分结合斜率强度与持续时间
+                let slope_factor = if let Some(slope) = ma20_slope {
+                    let slope_abs = slope.abs().min(5.0);
+                    // 持续时间越长，斜率影响越大
+                    let bars_factor = (ma20_slope_bars as f64 / 10.0).min(1.5);
+                    1.0 + slope_abs * 0.1 * bars_factor
+                } else {
+                    1.0
+                };
+                base_score = (if is_bull { 70.0 } else { -70.0 }) * slope_factor;
                 m_regime = MULT_REGIME_TREND;
 
                 // RSI 动量评估
@@ -121,7 +135,7 @@ impl Analyzer for MarketRegimeAnalyzer {
                     }
                 }
 
-                // MA20 斜率动量增强
+                // MA20 斜率动量增强（与趋势方向一致时）
                 if let Some(slope) = ma20_slope {
                     let slope_aligned = (is_bull && slope > 0.0) || (!is_bull && slope < 0.0);
                     if slope_aligned {
@@ -131,7 +145,9 @@ impl Analyzer for MarketRegimeAnalyzer {
                         } else {
                             1.0
                         };
-                        m_momentum *= 1.0 + slope_strength * SLOPE_MOMENTUM_BOOST * bars_factor;
+                        // 限制增强幅度不超过 50%
+                        let boost = 1.0 + slope_strength * SLOPE_MOMENTUM_BOOST * bars_factor;
+                        m_momentum *= boost.min(1.5);
                         res = res.because(format!("MA20斜率共振: {:.2}", slope));
                     }
                 }
@@ -170,7 +186,13 @@ impl Analyzer for MarketRegimeAnalyzer {
             }
             TrendStructure::Bullish | TrendStructure::Bearish => {
                 let is_bull = matches!(structure, TrendStructure::Bullish);
-                base_score = if is_bull { 30.0 } else { -30.0 };
+                let slope_factor = if let Some(slope) = ma20_slope {
+                    let slope_abs = slope.abs().min(3.0);
+                    1.0 + slope_abs * 0.08
+                } else {
+                    1.0
+                };
+                base_score = (if is_bull { 30.0 } else { -30.0 }) * slope_factor;
 
                 if let Some(slope) = ma20_slope {
                     let slope_aligned = (is_bull && slope > 0.0) || (!is_bull && slope < 0.0);
@@ -181,12 +203,20 @@ impl Analyzer for MarketRegimeAnalyzer {
             }
         }
 
+        // 改进2：乘数上限控制（避免叠加失控）
+        m_momentum = m_momentum.clamp(0.2, 2.5);
+
         let tsunami_oi_threshold =
             TSUNAMI_BASE_OI_DELTA * (1.0 + (vol_p - 50.0) / 200.0).clamp(0.8, 1.5);
 
         let (is_tsunami, oi_state) = match oi_delta {
             Some(delta) => {
                 let price_pct = (close_price - open_price) / open_price.max(0.0001);
+                // 注意：OIPositionState::determine 实现应符合：
+                // 价格涨 + OI增 → LongBuildUp
+                // 价格涨 + OI减 → ShortCovering
+                // 价格跌 + OI增 → ShortBuildUp
+                // 价格跌 + OI减 → LongLiquidation
                 let state = OIPositionState::determine(price_pct, delta);
 
                 let tsunami = matches!(state, OIPositionState::LongBuildUp)
@@ -206,41 +236,47 @@ impl Analyzer for MarketRegimeAnalyzer {
             m_momentum *= 1.8;
         }
 
+        // 改进3：Taker Game 乘数结合数据源置信度
         let m_game = match taker_ratio {
-            Some(pct) => match structure {
-                TrendStructure::StrongBullish | TrendStructure::Bullish => {
-                    if pct > TAKER_TREND_BULL_MIN {
-                        1.0 + (pct - 0.5) * GAME_TAKER_SMOOTH
-                    } else if pct < 0.45 {
-                        0.6
-                    } else {
-                        1.0
+            Some(pct) => {
+                let base_game: f64 = match structure {
+                    TrendStructure::StrongBullish | TrendStructure::Bullish => {
+                        if pct > TAKER_TREND_BULL_MIN {
+                            1.0 + (pct - 0.5) * GAME_TAKER_SMOOTH
+                        } else if pct < 0.45 {
+                            0.6
+                        } else {
+                            1.0
+                        }
                     }
-                }
-                TrendStructure::StrongBearish | TrendStructure::Bearish => {
-                    if pct < TAKER_TREND_BEAR_MAX {
-                        1.0 + (0.5 - pct) * GAME_TAKER_SMOOTH
-                    } else if pct > 0.55 {
-                        0.6
-                    } else {
-                        1.0
+                    TrendStructure::StrongBearish | TrendStructure::Bearish => {
+                        if pct < TAKER_TREND_BEAR_MAX {
+                            1.0 + (0.5 - pct) * GAME_TAKER_SMOOTH
+                        } else if pct > 0.55 {
+                            0.6
+                        } else {
+                            1.0
+                        }
                     }
-                }
-                TrendStructure::Range => {
-                    if pct > 0.62 || pct < 0.38 {
-                        1.3
-                    } else {
-                        0.8
+                    TrendStructure::Range => {
+                        if pct > 0.62 || pct < 0.38 {
+                            1.3
+                        } else {
+                            0.8
+                        }
                     }
-                }
-            },
+                };
+
+                base_game.clamp(0.5, 2.0)
+            }
             None => 1.0,
         };
 
         let m_mtf = if mtf_aligned { 1.0 } else { 0.6 };
 
         let raw_mult = m_regime + m_momentum + m_game + m_mtf - 3.0;
-        let final_mult = raw_mult.clamp(0.1, 5.0);
+        // 改进2：最终乘数上限更严格
+        let final_mult = raw_mult.clamp(0.2, MAX_MULT_CAP);
 
         ctx.set_cached(ContextKey::RegimeStructure, structure);
 

@@ -47,11 +47,14 @@ impl VolumeStructureAnalyzer {
         let total_travel = (p_action.high - p_action.low).max(f64::EPSILON);
 
         let body_ratio = body_spread / total_travel;
-        if body_ratio < 0.1 {
-            return 0.0;
-        }
 
-        let compactness = body_ratio.max(MIN_COMPACTNESS);
+        // 修改点：不再直接返回
+        let compactness = if body_ratio < 0.1 {
+            0.1 // 十字星最低效率值
+        } else {
+            body_ratio.max(MIN_COMPACTNESS)
+        };
+
         let normalized_move = if atr > f64::EPSILON {
             body_spread / atr
         } else {
@@ -59,7 +62,6 @@ impl VolumeStructureAnalyzer {
         };
         (normalized_move / rvol * compactness).min(5.0)
     }
-
     fn compute_vol_factor(vol_p: f64) -> f64 {
         (vol_p / 50.0).clamp(VOL_FACTOR_MIN, VOL_FACTOR_MAX)
     }
@@ -148,15 +150,18 @@ impl Analyzer for VolumeStructureAnalyzer {
             .iter()
             .filter(|w| w.is_active && w.side == target_side)
             .min_by(|a, b| {
-                let score_a = a.distance_pct.abs() / (a.strength + 0.1);
-                let score_b = b.distance_pct.abs() / (b.strength + 0.1);
+                let dist_a = (a.level - last_price).abs() / last_price;
+                let dist_b = (b.level - last_price).abs() / last_price;
+                let score_a = dist_a / (a.strength + 0.1);
+                let score_b = dist_b / (b.strength + 0.1);
                 score_a
                     .partial_cmp(&score_b)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
         if let Some(well) = active_well {
-            let in_critical_zone = well.distance_pct.abs() < sigma * 1.5;
+            let dist_pct = (well.level - last_price).abs() / last_price;
+            let in_critical_zone = dist_pct < sigma * 1.5;
 
             if in_critical_zone {
                 match well.side {

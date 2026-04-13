@@ -22,17 +22,95 @@ impl TradeDirection {
 // ================= 风控常量 =================
 
 const RR_MIN_ACCEPTABLE: f64 = 2.2;
-const MA20_EXTREME_MULT: f64 = 3.5; // 均线乖离限制系数
-const ATR_SL_BUFFERS: [f64; 3] = [0.8, 1.5, 2.2]; // 止损阶梯
-const BREAKOUT_CONFIRM_GATE: f64 = 0.0020; // 突破确认阈值 (0.2%)
-const MAX_STRENGTH_CAP: f64 = 3.5; // 井位强度上限基准
+const MA20_EXTREME_MULT: f64 = 3.5;
+const MA20_PENALTY_COEFF: f64 = 0.10;
+const ATR_SL_BUFFERS: [f64; 3] = [0.8, 1.5, 2.2];
+const MIN_SL_ATR_MULT: f64 = 0.5;
+const BREAKOUT_CONFIRM_GATE: f64 = 0.0020;
+const MAX_STRENGTH_CAP: f64 = 3.5;
 
-// 仓位管理常量
-const BASE_SIZE_MAX: f64 = 0.8; // 基础仓位上限
-const MIN_BASE_SIZE: f64 = 0.15; // 基础仓位下限（原 0.3 降低，更保守）
-const CONFIDENCE_BASE: f64 = 0.5; // 置信度初始基准
-const MIN_POSITION_SIZE: f64 = 0.05; // 最低允许仓位 (5%)
-const MAX_POSITION_SIZE: f64 = 1.0; // 最高仓位 (100%)
+const BASE_SIZE_MAX: f64 = 0.8;
+const MIN_BASE_SIZE: f64 = 0.15;
+const CONFIDENCE_PRIOR: f64 = 0.5; // 贝叶斯先验概率
+const MIN_POSITION_SIZE: f64 = 0.05;
+const MAX_POSITION_SIZE: f64 = 1.0;
+
+const MULT_MIN: f64 = 0.4;
+const MULT_MAX: f64 = 1.6;
+
+const TSUNAMI_ALLOCATION: [f64; 3] = [0.2, 0.3, 0.5];
+
+// ================= 贝叶斯似然比定义 =================
+
+/// 趋势结构因子的似然比（方向正确时）
+const LR_TREND_STRONG: f64 = 2.5; // 强趋势对齐：显著提升
+const LR_TREND_WEAK: f64 = 0.6; // 趋势弱/逆势：适当降低
+
+/// Taker 主动流向对齐时的似然比
+const LR_TAKER_ALIGNED: f64 = 1.8;
+const LR_TAKER_MISMATCH: f64 = 0.7;
+
+/// 均线乖离惩罚（按超出比例分段）
+fn ma_overextend_lr(exceed_ratio: f64) -> f64 {
+    if exceed_ratio < 0.5 {
+        1.0
+    } else if exceed_ratio < 1.0 {
+        0.85
+    } else if exceed_ratio < 1.5 {
+        0.7
+    } else {
+        0.55
+    }
+}
+
+/// 成交量分位数对置信度的影响
+fn volume_percentile_lr(vol_p: f64) -> f64 {
+    if vol_p > 70.0 {
+        1.25 // 高波动，趋势延续性强
+    } else if vol_p < 20.0 {
+        0.80 // 低波动，缺乏动能
+    } else {
+        1.0
+    }
+}
+
+/// 盈亏比质量因子
+fn rr_quality_lr(weighted_rr: f64) -> f64 {
+    if weighted_rr >= RR_MIN_ACCEPTABLE * 1.2 {
+        1.4
+    } else if weighted_rr >= RR_MIN_ACCEPTABLE {
+        1.15
+    } else if weighted_rr >= 1.5 {
+        0.9
+    } else {
+        0.6
+    }
+}
+
+/// 临近强阻力/支撑墙
+fn wall_proximity_lr(distance_pct: f64, vol_p: f64) -> f64 {
+    if distance_pct.abs() < BREAKOUT_CONFIRM_GATE {
+        if vol_p >= 60.0 {
+            1.2 // 高波动突破蓄力
+        } else {
+            0.8 // 低波动遇阻
+        }
+    } else {
+        1.0
+    }
+}
+
+/// 净得分因子（将 net_score 映射为似然比）
+fn net_score_lr(net_score: f64) -> f64 {
+    let norm = (net_score / 100.0).clamp(-1.0, 1.0);
+    // 映射到 [0.6, 1.8] 区间
+    1.0 + norm * 0.6
+}
+
+/// 海啸模式似然比提升
+const LR_TSUNAMI: f64 = 1.5;
+
+// ================= 风险输出结构 =================
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RiskAssessment {
@@ -42,16 +120,39 @@ pub struct RiskAssessment {
     pub take_profit_levels: Vec<f64>,
     pub weighted_rr: f64,
     pub rr_levels: [f64; 3],
-    pub confidence_mult: f64, // 综合乘数（0.2~2.0），融合内部置信度和信号总分
+    pub confidence: f64,      // 贝叶斯后验概率
+    pub confidence_mult: f64, // 由后验概率映射的仓位乘数
     pub audit_tags: Vec<String>,
-    pub allocation: [f64; 3], // 动态止盈分配比例
+    pub allocation: [f64; 3],
     pub is_tsunami: bool,
 }
 
 pub struct RiskManager;
 
 impl RiskManager {
-    /// 核心风控评估函数（动态止盈分配 + net_score 融合）
+    /// 贝叶斯融合核心函数：输入先验概率与似然比列表，返回后验概率
+    fn bayesian_update(prior: f64, likelihoods: &[f64]) -> f64 {
+        if likelihoods.is_empty() {
+            return prior;
+        }
+
+        // 先验几率 = p / (1-p)
+        let mut log_odds = (prior / (1.0 - prior)).ln();
+
+        for &lr in likelihoods {
+            // LR 应保证为正数，钳位避免极端值
+            let safe_lr = lr.clamp(0.1, 10.0);
+            log_odds += safe_lr.ln();
+        }
+
+        // 后验概率 = 1 / (1 + exp(-log_odds))
+        let posterior = 1.0 / (1.0 + (-log_odds).exp());
+
+        // 钳位到 [0.05, 0.95]，避免绝对化
+        posterior.clamp(0.05, 0.95)
+    }
+
+    /// 核心风控评估函数（贝叶斯融合版本）
     pub fn assess(
         direction: Option<TradeDirection>,
         wells: &[PriceGravityWell],
@@ -62,7 +163,7 @@ impl RiskManager {
         is_tsunami: bool,
         taker_ratio: f64,
         ma20_dist: Option<f64>,
-        net_score: f64, // 分析器链最终总分（-100..100）
+        net_score: f64,
     ) -> Option<RiskAssessment> {
         // 1. 方向预处理
         let direction = direction?;
@@ -102,18 +203,24 @@ impl RiskManager {
             }
         });
 
+        let min_sl_distance = atr_v * MIN_SL_ATR_MULT;
         let sl_levels = ATR_SL_BUFFERS
             .iter()
             .map(|&buf| {
-                if is_long {
+                let raw_sl = if is_long {
                     (base_def - atr_v * buf).max(last_price * 0.95)
                 } else {
                     (base_def + atr_v * buf).min(last_price * 1.05)
+                };
+                if is_long {
+                    raw_sl.min(last_price - min_sl_distance)
+                } else {
+                    raw_sl.max(last_price + min_sl_distance)
                 }
             })
             .collect::<Vec<_>>();
 
-        // 4. 计算止盈位 (TP) —— 保留原有逻辑
+        // 4. 计算止盈位 (TP)
         let tp1 = primary_targets
             .first()
             .map(|w| w.level)
@@ -145,69 +252,97 @@ impl RiskManager {
             last_price - atr_v * 5.0
         });
 
+        let (tp1, tp2, tp3) = if is_long {
+            (
+                tp1.max(last_price * 1.001),
+                tp2.max(last_price * 1.001),
+                tp3.max(last_price * 1.001),
+            )
+        } else {
+            (
+                tp1.min(last_price * 0.999),
+                tp2.min(last_price * 0.999),
+                tp3.min(last_price * 0.999),
+            )
+        };
         let tp_levels = vec![tp1, tp2, tp3];
 
-        // ================= 动态止盈分配（根据目标井强度平方归一化） =================
-        // 获取三个目标井的强度（若不足则使用默认强度 0.5）
+        // 5. 动态止盈分配（井位强度平方归一化）
         let mut target_strengths = vec![0.5; 3];
         for i in 0..3 {
             if let Some(well) = primary_targets.get(i) {
                 target_strengths[i] = well.strength.clamp(0.2, 3.0);
             }
         }
-        // 平方放大差异
         let squared: Vec<f64> = target_strengths.iter().map(|&s| s * s).collect();
         let sum_sq: f64 = squared.iter().sum();
-        let allocation: [f64; 3] = if sum_sq > 0.0 {
+        let mut allocation: [f64; 3] = if sum_sq > 0.0 {
             [
                 squared[0] / sum_sq,
                 squared[1] / sum_sq,
                 squared[2] / sum_sq,
             ]
         } else {
-            [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0] // 均匀分配
+            [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
         };
 
-        // 5. 计算加权盈亏比 (RR) —— 使用动态 allocation
-        let risk_base = (last_price - sl_levels[0]).abs().max(last_price * 0.0005);
-        let rewards = tp_levels
+        if is_tsunami {
+            allocation = TSUNAMI_ALLOCATION;
+            audit_tags.push("TSUNAMI_ALLOC".to_string());
+        }
+
+        // 6. 计算加权盈亏比 (RR)
+        let risks: Vec<f64> = sl_levels
             .iter()
-            .map(|tp| (tp - last_price).abs())
-            .collect::<Vec<_>>();
-        let rr_levels = [
-            rewards[0] / risk_base,
-            rewards[1] / risk_base,
-            rewards[2] / risk_base,
-        ];
+            .map(|sl| (last_price - sl).abs().max(last_price * 0.0005))
+            .collect();
+        let rewards: Vec<f64> = tp_levels.iter().map(|tp| (tp - last_price).abs()).collect();
+
+        let weighted_risk = risks
+            .iter()
+            .enumerate()
+            .map(|(i, r)| r * allocation[i])
+            .sum::<f64>();
 
         let weighted_reward = rewards
             .iter()
             .enumerate()
             .map(|(i, r)| r * allocation[i])
             .sum::<f64>();
-        let weighted_rr = weighted_reward / risk_base;
 
-        // ================= 置信度分数计算（加性，0~1 区间） =================
-        let mut conf_score = CONFIDENCE_BASE;
+        let weighted_rr = if weighted_risk > f64::EPSILON {
+            weighted_reward / weighted_risk
+        } else {
+            0.0
+        };
+
+        let rr_levels = [
+            rewards[0] / risks[0],
+            rewards[1] / risks[1],
+            rewards[2] / risks[2],
+        ];
+
+        // ================= 贝叶斯置信度融合 =================
+        let mut likelihoods: Vec<f64> = Vec::new();
 
         // 1) 趋势结构
         if trend_ok {
-            conf_score += 0.15;
+            likelihoods.push(LR_TREND_STRONG);
             audit_tags.push("TREND_OK".to_string());
         } else {
-            conf_score -= 0.10;
+            likelihoods.push(LR_TREND_WEAK);
             audit_tags.push("TREND_WEAK".to_string());
         }
 
-        // 2) Taker 主动流向（动态阈值，根据波动率调整）
+        // 2) Taker 主动流向
         let taker_threshold = 0.52 - ((vol_p - 50.0) / 200.0).clamp(-0.05, 0.05);
         let taker_aligned = (is_long && taker_ratio > taker_threshold)
             || (!is_long && taker_ratio < (1.0 - taker_threshold));
         if taker_aligned {
-            conf_score += 0.12;
+            likelihoods.push(LR_TAKER_ALIGNED);
             audit_tags.push("TAKER_FLOW_OK".to_string());
         } else {
-            conf_score -= 0.06;
+            likelihoods.push(LR_TAKER_MISMATCH);
             audit_tags.push("TAKER_FLOW_MISMATCH".to_string());
         }
 
@@ -215,57 +350,60 @@ impl RiskManager {
         if let Some(dist) = ma20_dist {
             let limit = atr_ratio * MA20_EXTREME_MULT;
             let exceed_ratio = (dist.abs() / limit).min(2.0);
-            let penalty = 0.15 * exceed_ratio;
-            conf_score -= penalty;
-            if penalty > 0.05 {
+            let lr = ma_overextend_lr(exceed_ratio);
+            likelihoods.push(lr);
+            if exceed_ratio > 0.5 {
                 audit_tags.push(format!("MA_OVEREXTEND:{:.1}%", exceed_ratio * 100.0));
             }
         }
 
-        // 4) 成交量分位数加成
-        let vol_bonus = ((vol_p - 50.0) / 50.0).clamp(-0.15, 0.15);
-        conf_score += vol_bonus;
+        // 4) 成交量分位数
+        let lr_vol = volume_percentile_lr(vol_p);
+        likelihoods.push(lr_vol);
         if vol_p > 70.0 {
             audit_tags.push("HIGH_VOL".to_string());
         } else if vol_p < 20.0 {
             audit_tags.push("LOW_VOL".to_string());
         }
 
-        // 5) 盈亏比质量因子
-        let rr_deviation = weighted_rr / RR_MIN_ACCEPTABLE - 1.0;
-        let rr_quality = rr_deviation.tanh().clamp(-0.20, 0.20);
-        conf_score += rr_quality;
+        // 5) 盈亏比质量
+        let lr_rr = rr_quality_lr(weighted_rr);
+        likelihoods.push(lr_rr);
         if weighted_rr >= RR_MIN_ACCEPTABLE {
             audit_tags.push(format!("RR_OK:{:.1}", weighted_rr));
         } else {
             audit_tags.push(format!("RR_LOW:{:.1}", weighted_rr));
         }
 
-        // 6) 临近强阻力/支撑处理
+        // 6) 临近强阻力/支撑墙
         if let Some(target) = primary_targets.first() {
+            let lr_wall = wall_proximity_lr(target.distance_pct, vol_p);
+            likelihoods.push(lr_wall);
             if target.distance_pct.abs() < BREAKOUT_CONFIRM_GATE {
                 if vol_p < 60.0 {
-                    conf_score -= 0.10;
                     audit_tags.push("WALL_NEAR".to_string());
                 } else {
-                    conf_score += 0.05;
                     audit_tags.push("BREAKOUT_READY".to_string());
                 }
             }
         }
 
-        let normalized_net = (net_score / 100.0).clamp(-1.0, 1.0);
-        conf_score += normalized_net * 0.15;
+        // 7) 净得分因子
+        let lr_net = net_score_lr(net_score);
+        likelihoods.push(lr_net);
 
-        // 最终置信度钳位 (0.05 ~ 0.95)
-        conf_score = conf_score.clamp(0.05, 0.95);
-        audit_tags.push(format!("CONF_SCORE:{:.2}", conf_score));
+        // 8) 海啸模式
+        if is_tsunami {
+            likelihoods.push(LR_TSUNAMI);
+        }
 
-        // ================= 综合乘数计算 =================
-        let base_mult = (conf_score * 2.0).clamp(0.2, 1.9);
-        let net_mult = 1.0 + normalized_net * 0.5;
-        let mut total_mult = base_mult * net_mult;
-        total_mult = total_mult.clamp(0.2, 2.0);
+        // 贝叶斯融合
+        let posterior = Self::bayesian_update(CONFIDENCE_PRIOR, &likelihoods);
+        audit_tags.push(format!("BAYES_CONF:{:.2}", posterior));
+
+        // ================= 综合乘数计算（收窄范围） =================
+        // 将后验概率映射到乘数区间 [0.4, 1.6]
+        let confidence_mult = (posterior * 2.4 - 0.4).clamp(MULT_MIN, MULT_MAX);
 
         // ================= 仓位计算 =================
         let base_size = defense_wells
@@ -283,7 +421,7 @@ impl RiskManager {
             1.00
         };
 
-        let mut final_size = base_size * vol_adj * total_mult;
+        let mut final_size = base_size * vol_adj * confidence_mult;
 
         if is_tsunami {
             final_size *= 1.20;
@@ -300,7 +438,8 @@ impl RiskManager {
             take_profit_levels: tp_levels,
             weighted_rr,
             rr_levels,
-            confidence_mult: total_mult,
+            confidence: posterior,
+            confidence_mult,
             audit_tags,
             allocation,
             is_tsunami,

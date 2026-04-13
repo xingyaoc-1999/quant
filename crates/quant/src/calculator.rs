@@ -74,9 +74,7 @@ impl CalculatorConfig {
                 cfg.extreme_candle_atr_mult = 2.5;
                 cfg.slope_deadzone = 0.0004;
             }
-            Interval::H1 | Interval::H4 => {
-                // 保持基础配置
-            }
+            Interval::H1 | Interval::H4 => {}
             Interval::D1 => {
                 cfg.warmup_period = 250;
                 cfg.slope_period = 2;
@@ -129,6 +127,7 @@ pub struct FeatureCalculator {
     recent_macd_hists: VecDeque<f64>,
     recent_closes: VecDeque<f64>,
     recent_global_closes: VecDeque<f64>,
+    atr_history: VecDeque<f64>,
 }
 
 impl FeatureCalculator {
@@ -171,6 +170,7 @@ impl FeatureCalculator {
             recent_macd_hists: VecDeque::with_capacity(struct_window + 1),
             recent_closes: VecDeque::with_capacity(struct_window + 1),
             recent_global_closes: VecDeque::with_capacity(struct_window + 1),
+            atr_history: VecDeque::with_capacity(20), // 新增
         }
     }
 
@@ -339,7 +339,16 @@ impl FeatureCalculator {
             ma_converging: (m50_v > 0.0)
                 .then_some(((m20_v - m50_v).abs() / m50_v) < self.config.ma_converge_threshold),
         };
-
+        let atr_median_20 = {
+            Self::push_fixed_window(&mut self.atr_history, atr_v, 20);
+            if self.atr_history.len() >= 20 {
+                let mut sorted: Vec<f64> = self.atr_history.iter().copied().collect();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                Some((sorted[9] + sorted[10]) / 2.0)
+            } else {
+                None
+            }
+        };
         FeatureSet {
             bucket,
             symbol: candle.symbol,
@@ -365,6 +374,7 @@ impl FeatureCalculator {
                 macd: (self.count >= 26).then_some(macd_out.macd),
                 macd_signal: (self.count >= 34).then_some(macd_out.signal),
                 macd_histogram: (self.count >= 34).then_some(macd_out.histogram),
+                atr_median_20,
             },
             structure: MarketStructure {
                 trend_structure: self.get_trend_struct(candle.close, m20_v, m50_v, m200_v),

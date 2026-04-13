@@ -19,27 +19,60 @@ const MAGNET_CONFIRM_MS: i64 = 180_000; // 3分钟确认
 const MIN_HOLD_MS: i64 = 30_000; // 30秒过滤毛刺
 const MIN_BUFFER_PCT: f64 = 0.001; // 0.1% 最低缓冲区
 
+// 磨损恢复半衰期（单位：毫秒），约 2 小时恢复一半强度
+const WEAR_RESTORE_HALFLIFE_MS: f64 = 7_200_000.0; // 2小时
+
+// 多空博弈区距离系数（相对于 confluence_gate）
+const CROSS_SIDE_MERGE_FACTOR: f64 = 0.5;
+// 多空博弈双方强度衰减系数
+const CROSS_SIDE_STRENGTH_DAMPEN: f64 = 0.7;
+
+// ========== 权重配置（可后续改为动态读取） ==========
+// 建议：未来可通过 ContextKey::WellWeights 读取一个 HashMap<String, f64>
+const WEIGHT_1D_RES: f64 = 1.2;
+const WEIGHT_4H_RES: f64 = 0.8;
+const WEIGHT_1D_SUP: f64 = 1.2;
+const WEIGHT_4H_SUP: f64 = 0.8;
+const WEIGHT_MA20: f64 = 1.0;
+
 pub struct GravityAnalyzer;
 
 impl GravityAnalyzer {
+    /// 计算强度：高斯核 + 自适应长尾补偿
     #[inline]
     fn calculate_intensity(dist: f64, sigma: f64) -> f64 {
         if sigma <= f64::EPSILON {
             return 0.0;
         }
         let gauss = (-(dist * dist) / (2.0 * sigma * sigma)).exp();
-        let long_range = 0.05 * (-dist / (10.0 * sigma)).exp();
+
+        // 改进1：长尾衰减随 sigma 自适应，避免低波动时远距离井完全失效
+        let long_tail_scale = 15.0 * sigma; // 自适应衰减距离
+        let long_range = 0.03 * (-dist.abs() / long_tail_scale).exp();
+
         gauss.max(long_range)
     }
 
+    /// 计算磨损乘数，包含非线性恢复
     fn calculate_wear_multiplier(hit_count: u32, last_hit_ts: i64, now: i64) -> f64 {
         if hit_count == 0 {
             return 1.0;
         }
         let h = hit_count as f64;
+        // 磨损因子：sigmoid 衰减，超过临界值后强度大幅下降
         let wear_factor = 1.0 / (1.0 + (STEEPNESS * (h - CRITICAL_HIT_COUNT)).exp());
-        let recovery = ((now - last_hit_ts).max(0) as f64 / 3_600_000.0) * 0.05;
-        (wear_factor + recovery).min(1.0)
+
+        // 改进2：非线性恢复，基于半衰期
+        let time_since = (now - last_hit_ts).max(0) as f64;
+        let recovery = if time_since > 0.0 {
+            // 指数恢复：1 - exp(-lambda * t)，其中 lambda = ln(2) / halflife
+            let lambda = std::f64::consts::LN_2 / WEAR_RESTORE_HALFLIFE_MS;
+            1.0 - (-lambda * time_since).exp()
+        } else {
+            0.0
+        };
+        // 恢复程度受限于磨损造成的强度损失，不能超过 1.0
+        (wear_factor + (1.0 - wear_factor) * recovery).min(1.0)
     }
 
     fn calculate_composite_strength(side_wells: Vec<&PriceGravityWell>) -> f64 {
@@ -84,10 +117,8 @@ impl Analyzer for GravityAnalyzer {
         let t_space = &trend_role.feature_set.space;
         let f_space = &filter_role.feature_set.space;
 
-        // 提取均线收敛状态
         let ma_converging = t_space.ma_converging.unwrap_or(false);
 
-        // 2. 继承旧能级状态
         let prev_wells: Vec<PriceGravityWell> = ctx
             .get_cached::<Vec<PriceGravityWell>>(ContextKey::SpaceGravityWells)
             .unwrap_or_default();
@@ -139,6 +170,15 @@ impl Analyzer for GravityAnalyzer {
                     merged = true;
                     break;
                 }
+
+                // 改进3：跨方向合并检测（多空博弈区）
+                if existing.side != side && diff < confluence_gate * CROSS_SIDE_MERGE_FACTOR {
+                    // 方向不同但价格极为接近 → 多空拉锯，双方强度均衰减
+                    existing.strength *= CROSS_SIDE_STRENGTH_DAMPEN;
+                    // 对新井也衰减后再加入
+                    final_strength *= CROSS_SIDE_STRENGTH_DAMPEN;
+                    // 注意：这里不 break，因为新井仍可能与其他同方向井合并，所以继续循环
+                }
             }
             if !merged {
                 wells.push(PriceGravityWell {
@@ -158,11 +198,12 @@ impl Analyzer for GravityAnalyzer {
             }
         };
 
+        // 改进5：使用可配置权重（目前常量，后续可改为从 ctx 读取）
         process_source(
             t_space.dist_to_resistance,
             Some(WellSide::Resistance),
             "1D_R",
-            1.2,
+            WEIGHT_1D_RES,
             t_space.res_hit_count,
             t_space.res_last_hit,
         );
@@ -170,7 +211,7 @@ impl Analyzer for GravityAnalyzer {
             f_space.dist_to_resistance,
             Some(WellSide::Resistance),
             "4H_R",
-            0.8,
+            WEIGHT_4H_RES,
             f_space.res_hit_count,
             f_space.res_last_hit,
         );
@@ -178,7 +219,7 @@ impl Analyzer for GravityAnalyzer {
             t_space.dist_to_support.map(|d| -d),
             Some(WellSide::Support),
             "1D_S",
-            1.2,
+            WEIGHT_1D_SUP,
             t_space.sup_hit_count,
             t_space.sup_last_hit,
         );
@@ -186,12 +227,19 @@ impl Analyzer for GravityAnalyzer {
             f_space.dist_to_support.map(|d| -d),
             Some(WellSide::Support),
             "4H_S",
-            0.8,
+            WEIGHT_4H_SUP,
             f_space.sup_hit_count,
             f_space.sup_last_hit,
         );
         if let Some(ratio) = t_space.ma20_dist_ratio {
-            process_source(Some(1.0 / (ratio + 1.0) - 1.0), None, "1D_MA20", 1.0, 0, 0);
+            process_source(
+                Some(1.0 / (ratio + 1.0) - 1.0),
+                None,
+                "1D_MA20",
+                WEIGHT_MA20,
+                0,
+                0,
+            );
         }
 
         // 4. 状态继承与增强处理
@@ -241,7 +289,6 @@ impl Analyzer for GravityAnalyzer {
         {
             let dist_pct = (well.level - last_price) / last_price;
 
-            // 状态机核心更新
             if dist_pct < -buffer {
                 if !well.last_tested_below {
                     well.last_tested_below = true;
@@ -262,7 +309,6 @@ impl Analyzer for GravityAnalyzer {
                 well.cross_ts = 0;
             }
 
-            // 检查确认转换
             if well.cross_ts > 0 {
                 let duration = now - well.cross_ts;
                 let mut should_convert = false;
@@ -292,6 +338,7 @@ impl Analyzer for GravityAnalyzer {
                         WellSide::Support
                     };
                     well.hit_count += 2;
+                    well.last_hit_ts = now; // 改进4：记录转换时刻，用于磨损计算
                     well.magnet_activated = false;
                     well.cross_ts = 0;
                     continue;
@@ -307,7 +354,6 @@ impl Analyzer for GravityAnalyzer {
             effective_magnet_strength += well.strength * base_weight;
         }
 
-        // 6. 最终评分输出
         let total_res = Self::calculate_composite_strength(
             wells
                 .iter()

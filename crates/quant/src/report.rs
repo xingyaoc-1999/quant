@@ -147,9 +147,12 @@ impl AnalysisAudit {
 
         let mut fakeout_score = 0.0;
         let mut efficiency = None;
+
         for report in &signal.sub_reports {
             match report.kind {
-                crate::analyzer::AnalyzerKind::Fakeout => fakeout_score = report.score,
+                crate::analyzer::AnalyzerKind::Fakeout => {
+                    fakeout_score = report.score;
+                }
                 crate::analyzer::AnalyzerKind::VolumeProfile => {
                     if let Some(eff_val) = report.debug_data.get("eff").and_then(|v| v.as_i64()) {
                         efficiency = Some(eff_val as f64 / 100.0);
@@ -203,12 +206,10 @@ impl AnalysisAudit {
         ));
 
         lines.push("━━━━━━━━━━━━━━━".to_string());
-
         lines.push(format!(
-            "S: `{score}` {status}  │  V:`{vol}%`  │  OI: `{oi}%`",
-            score = fmt_raw(signal.net_score, 1),
+            "S: `{score}` {status}  │  OI: `{oi}%`",
+            score = fmt_raw(signal.net_score, 0),
             status = status_icon,
-            vol = fmt_raw(snapshot.filter_vol_percentile, 0),
             oi = format!("{:+}", fmt_raw(snapshot.entry_oi_change * 100.0, 2)),
         ));
 
@@ -223,6 +224,7 @@ impl AnalysisAudit {
 
         let mut msg = lines.join("\n");
 
+        // 假突破显示（无方向）
         if fakeout_score < -10.0 {
             let fakeout_icon = if fakeout_score < -30.0 {
                 "🚨"
@@ -236,16 +238,25 @@ impl AnalysisAudit {
             ));
         }
 
+        // 效率显示（平方根归一化 + 评级）
         if let Some(eff) = efficiency {
-            let eff_pct = (eff * 100.0).round() as i32;
-            let eff_icon = if eff > 0.6 { "⚡" } else { "🐢" };
+            let eff_disp = ((eff / 5.0).sqrt() * 100.0).round() as i32;
+            let (eff_icon, eff_level) = if eff_disp >= 60 {
+                ("⚡⚡", "高")
+            } else if eff_disp >= 30 {
+                ("⚡", "正常")
+            } else {
+                ("🐢", "低")
+            };
             msg.push_str(&format!(
-                "\nEfficiency: {icon} `{eff}%`",
+                "\nEfficiency: {icon} `{eff}%` ({level})",
                 icon = eff_icon,
-                eff = eff_pct
+                eff = eff_disp,
+                level = eff_level
             ));
         }
 
+        // 风控部分（无 Tags）
         if let Some(risk) = &self.risk_assessment {
             let dir_str = risk.direction.as_str();
 
@@ -275,37 +286,16 @@ impl AnalysisAudit {
 
             let conf_pct = (risk.confidence_mult * 100.0).round() as i32;
 
-            let short_tags: Vec<String> = risk
-                .audit_tags
-                .iter()
-                .map(|t| {
-                    match t.as_str() {
-                        "TREND_OK" => "T↑",
-                        "TAKER_FLOW_OK" => "F↑",
-                        "HIGH_VOL" => "V↑",
-                        "LOW_VOL" => "V↓",
-                        "RR_OK" => "R↑",
-                        "RR_LOW" => "R↓",
-                        "WALL_NEAR" => "W⚠",
-                        "BREAKOUT_READY" => "B↑",
-                        _ => t,
-                    }
-                    .to_string()
-                })
-                .collect();
-            let tags_str = short_tags.join("·");
-
             msg.push_str(&format!(
                 "\n\n━━━━━━━━━━━━━━━\n\
-                 *Risk Management*\n\
-                 Dir: `{dir}`  │  Size: `{size}%`  │  SL: `{sl}`\n\
-                 \n\
-                 {tp1}\n\
-                 {tp2}\n\
-                 {tp3}\n\
-                 \n\
-                 WRR: `{wrr}`  │  Conf: `[{bar}]` {conf}%\n\
-                 Tags: _{tags}_",
+             *Risk Management*\n\
+             Dir: `{dir}`  │  Size: `{size}%`  │  SL: `{sl}`\n\
+             \n\
+             {tp1}\n\
+             {tp2}\n\
+             {tp3}\n\
+             \n\
+             WRR: `{wrr}`  │  Conf: `[{bar}]` {conf}%",
                 dir = dir_str,
                 size = size_pct,
                 sl = sl_str,
@@ -315,7 +305,6 @@ impl AnalysisAudit {
                 wrr = fmt_raw(risk.weighted_rr, 2),
                 bar = bar,
                 conf = conf_pct,
-                tags = escape_markdown_v2(&tags_str)
             ));
         }
 

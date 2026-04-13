@@ -1,5 +1,7 @@
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, MarketContext, Role};
-use crate::types::{DivergenceType, MacdCross, MacdMomentum};
+use crate::analyzer::{
+    AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, ContextKey, MarketContext, Role,
+};
+use crate::types::{DivergenceType, MacdCross, MacdMomentum, TrendStructure};
 use serde_json::json;
 
 pub struct ResonanceAnalyzer;
@@ -36,7 +38,6 @@ impl Analyzer for ResonanceAnalyzer {
         let mut m_resonance: f64 = 1.0;
         let mut extra_score: f64 = 0.0;
 
-        // --- 2. 基础得分 ---
         let base_score = if is_reclaim || is_breakdown {
             description.push("TRIGGER:MA20_RECLAIM".to_string());
             45.0
@@ -93,7 +94,19 @@ impl Analyzer for ResonanceAnalyzer {
             }
         }
 
-        let final_score = base_score * direction + extra_score;
+        // 改进1：检查 MTF 对齐状态
+        let mtf_aligned = match ctx.get_cached::<TrendStructure>(ContextKey::RegimeStructure) {
+            Some(TrendStructure::StrongBullish) | Some(TrendStructure::Bullish) => is_long,
+            Some(TrendStructure::StrongBearish) | Some(TrendStructure::Bearish) => !is_long,
+            _ => true, // 震荡市中不惩罚
+        };
+        if !mtf_aligned {
+            m_resonance *= 0.7;
+            description.push("MTF_MISALIGN".to_string());
+        }
+
+        // 改进2：extra_score 也受乘数影响，避免背离信号放大过度
+        let final_score = base_score * direction + extra_score * m_resonance;
 
         Ok(AnalysisResult::new(self.kind(), "RESONANCE_V2".into())
             .with_score(final_score)
@@ -105,6 +118,7 @@ impl Analyzer for ResonanceAnalyzer {
                   "slope_bars": slope_bars,
                   "base_score": base_score,
                   "extra_score": extra_score,
+                  "mtf_aligned": mtf_aligned,
             })))
     }
 }
