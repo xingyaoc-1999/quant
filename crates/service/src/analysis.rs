@@ -67,7 +67,6 @@ impl AnalysisService {
                     }
                 }
             }
-
             info!("Analysis worker stopped");
         })
     }

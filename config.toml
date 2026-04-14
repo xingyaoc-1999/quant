@@ -1,8 +1,13 @@
 [proxy]
-socks_proxy_list = ["127.0.0.1:7898"]
+socks_proxy_list = [
+    "pffpxtsd:j2icbfc6orky@31.59.20.176:6754",
+    "pffpxtsd:j2icbfc6orky@45.38.107.97:6014",
+    "pffpxtsd:j2icbfc6orky@198.105.121.200:6462",
+    "pffpxtsd:j2icbfc6orky@142.111.67.146:5611",
+    "pffpxtsd:j2icbfc6orky@31.58.9.4:6077",
+]
 [telegram]
 token = "6873806668:AAFwVFInvpCfralLjAslQgKaQ4QczihR8No"
 
 [database]
 db_url = "postgres://postgres:xingyaoc@localhost:5432/postgres"
-

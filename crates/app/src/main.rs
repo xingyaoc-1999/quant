@@ -93,7 +93,6 @@ async fn main() -> Result<()> {
         info!("Analysis notification worker started");
         while let Ok(event) = analysis_rx.recv().await {
             let msg = event.audit.to_markdown_v2();
-            // 只发送消息文本和 Symbol，广播由 BotApp 内部处理订阅者列表
             let _ = tg_sender.send((msg, event.audit.signal.symbol)).await;
         }
         info!("Analysis notification worker stopped");
@@ -122,7 +121,6 @@ async fn main() -> Result<()> {
     .await?;
     info!("AI Agent started");
 
-    // 命令路由（将用户命令转发给 Agent）
     tokio::spawn(async move {
         while let Some((cmd, chat_id)) = cmd_rx.recv().await {
             info!("Received command: {} from {}", cmd, chat_id);

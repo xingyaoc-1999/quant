@@ -1,3 +1,5 @@
+use crate::config::Appconfig;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -5,8 +7,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, warn};
-
-use crate::config::Appconfig;
 
 pub type ProxyAddr = Arc<str>;
 
@@ -217,4 +217,15 @@ where
             }
         }
     }
+}
+pub fn parse_proxy_auth(proxy_str: &str) -> Result<(&str, &str, &str)> {
+    let (auth_part, addr) = proxy_str
+        .split_once('@')
+        .ok_or_else(|| anyhow!("Invalid proxy format: missing '@'"))?;
+
+    let (username, password) = auth_part
+        .split_once(':')
+        .ok_or_else(|| anyhow!("Invalid auth format: missing ':'"))?;
+
+    Ok((addr, username, password))
 }

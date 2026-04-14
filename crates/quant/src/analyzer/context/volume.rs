@@ -1,12 +1,14 @@
 use crate::analyzer::{
     AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, ContextKey, MarketContext, Role,
 };
-use crate::types::{OIPositionState, PriceAction, PriceGravityWell, VolumeState, WellSide};
+use crate::types::{
+    OIPositionState, PriceAction, PriceGravityWell, TrendStructure, VolumeState, WellSide,
+};
 use serde_json::json;
 
 // ================= 动态阈值基准常量 =================
 const RVOL_BREAK_BASE: f64 = 1.2;
-const RVOL_EXTREME_BASE: f64 = 2.0; // 提高基准，避免高波动市场过于敏感
+const RVOL_EXTREME_BASE: f64 = 2.0;
 const EFF_HIGH_BASE: f64 = 1.2;
 const EFF_LOW_BASE: f64 = 0.5;
 
@@ -16,19 +18,26 @@ const VOL_FACTOR_MAX: f64 = 1.8;
 const BACKGROUND_SCORE_BASE: f64 = 10.0;
 const BACKGROUND_MULT: f64 = 1.1;
 
+// 趋势延伸模式参数
+const TREND_EXTENSION_BASE_SCORE: f64 = 35.0;
+const TREND_EXTENSION_EFF_BOOST: f64 = 1.3;
+const TREND_EXTENSION_MULT: f64 = 1.35;
+const TREND_EFFICIENCY_THRESHOLD: f64 = 0.35;
+const TREND_WEAK_EFF_PENALTY: f64 = 0.8;
+
 // 被动吸收判定阈值
 const ABSORPTION_TAKER_BUY_MIN: f64 = 0.55;
 const ABSORPTION_TAKER_SELL_MAX: f64 = 0.45;
 const ABSORPTION_OI_DELTA_MIN: f64 = 0.008;
 
-// 磁力分支基准阈值（将在运行时根据 vol_factor 调整）
+// 磁力分支基准阈值
 const MAGNET_RVOL_BREAK_BASE: f64 = 0.8;
 const MAGNET_EFF_HIGH_BASE: f64 = 0.6;
 const MAGNET_RVOL_SHRINK_BASE: f64 = 0.5;
 const MAGNET_EFF_LOW_BASE: f64 = 0.3;
 
 // 效率计算保护
-const MIN_COMPACTNESS: f64 = 0.2; // 避免十字星完全抹杀效率
+const MIN_COMPACTNESS: f64 = 0.2;
 
 pub struct VolumeStructureAnalyzer;
 
@@ -39,8 +48,9 @@ impl VolumeStructureAnalyzer {
         } else {
             1.0
         };
+        // 极端缩量时返回极小值而非 0，避免完全抹杀信号
         if rvol < 0.2 {
-            return 0.0;
+            return 0.05;
         }
 
         let body_spread = (p_action.close - p_action.open).abs();
@@ -48,9 +58,8 @@ impl VolumeStructureAnalyzer {
 
         let body_ratio = body_spread / total_travel;
 
-        // 修改点：不再直接返回
         let compactness = if body_ratio < 0.1 {
-            0.1 // 十字星最低效率值
+            0.1
         } else {
             body_ratio.max(MIN_COMPACTNESS)
         };
@@ -62,6 +71,7 @@ impl VolumeStructureAnalyzer {
         };
         (normalized_move / rvol * compactness).min(5.0)
     }
+
     fn compute_vol_factor(vol_p: f64) -> f64 {
         (vol_p / 50.0).clamp(VOL_FACTOR_MIN, VOL_FACTOR_MAX)
     }
@@ -70,7 +80,8 @@ impl VolumeStructureAnalyzer {
         match volume_state {
             Some(VolumeState::Expand) if rvol < 1.0 => 0.7,
             Some(VolumeState::Shrink) if rvol > 0.8 => 0.7,
-            Some(VolumeState::Normal) if rvol > 1.2 || rvol < 0.6 => 0.8,
+            // 放宽 Normal 状态阈值：从 1.2/0.6 改为 1.5/0.5
+            Some(VolumeState::Normal) if rvol > 1.5 || rvol < 0.5 => 0.8,
             _ => 1.0,
         }
     }
@@ -78,7 +89,7 @@ impl VolumeStructureAnalyzer {
 
 impl Analyzer for VolumeStructureAnalyzer {
     fn name(&self) -> &'static str {
-        "volume_structure_pro_v4"
+        "volume_structure_pro_v5"
     }
     fn kind(&self) -> AnalyzerKind {
         AnalyzerKind::VolumeProfile
@@ -126,10 +137,10 @@ impl Analyzer for VolumeStructureAnalyzer {
         let eff_high = EFF_HIGH_BASE / vol_factor;
         let eff_low = EFF_LOW_BASE * vol_factor;
 
-        // 磁力分支动态阈值
+        // 磁力分支动态阈值（修正缩量阈值为除法）
         let magnet_rvol_break = MAGNET_RVOL_BREAK_BASE / vol_factor;
         let magnet_eff_high = MAGNET_EFF_HIGH_BASE / vol_factor;
-        let magnet_rvol_shrink = MAGNET_RVOL_SHRINK_BASE * vol_factor;
+        let magnet_rvol_shrink = MAGNET_RVOL_SHRINK_BASE / vol_factor;
         let magnet_eff_low = MAGNET_EFF_LOW_BASE * vol_factor;
 
         let is_up = p_action.close > p_action.open;
@@ -139,27 +150,27 @@ impl Analyzer for VolumeStructureAnalyzer {
 
         let mut score = 0.0;
         let mut m_vol = 1.0;
-        let mut res = AnalysisResult::new(self.kind(), "VSA_PRO_V4".into());
+        let mut res = AnalysisResult::new(self.kind(), "VSA_PRO_V5".into());
 
+        // --- 井位触发逻辑（使用实时距离）---
         let target_side = if is_up {
             WellSide::Resistance
         } else {
             WellSide::Support
         };
+
+        // 寻找最邻近的活跃井位（基于实时距离）
         let active_well = wells
             .iter()
             .filter(|w| w.is_active && w.side == target_side)
             .min_by(|a, b| {
-                let dist_a = (a.level - last_price).abs() / last_price;
-                let dist_b = (b.level - last_price).abs() / last_price;
-                let score_a = dist_a / (a.strength + 0.1);
-                let score_b = dist_b / (b.strength + 0.1);
-                score_a
-                    .partial_cmp(&score_b)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                let score_a = ((a.level - last_price).abs() / last_price) / (a.strength + 0.1);
+                let score_b = ((b.level - last_price).abs() / last_price) / (b.strength + 0.1);
+                score_a.total_cmp(&score_b) // 更优雅的写法
             });
 
         if let Some(well) = active_well {
+            // 实时计算当前距离
             let dist_pct = (well.level - last_price).abs() / last_price;
             let in_critical_zone = dist_pct < sigma * 1.5;
 
@@ -254,20 +265,56 @@ impl Analyzer for VolumeStructureAnalyzer {
             }
         }
 
-        // 背景评分（无活跃井或未触发条件时）
+        // --- 增强：无活跃井位时的趋势延伸评分 ---
         if score == 0.0 {
-            let trend_bias = if is_up {
-                BACKGROUND_SCORE_BASE
-            } else {
-                -BACKGROUND_SCORE_BASE
+            let regime = ctx.get_cached::<TrendStructure>(ContextKey::RegimeStructure);
+            let is_up = p_action.close > p_action.open;
+
+            // 判断是否处于与当前K线方向一致的强趋势中
+            let is_strong_trend = match regime {
+                Some(TrendStructure::StrongBullish) | Some(TrendStructure::Bullish) => is_up,
+                Some(TrendStructure::StrongBearish) | Some(TrendStructure::Bearish) => !is_up,
+                _ => false,
             };
-            if rvol > 1.0 {
-                score = trend_bias * (rvol.min(2.0)) * consistency;
-                m_vol = BACKGROUND_MULT;
+
+            if is_strong_trend {
+                // 趋势延伸模式：价格脱离井位但趋势结构健康
+                let base = if is_up {
+                    TREND_EXTENSION_BASE_SCORE
+                } else {
+                    -TREND_EXTENSION_BASE_SCORE
+                };
+                let mut trend_score = base;
+
+                // 高效率放量 -> 趋势健康，额外加分
+                if efficiency > TREND_EFFICIENCY_THRESHOLD && rvol > 1.2 {
+                    trend_score *= TREND_EXTENSION_EFF_BOOST;
+                    res = res.because("趋势延伸(高效): 脱离引力井，量价健康持续");
+                } else if efficiency < 0.2 {
+                    // 效率过低 -> 降权，防止反转追高
+                    trend_score *= TREND_WEAK_EFF_PENALTY;
+                    res = res.because("趋势延伸(低效): 脱离引力井但动能减弱，谨慎");
+                } else {
+                    res = res.because("趋势延伸: 脱离引力井，趋势结构维持");
+                }
+
+                score = trend_score * consistency;
+                m_vol = TREND_EXTENSION_MULT;
+            } else {
+                // 原始背景评分：非强趋势时的保守处理
+                let trend_bias = if is_up {
+                    BACKGROUND_SCORE_BASE
+                } else {
+                    -BACKGROUND_SCORE_BASE
+                };
+                if rvol > 1.0 {
+                    score = trend_bias * (rvol.min(2.0)) * consistency;
+                    m_vol = BACKGROUND_MULT;
+                }
             }
         }
 
-        // 缓存写入（供 FakeoutDetector 等使用）
+        // 缓存写入
         ctx.set_cached(ContextKey::LastEfficiency, efficiency);
         ctx.set_cached(ContextKey::LastRVol, rvol);
         ctx.set_cached(

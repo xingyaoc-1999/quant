@@ -37,6 +37,7 @@ pub enum ContextKey {
     PositionSizePct,
     LastEfficiency,
     LastRVol,
+    FundingRate,
 }
 
 #[derive(
@@ -85,14 +86,11 @@ impl FromStr for Role {
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 pub enum AnalyzerKind {
-    TrendStrength,
     Momentum,
     VolumeProfile,
-    Divergence,
     SupportResistance,
     Volatility,
     MarketRegime,
-    RiskManagement,
     Fakeout,
 }
 

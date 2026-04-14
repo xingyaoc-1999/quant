@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Result};
-use common::utils::CooledProxyPool;
+use common::utils::{parse_proxy_auth, CooledProxyPool};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashSet;
@@ -60,7 +60,15 @@ impl<P: WsProtocol> GenericWsClient<P> {
             None => bail!("No available proxy in pool"),
         };
 
-        match Socks5Stream::connect(&*proxy_addr, self.protocol.proxy_target()).await {
+        let (addr, user_name, password) = parse_proxy_auth(&proxy_addr)?;
+        match Socks5Stream::connect_with_password(
+            &*addr,
+            self.protocol.proxy_target(),
+            user_name,
+            password,
+        )
+        .await
+        {
             Ok(stream) => {
                 let tcp = stream.into_inner();
                 let req = self.protocol.url().into_client_request()?;

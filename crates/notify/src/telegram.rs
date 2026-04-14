@@ -52,7 +52,10 @@ impl BotApp {
         let all_symbols = Symbol::all();
         for symbol in all_symbols {
             subscriptions.add(symbol, ChatId(5943539337)).await;
+            subscriptions.add(symbol, ChatId(8749052696)).await;
+
             subscriptions.add(symbol, ChatId(454287823)).await;
+            subscriptions.add(symbol, ChatId(7541106291)).await;
         }
 
         Ok(Self {
@@ -198,14 +201,15 @@ impl BotApp {
                                 // 1. Get old_id and immediately drop the lock
                                 let old_id = storage.lock().await.get(&key).copied();
 
-                                // 2. Logic Flow: Try Edit -> (If deleted) Clear Cache -> (If no id) Send New
                                 if let Some(msg_id) = old_id {
                                     match bot.edit_message_text(chat_id, msg_id, &text)
                                         .parse_mode(ParseMode::MarkdownV2)
                                         .reply_markup(kb.clone())
                                         .await
                                     {
-                                        Ok(_) => return, // Success: Exit task
+                                        Ok(msg) =>{
+
+                                             return},
                                         Err(RequestError::Api(teloxide::ApiError::MessageNotModified)) => return, // No change: Exit task
                                         Err(RequestError::Api(teloxide::ApiError::MessageToEditNotFound)) => {
                                             // Message was deleted: Clear cache and CONTINUE to send_message

@@ -29,8 +29,7 @@ const SLOPE_BARS_THRESHOLD: i32 = 3;
 
 // 乘数上限（防止过度叠加）
 const MAX_MULT_CAP: f64 = 3.0;
-// 缺少期货数据时 taker_ratio 的权重折扣
-const TAKER_WEIGHT_NO_FUTURES: f64 = 0.6;
+
 // =============================================
 
 pub struct MarketRegimeAnalyzer;
@@ -159,10 +158,11 @@ impl Analyzer for MarketRegimeAnalyzer {
                         RsiState::Overbought | RsiState::Oversold => {
                             let in_well = gravity_wells.as_ref().map_or(false, |wells| {
                                 wells.iter().any(|w| {
-                                    w.is_active && w.distance_pct.abs() < RANGE_WELL_DIST_THRESHOLD
+                                    w.is_active
+                                        && (w.level - close_price).abs() / close_price
+                                            < RANGE_WELL_DIST_THRESHOLD
                                 })
                             });
-
                             base_score = if matches!(rsi, RsiState::Overbought) {
                                 -55.0
                             } else {
@@ -236,7 +236,6 @@ impl Analyzer for MarketRegimeAnalyzer {
             m_momentum *= 1.8;
         }
 
-        // 改进3：Taker Game 乘数结合数据源置信度
         let m_game = match taker_ratio {
             Some(pct) => {
                 let base_game: f64 = match structure {

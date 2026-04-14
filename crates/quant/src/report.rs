@@ -1,6 +1,6 @@
 use crate::{
     analyzer::{ContextKey, FinalSignal, MarketContext, Role},
-    risk_manager::{RiskAssessment, RiskManager, TradeDirection},
+    risk_manager::{RiskAssessment, RiskConfig, RiskManager, TradeDirection},
     types::*,
 };
 use chrono::Utc;
@@ -99,6 +99,7 @@ impl AnalysisAudit {
     ) -> Option<&RiskAssessment> {
         let dir = direction?;
 
+        // 1. 提取缓存数据
         let atr_ratio = ctx
             .get_cached::<f64>(ContextKey::VolAtrRatio)
             .unwrap_or(0.005);
@@ -123,17 +124,30 @@ impl AnalysisAudit {
             .ok()
             .and_then(|r| r.feature_set.space.ma20_dist_ratio);
 
-        let risk = RiskManager::assess(
-            Some(dir),
-            &self.gravity_wells,
-            self.snapshot.price,
-            atr_ratio,
-            vol_p,
-            regime,
-            is_tsunami,
-            taker,
-            ma_dist,
-            self.signal.net_score,
+        let max_loss_pct = Some(0.02); // 2% 单笔最大亏损，可根据需要调整
+        let leverage = 10.0; // 从配置或合约信息获取，此处示例为10倍
+
+        // 尝试获取资金费率（假设已缓存到 ContextKey::FundingRate）
+        let funding_rate = ctx.get_cached::<f64>(ContextKey::FundingRate);
+
+        // 2. 创建风险管理器实例（使用默认配置）
+        let risk_mgr = RiskManager::new(RiskConfig::default());
+
+        // 3. 调用新版 assess 方法（注意参数顺序）
+        let risk = risk_mgr.assess(
+            Some(dir),             // direction
+            &self.gravity_wells,   // wells
+            self.snapshot.price,   // last_price
+            atr_ratio,             // atr_ratio
+            vol_p,                 // vol_p
+            regime,                // regime
+            is_tsunami,            // is_tsunami
+            taker,                 // taker_ratio
+            ma_dist,               // ma20_dist
+            self.signal.net_score, // net_score
+            max_loss_pct,          // max_loss_pct
+            leverage,              // leverage
+            funding_rate,          // funding_rate
         )?;
 
         self.risk_assessment = Some(risk);
@@ -142,6 +156,7 @@ impl AnalysisAudit {
 
     pub fn to_markdown_v2(&self) -> String {
         debug!(?self);
+
         let signal = &self.signal;
         let snapshot = &self.snapshot;
 
@@ -224,7 +239,7 @@ impl AnalysisAudit {
 
         let mut msg = lines.join("\n");
 
-        // 假突破显示（无方向）
+        // 假突破显示
         if fakeout_score < -10.0 {
             let fakeout_icon = if fakeout_score < -30.0 {
                 "🚨"
@@ -238,7 +253,7 @@ impl AnalysisAudit {
             ));
         }
 
-        // 效率显示（平方根归一化 + 评级）
+        // 效率显示
         if let Some(eff) = efficiency {
             let eff_disp = ((eff / 5.0).sqrt() * 100.0).round() as i32;
             let (eff_icon, eff_level) = if eff_disp >= 60 {
@@ -249,21 +264,23 @@ impl AnalysisAudit {
                 ("🐢", "低")
             };
             msg.push_str(&format!(
-                "\nEfficiency: {icon} `{eff}%` ({level})",
+                "\nEfficiency: {icon} `{eff}%` \\({level}\\)",
                 icon = eff_icon,
                 eff = eff_disp,
                 level = eff_level
             ));
         }
 
-        // 风控部分（无 Tags）
         if let Some(risk) = &self.risk_assessment {
             let dir_str = risk.direction.as_str();
+            let conf_pct = (risk.confidence_mult * 100.0).round() as i32;
 
-            let conf_val = ((risk.confidence_mult - 0.2) / 1.8 * 10.0)
-                .round()
-                .clamp(0.0, 10.0) as usize;
-            let bar = "■".repeat(conf_val) + &"□".repeat(10 - conf_val);
+            let conf_val = ((conf_pct as f64) / 10.0).round().clamp(0.0, 10.0) as usize;
+            let bar = if conf_val > 0 {
+                "■".repeat(conf_val) + &"□".repeat(10 - conf_val)
+            } else {
+                "□".repeat(10)
+            };
 
             let size_pct = fmt_raw(risk.position_size_pct * 100.0, 1);
 
@@ -281,21 +298,19 @@ impl AnalysisAudit {
                 let tp = fmt_raw(risk.take_profit_levels[idx], 1);
                 let rr = fmt_esc(risk.rr_levels[idx], 1);
                 let alloc = fmt_esc(risk.allocation[idx] * 100.0, 0);
-                format!("TP{}: `${}` (RR:{} | {}%)", idx + 1, tp, rr, alloc)
+                format!("TP{}: `${}` \\(RR:{} \\| {}%\\)", idx + 1, tp, rr, alloc)
             };
-
-            let conf_pct = (risk.confidence_mult * 100.0).round() as i32;
 
             msg.push_str(&format!(
                 "\n\n━━━━━━━━━━━━━━━\n\
-             *Risk Management*\n\
-             Dir: `{dir}`  │  Size: `{size}%`  │  SL: `{sl}`\n\
-             \n\
-             {tp1}\n\
-             {tp2}\n\
-             {tp3}\n\
-             \n\
-             WRR: `{wrr}`  │  Conf: `[{bar}]` {conf}%",
+                 *Risk Management*\n\
+                 Dir: `{dir}`  │  Size: `{size}%`  │  SL: `{sl}`\n\
+                 \n\
+                 {tp1}\n\
+                 {tp2}\n\
+                 {tp3}\n\
+                 \n\
+                 WRR: `{wrr}`  │  Conf: `[{bar}]` `{conf}%`",
                 dir = dir_str,
                 size = size_pct,
                 sl = sl_str,
@@ -305,6 +320,11 @@ impl AnalysisAudit {
                 wrr = fmt_raw(risk.weighted_rr, 2),
                 bar = bar,
                 conf = conf_pct,
+            ));
+
+            msg.push_str(&format!(
+                "\n`Est. Loss:` `{:.2}%` of capital",
+                risk.estimated_loss_pct * 100.0
             ));
         }
 
