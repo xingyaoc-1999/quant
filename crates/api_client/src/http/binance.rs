@@ -85,10 +85,7 @@ impl ArchiveProvider {
                     let client = factory.get_client(proxy).await?;
                     let response = client.get(&url).send().await?;
 
-                    let json: serde_json::Value = response
-                        .json()
-                        .await
-                        .map_err(|e| RequestError::Other(e.to_string()))?;
+                    let json: serde_json::Value = response.json().await?;
 
                     // 业务错误检查
                     if let Some(code) = json.get("code").and_then(|v| v.as_i64()) {
@@ -136,10 +133,7 @@ impl ArchiveProvider {
                     let client = factory.get_client(proxy).await?;
                     let response = client.get(&url).send().await?;
 
-                    let json: serde_json::Value = response
-                        .json()
-                        .await
-                        .map_err(|e| RequestError::Other(e.to_string()))?;
+                    let json: serde_json::Value = response.json().await?;
 
                     if let Some(obj) = json.as_object() {
                         if let Some(code) = obj.get("code").and_then(|c| c.as_i64()) {
