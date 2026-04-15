@@ -57,7 +57,10 @@ impl<P: WsProtocol> GenericWsClient<P> {
     )> {
         let proxy_addr = match self.proxy_pool.current_available().await {
             Some(proxy) => proxy,
-            None => bail!("No available proxy in pool"),
+            None => {
+                // warn!(?self.proxy_pool);
+                bail!("No available proxy in pool")
+            }
         };
 
         let (addr, user_name, password) = parse_proxy_auth(&proxy_addr)?;

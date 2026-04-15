@@ -22,7 +22,6 @@ const TAKER_TREND_BULL_MIN: f64 = 0.52;
 const TAKER_TREND_BEAR_MAX: f64 = 0.48;
 
 const TSUNAMI_BASE_OI_DELTA: f64 = 0.012;
-const TSUNAMI_BASE_TAKER_RATIO: f64 = 0.55;
 
 const SLOPE_MOMENTUM_BOOST: f64 = 0.15;
 const SLOPE_BARS_THRESHOLD: i32 = 3;
@@ -95,10 +94,8 @@ impl Analyzer for MarketRegimeAnalyzer {
         match structure {
             TrendStructure::StrongBullish | TrendStructure::StrongBearish => {
                 let is_bull = matches!(structure, TrendStructure::StrongBullish);
-                // 改进1：基础得分结合斜率强度与持续时间
                 let slope_factor = if let Some(slope) = ma20_slope {
                     let slope_abs = slope.abs().min(5.0);
-                    // 持续时间越长，斜率影响越大
                     let bars_factor = (ma20_slope_bars as f64 / 10.0).min(1.5);
                     1.0 + slope_abs * 0.1 * bars_factor
                 } else {
@@ -134,7 +131,7 @@ impl Analyzer for MarketRegimeAnalyzer {
                     }
                 }
 
-                // MA20 斜率动量增强（与趋势方向一致时）
+                // MA20 斜率动量增强
                 if let Some(slope) = ma20_slope {
                     let slope_aligned = (is_bull && slope > 0.0) || (!is_bull && slope < 0.0);
                     if slope_aligned {
@@ -144,7 +141,6 @@ impl Analyzer for MarketRegimeAnalyzer {
                         } else {
                             1.0
                         };
-                        // 限制增强幅度不超过 50%
                         let boost = 1.0 + slope_strength * SLOPE_MOMENTUM_BOOST * bars_factor;
                         m_momentum *= boost.min(1.5);
                         res = res.because(format!("MA20斜率共振: {:.2}", slope));
@@ -203,27 +199,47 @@ impl Analyzer for MarketRegimeAnalyzer {
             }
         }
 
-        // 改进2：乘数上限控制（避免叠加失控）
         m_momentum = m_momentum.clamp(0.2, 2.5);
 
-        let tsunami_oi_threshold =
-            TSUNAMI_BASE_OI_DELTA * (1.0 + (vol_p - 50.0) / 200.0).clamp(0.8, 1.5);
+        // ========== 优化后的海啸判定逻辑 ==========
+        // 新增：支持空头方向 + 动态阈值放宽，使磁力井触发更均衡
+        let is_bullish = matches!(
+            structure,
+            TrendStructure::StrongBullish | TrendStructure::Bullish
+        );
+        let is_bearish = matches!(
+            structure,
+            TrendStructure::StrongBearish | TrendStructure::Bearish
+        );
+
+        // 动态 OI 阈值：高波动时阈值略微降低（用除法替代乘法，高波更易触发）
+        let vol_adjust = (vol_p / 50.0).clamp(0.8, 1.2);
+        let tsunami_oi_threshold = TSUNAMI_BASE_OI_DELTA / vol_adjust;
+
+        // 动态 Taker 阈值：随波动率微调
+        let taker_bull_threshold =
+            (TAKER_TREND_BULL_MIN - 0.02 * (vol_p / 50.0 - 1.0)).clamp(0.50, 0.55);
+        let taker_bear_threshold =
+            (TAKER_TREND_BEAR_MAX + 0.02 * (vol_p / 50.0 - 1.0)).clamp(0.45, 0.50);
 
         let (is_tsunami, oi_state) = match oi_delta {
             Some(delta) => {
                 let price_pct = (close_price - open_price) / open_price.max(0.0001);
-                // 注意：OIPositionState::determine 实现应符合：
-                // 价格涨 + OI增 → LongBuildUp
-                // 价格涨 + OI减 → ShortCovering
-                // 价格跌 + OI增 → ShortBuildUp
-                // 价格跌 + OI减 → LongLiquidation
                 let state = OIPositionState::determine(price_pct, delta);
 
-                let tsunami = matches!(state, OIPositionState::LongBuildUp)
+                // 多头海啸：价格涨 + OI激增 + 主动买盘占优 + 趋势偏多
+                let tsunami_long = matches!(state, OIPositionState::LongBuildUp)
+                    && is_bullish
                     && delta > tsunami_oi_threshold
-                    && taker_ratio.unwrap_or(0.5) > TSUNAMI_BASE_TAKER_RATIO;
+                    && taker_ratio.unwrap_or(0.5) > taker_bull_threshold;
 
-                (tsunami, state)
+                // 空头海啸：价格跌 + OI激增 + 主动卖盘占优 + 趋势偏空
+                let tsunami_short = matches!(state, OIPositionState::ShortBuildUp)
+                    && is_bearish
+                    && delta > tsunami_oi_threshold
+                    && taker_ratio.unwrap_or(0.5) < taker_bear_threshold;
+
+                (tsunami_long || tsunami_short, state)
             }
             None => (false, OIPositionState::Neutral),
         };
@@ -265,7 +281,6 @@ impl Analyzer for MarketRegimeAnalyzer {
                         }
                     }
                 };
-
                 base_game.clamp(0.5, 2.0)
             }
             None => 1.0,
@@ -274,7 +289,6 @@ impl Analyzer for MarketRegimeAnalyzer {
         let m_mtf = if mtf_aligned { 1.0 } else { 0.6 };
 
         let raw_mult = m_regime + m_momentum + m_game + m_mtf - 3.0;
-        // 改进2：最终乘数上限更严格
         let final_mult = raw_mult.clamp(0.2, MAX_MULT_CAP);
 
         ctx.set_cached(ContextKey::RegimeStructure, structure);

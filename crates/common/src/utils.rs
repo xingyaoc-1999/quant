@@ -9,12 +9,13 @@ use tokio::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
 pub type ProxyAddr = Arc<str>;
+#[derive(Debug)]
 
 struct PoolInner {
     proxies: VecDeque<ProxyAddr>,
     cooldowns: HashMap<ProxyAddr, Instant>,
 }
-
+#[derive(Debug)]
 pub struct CooledProxyPool {
     inner: Arc<Mutex<PoolInner>>,
     default_cooldown: Duration,
@@ -79,7 +80,7 @@ impl CooledProxyPool {
         let mut guard = self.inner.lock().await;
         let until = Instant::now() + self.default_cooldown;
         guard.cooldowns.insert(proxy.clone(), until);
-        warn!(
+        error!(
             "Proxy {} entering cooldown for {:?}",
             proxy, self.default_cooldown
         );

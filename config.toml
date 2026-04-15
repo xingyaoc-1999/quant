@@ -1,5 +1,6 @@
 [proxy]
 socks_proxy_list = [
+    "admin:admin@127.0.0.1:7898",
     "pffpxtsd:j2icbfc6orky@31.59.20.176:6754",
     "pffpxtsd:j2icbfc6orky@45.38.107.97:6014",
     "pffpxtsd:j2icbfc6orky@198.105.121.200:6462",

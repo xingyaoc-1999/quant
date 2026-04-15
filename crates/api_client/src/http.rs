@@ -67,7 +67,7 @@ impl HttpClientFactory {
             .proxy(proxy)
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|e| RequestError::Other(e.to_string()))?;
+            .map_err(|e| RequestError::Proxy(e.to_string()))?;
 
         let mut cache = self.client_cache.lock().await;
         cache.insert(proxy_url, client.clone());

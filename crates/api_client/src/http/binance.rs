@@ -42,10 +42,7 @@ impl ArchiveProvider {
                     let client = factory.get_client(proxy).await?;
                     let response = client.get(&url).send().await?;
 
-                    let json: serde_json::Value = response
-                        .json()
-                        .await
-                        .map_err(|e| RequestError::Other(e.to_string()))?;
+                    let json: serde_json::Value = response.json().await?;
 
                     if let Some(code) = json.get("code").and_then(|v| v.as_i64()) {
                         let msg = json.get("msg").and_then(|v| v.as_str()).unwrap_or("");
