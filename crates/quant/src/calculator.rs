@@ -1,6 +1,9 @@
-use crate::types::{
-    CandleType, DivergenceType, FeatureSet, MacdCross, MacdMomentum, MarketStructure, PriceAction,
-    RsiState, SignalStates, SpaceGeometry, TechnicalIndicators, TrendStructure, VolumeState,
+use crate::{
+    types::market::{
+        DivergenceType, FeatureSet, MacdCross, MacdMomentum, MarketStructure, PriceAction,
+        RsiState, SignalStates, SpaceGeometry, TechnicalIndicators, TrendStructure, VolumeState,
+    },
+    utils::math::push_fixed_window,
 };
 use chrono::{TimeZone, Utc};
 use common::{Candle, Interval};
@@ -253,25 +256,25 @@ impl FeatureCalculator {
         // 4. MACD 背离
         let macd_divergence = self.check_macd_divergence(candle.close, macd_out.histogram);
 
-        Self::push_fixed_window(&mut self.volatility_history, bb_w, self.config.vol_window);
-        Self::push_fixed_window(
+        push_fixed_window(&mut self.volatility_history, bb_w, self.config.vol_window);
+        push_fixed_window(
             &mut self.recent_highs,
             candle.high,
             self.config.struct_window,
         );
-        Self::push_fixed_window(&mut self.recent_lows, candle.low, self.config.struct_window);
-        Self::push_fixed_window(
+        push_fixed_window(&mut self.recent_lows, candle.low, self.config.struct_window);
+        push_fixed_window(
             &mut self.recent_macd_hists,
             macd_out.histogram,
             self.config.struct_window,
         );
-        Self::push_fixed_window(
+        push_fixed_window(
             &mut self.recent_closes,
             candle.close,
             self.config.struct_window,
         );
         if let Some(gc) = global_close {
-            Self::push_fixed_window(
+            push_fixed_window(
                 &mut self.recent_global_closes,
                 gc,
                 self.config.struct_window,
@@ -340,11 +343,10 @@ impl FeatureCalculator {
                 .then_some(((m20_v - m50_v).abs() / m50_v) < self.config.ma_converge_threshold),
         };
         let atr_median_20 = {
-            Self::push_fixed_window(&mut self.atr_history, atr_v, 20);
+            push_fixed_window(&mut self.atr_history, atr_v, 20);
             if self.atr_history.len() >= 20 {
-                let mut sorted: Vec<f64> = self.atr_history.iter().copied().collect();
-                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                Some((sorted[9] + sorted[10]) / 2.0)
+                let mut values: Vec<f64> = self.atr_history.iter().copied().collect();
+                crate::utils::math::median(&mut values)
             } else {
                 None
             }
@@ -386,7 +388,6 @@ impl FeatureCalculator {
                     _ => RsiState::Neutral,
                 }),
                 volume_state: Some(vs),
-                candle_type: Some(self.identify_candle_type(candle)),
                 ma20_slope: slope,
                 ma20_slope_bars: self.ma20_slope_bars,
                 mtf_aligned: (self.count >= 200).then_some(
@@ -496,18 +497,6 @@ impl FeatureCalculator {
         None
     }
 
-    fn identify_candle_type(&self, c: &Candle) -> CandleType {
-        let body = (c.close - c.open).abs();
-        let range = c.high - c.low;
-        if range > f64::EPSILON && (body / range) < self.config.doji_body_ratio {
-            CandleType::Doji
-        } else if c.close > c.open {
-            CandleType::BullishBody
-        } else {
-            CandleType::BearishBody
-        }
-    }
-
     fn is_volume_shrinking(&self) -> bool {
         self.volume_history[0].is_some()
             && self.volume_history[1].is_some()
@@ -533,7 +522,7 @@ impl FeatureCalculator {
         if m20.is_nan() || atr <= f64::EPSILON {
             return None;
         }
-        Self::push_fixed_window(&mut self.ma20_history, m20, self.config.slope_period + 1);
+        push_fixed_window(&mut self.ma20_history, m20, self.config.slope_period + 1);
 
         if self.ma20_history.len() < self.config.slope_period + 1 {
             return None;
@@ -577,14 +566,6 @@ impl FeatureCalculator {
         } else {
             Some(TrendStructure::Range)
         }
-    }
-
-    #[inline(always)]
-    fn push_fixed_window(queue: &mut VecDeque<f64>, value: f64, window: usize) {
-        while queue.len() >= window {
-            queue.pop_front();
-        }
-        queue.push_back(value);
     }
 
     pub fn peek(

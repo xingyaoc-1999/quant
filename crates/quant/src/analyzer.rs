@@ -1,21 +1,33 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use common::Symbol;
-use core::fmt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::{collections::HashMap, f64, str::FromStr};
+use std::{any::Any, collections::HashMap, f64};
 use tracing::warn;
 
 use crate::{
+    config::AnalyzerConfig,
     report::AnalysisAudit,
-    types::{DerivativeSnapshot, RoleData},
+    types::{
+        futures::{Role, RoleData},
+        market::DerivativeSnapshot,
+    },
 };
 
-pub mod context;
-pub mod signal;
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub mod fakeout;
+pub mod gravity;
+pub mod regime;
+pub mod resonance;
+pub mod volatility;
+pub mod volume;
+
+// 重导出分析器，便于外部使用
+pub use gravity::GravityAnalyzer;
+pub use volatility::VolatilityEnvironmentAnalyzer;
+
+// ==================== ContextKey ====================
+#[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Clone, Copy)]
 pub enum ContextKey {
     // 波动率环境
     VolAtrRatio,
@@ -31,135 +43,273 @@ pub enum ContextKey {
     // 物理引擎数据
     SpaceGravityWells,
     GravitySigma,
-    StopLossLevels,   // Vec<f64>
-    TakeProfitLevels, // Vec<f64>
-    WeightedRR,       // f64
+    StopLossLevels,
+    TakeProfitLevels,
+    WeightedRR,
     PositionSizePct,
     LastEfficiency,
     LastRVol,
     FundingRate,
+    MarketStressLevel,
+    FakeoutState,
 }
 
-#[derive(
-    Debug, Hash, Eq, PartialEq, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialOrd, Ord,
-)]
-pub enum Role {
-    Entry,
-    Filter,
-    Trend,
-}
-
-impl Role {
-    pub fn icon(&self) -> &'static str {
-        match self {
-            Self::Entry => "🎯",
-            Self::Filter => "🔍",
-            Self::Trend => "📈",
-        }
-    }
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Entry => "Entry",
-            Self::Filter => "Filter",
-            Self::Trend => "Trend",
-        }
-    }
-}
-
-impl fmt::Display for Role {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.icon(), self.as_str())
-    }
-}
-
-impl FromStr for Role {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "Entry" => Ok(Self::Entry),
-            "Filter" => Ok(Self::Filter),
-            "Trend" => Ok(Self::Trend),
-            _ => Err(format!("Unknown role: '{}'", s)),
-        }
-    }
-}
-
+// ==================== AnalyzerKind ====================
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 pub enum AnalyzerKind {
-    Momentum,
-    VolumeProfile,
-    SupportResistance,
+    Resonance,
+    VolumeStructure,
+    Gravity,
     Volatility,
     MarketRegime,
     Fakeout,
 }
 
+// ==================== AnalysisResult ====================
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct AnalysisResult {
+pub struct AnalysisResult<Extra = ()> {
     pub kind: AnalyzerKind,
     pub score: f64,
     pub is_violation: bool,
     pub weight_multiplier: f64,
     pub description: String,
-    pub tag: String,
     pub rationale: Vec<String>,
-    pub debug_data: Value,
+    #[serde(skip)]
+    pub extra: Extra,
 }
 
-impl AnalysisResult {
-    pub fn new(kind: AnalyzerKind, tag: String) -> Self {
+impl<Extra: Default> AnalysisResult<Extra> {
+    pub fn new(kind: AnalyzerKind) -> Self {
         Self {
             kind,
-            tag,
             score: 0.0,
             is_violation: false,
             weight_multiplier: 1.0,
             description: "PENDING".into(),
             rationale: vec![],
-            debug_data: json!({}),
+            extra: Extra::default(),
         }
     }
+
     pub fn because(mut self, s: impl Into<String>) -> Self {
         self.rationale.push(s.into());
         self
     }
+
     pub fn violate(mut self) -> Self {
         self.is_violation = true;
         self
     }
+
     pub fn with_score(mut self, s: f64) -> Self {
         self.score = s;
         self
     }
+
     pub fn with_mult(mut self, mult: f64) -> Self {
         self.weight_multiplier = mult;
         self
     }
 
-    pub fn debug(mut self, data: Value) -> Self {
-        self.debug_data = data;
+    pub fn with_extra(mut self, extra: Extra) -> Self {
+        self.extra = extra;
+        self
+    }
+
+    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
+        self.description = desc.into();
         self
     }
 }
 
+// ==================== MarketContext ====================
+#[derive(Debug)]
+pub struct MarketContext {
+    pub symbol: Symbol,
+    pub timestamp: DateTime<Utc>,
+    pub roles: HashMap<Role, RoleData>,
+    pub global: DerivativeSnapshot,
+    pub cache: HashMap<ContextKey, Box<dyn Any + Send + Sync>>,
+}
+
+impl MarketContext {
+    pub fn new(symbol: Symbol, timestamp: DateTime<Utc>) -> Self {
+        Self {
+            symbol,
+            timestamp,
+            roles: HashMap::new(),
+            global: DerivativeSnapshot::default(),
+            cache: HashMap::new(),
+        }
+    }
+
+    pub fn get_role(&self, role: Role) -> Result<&RoleData, AnalysisError> {
+        self.roles
+            .get(&role)
+            .ok_or(AnalysisError::InsufficientData(role))
+    }
+
+    pub fn get_cached<T: 'static>(&self, key: ContextKey) -> Option<&T> {
+        self.cache
+            .get(&key)
+            .and_then(|boxed| boxed.downcast_ref::<T>())
+    }
+
+    pub fn set_cached<T: 'static + Send + Sync>(&mut self, key: ContextKey, value: T) {
+        self.cache.insert(key, Box::new(value));
+    }
+}
+
+// ==================== Analyzer Trait ====================
+pub trait Analyzer: Send + Sync {
+    type Extra: Serialize + Clone + Send + Sync + Default + 'static;
+
+    fn kind(&self) -> AnalyzerKind;
+    fn name(&self) -> &'static str;
+    fn dependencies(&self) -> Vec<ContextKey> {
+        vec![]
+    }
+    fn analyze(
+        &self,
+        ctx: &mut MarketContext,
+    ) -> Result<AnalysisResult<Self::Extra>, AnalysisError>;
+}
+
+impl<T: Analyzer + ?Sized> Analyzer for Box<T> {
+    type Extra = T::Extra;
+    fn kind(&self) -> AnalyzerKind {
+        (**self).kind()
+    }
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+    fn dependencies(&self) -> Vec<ContextKey> {
+        (**self).dependencies()
+    }
+    fn analyze(
+        &self,
+        ctx: &mut MarketContext,
+    ) -> Result<AnalysisResult<Self::Extra>, AnalysisError> {
+        (**self).analyze(ctx)
+    }
+}
+
+pub trait ConfigurableAnalyzer: Analyzer {
+    fn with_config(config: AnalyzerConfig) -> Self;
+    fn config(&self) -> &AnalyzerConfig;
+}
+
+// ==================== Config ====================
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub weights: HashMap<AnalyzerKind, f64>,
+    pub sensitivity: f64,
+    pub divergence_threshold: f64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let mut weights = HashMap::new();
+        weights.insert(AnalyzerKind::MarketRegime, 1.5);
+        weights.insert(AnalyzerKind::Resonance, 1.0);
+        weights.insert(AnalyzerKind::VolumeStructure, 1.0);
+        weights.insert(AnalyzerKind::Gravity, 0.8);
+        weights.insert(AnalyzerKind::Volatility, 0.5);
+        weights.insert(AnalyzerKind::Fakeout, 1.2);
+
+        Self {
+            weights,
+            sensitivity: 0.02,
+            divergence_threshold: 0.2,
+        }
+    }
+}
+
+// ==================== FinalSignal ====================
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
+pub struct FinalSignal {
+    pub symbol: Symbol,
+    pub net_score: f64,
+    pub is_rejected: bool,
+    pub reason: String,
+    pub sub_reports: Vec<AnalysisResult>,
+}
+
+impl FinalSignal {
+    pub fn new_with_reports(symbol: Symbol, score: f64, reports: Vec<AnalysisResult>) -> Self {
+        Self {
+            symbol,
+            net_score: score,
+            is_rejected: false,
+            reason: "OK".to_string(),
+            sub_reports: reports,
+        }
+    }
+
+    pub fn rejected_with_reports(symbol: Symbol, reports: Vec<AnalysisResult>) -> Self {
+        let reason = reports
+            .iter()
+            .filter(|r| r.is_violation)
+            .flat_map(|r| &r.rationale)
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "Violation detected".to_string());
+
+        Self {
+            symbol,
+            net_score: 0.0,
+            is_rejected: true,
+            reason,
+            sub_reports: reports,
+        }
+    }
+
+    pub fn rejected_with_reason(
+        symbol: Symbol,
+        reason: impl Into<String>,
+        reports: Vec<AnalysisResult>,
+    ) -> Self {
+        Self {
+            symbol,
+            net_score: 0.0,
+            is_rejected: true,
+            reason: reason.into(),
+            sub_reports: reports,
+        }
+    }
+}
+
+// ==================== AnalysisError ====================
+#[derive(Debug, thiserror::Error)]
+pub enum AnalysisError {
+    #[error("Missing data for role {0:?}")]
+    InsufficientData(Role),
+    #[error("Calculation error: {0}")]
+    Calculation(String),
+}
+
+// ==================== AnalysisEngine ====================
 pub struct AnalysisEngine {
-    pub analyzers: Vec<Box<dyn Analyzer>>,
+    pub analyzers: Vec<Box<dyn Analyzer<Extra = ()>>>,
     pub config: Config,
 }
 
 impl AnalysisEngine {
-    pub fn new(config: Config, analyzers: Vec<Box<dyn Analyzer>>) -> Self {
+    pub fn new(config: Config, analyzers: Vec<Box<dyn Analyzer<Extra = ()>>>) -> Self {
         Self { analyzers, config }
     }
 
     pub fn run(&self, ctx: &mut MarketContext) -> AnalysisAudit {
         let mut results = Vec::new();
+        let mut warnings = Vec::new();
 
         for analyzer in &self.analyzers {
             match analyzer.analyze(ctx) {
                 Ok(res) => results.push(res),
                 Err(e) => {
-                    warn!("Analyzer {} failed: {}", analyzer.name(), e);
+                    let msg = format!("Analyzer {} failed: {}", analyzer.name(), e);
+                    warn!("{}", msg);
+                    warnings.push(msg);
                 }
             }
         }
@@ -169,13 +319,9 @@ impl AnalysisEngine {
     }
 
     fn aggregate(&self, ctx: &MarketContext, results: Vec<AnalysisResult>) -> FinalSignal {
-        let violation_tag = results
-            .iter()
-            .find(|r| r.is_violation)
-            .map(|r| r.tag.clone());
-
-        if let Some(tag) = violation_tag {
-            return FinalSignal::rejected_with_reports(ctx.symbol, &tag, results);
+        // 1. 违规优先
+        if results.iter().any(|r| r.is_violation) {
+            return FinalSignal::rejected_with_reports(ctx.symbol, results);
         }
 
         let mut total_weighted_score = 0.0;
@@ -184,8 +330,7 @@ impl AnalysisEngine {
         let mut neg_weighted_sum = 0.0;
 
         for res in &results {
-            let base_weight = self.config.weights.get(&res.kind).cloned().unwrap_or(1.0);
-
+            let base_weight = self.config.weights.get(&res.kind).copied().unwrap_or(1.0);
             let final_weight = base_weight * res.weight_multiplier;
 
             total_weighted_score += res.score * final_weight;
@@ -211,121 +356,22 @@ impl AnalysisEngine {
             1.0
         };
 
-        if total_active_weight > 0.0 && resonance_factor < 0.2 {
-            return FinalSignal::rejected_with_reports(ctx.symbol, "HIGH_DIVERGENCE", results);
+        // 高分歧拒绝
+        if self.config.divergence_threshold > 0.0
+            && total_active_weight > 0.0
+            && resonance_factor < self.config.divergence_threshold
+        {
+            return FinalSignal::rejected_with_reason(ctx.symbol, "HIGH_DIVERGENCE", results);
         }
-        let final_score =
-            self.normalize_to_standard_range(net_score * (0.5 + 0.5 * resonance_factor));
+
+        let raw_score = net_score * (0.5 + 0.5 * resonance_factor);
+        let final_score = self.normalize_to_standard_range(raw_score);
 
         FinalSignal::new_with_reports(ctx.symbol, final_score, results)
     }
 
     fn normalize_to_standard_range(&self, score: f64) -> f64 {
         let normalized = (score * self.config.sensitivity).tanh();
-        (normalized * 100.0).round()
+        (normalized * 100.0 * 10.0).round() / 10.0
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct MarketContext {
-    pub symbol: Symbol,
-    pub timestamp: DateTime<Utc>,
-    pub roles: HashMap<Role, RoleData>,
-    pub global: DerivativeSnapshot,
-    pub cache: HashMap<ContextKey, Value>,
-}
-
-impl MarketContext {
-    pub fn new(symbol: Symbol, timestamp: DateTime<Utc>) -> Self {
-        Self {
-            symbol,
-            timestamp,
-            roles: HashMap::new(),
-            global: DerivativeSnapshot::default(),
-            cache: HashMap::new(),
-        }
-    }
-
-    pub fn get_role(&self, role: Role) -> Result<&RoleData, AnalysisError> {
-        self.roles
-            .get(&role)
-            .ok_or(AnalysisError::InsufficientData(role))
-    }
-
-    pub fn get_cached<T: serde::de::DeserializeOwned>(&self, key: ContextKey) -> Option<T> {
-        self.cache
-            .get(&key)
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-    }
-
-    pub fn set_cached<T: Serialize>(&mut self, key: ContextKey, value: T) {
-        self.cache.insert(key, json!(value));
-    }
-}
-
-pub trait Analyzer: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn kind(&self) -> AnalyzerKind;
-    fn analyze(&self, ctx: &mut MarketContext) -> Result<AnalysisResult, AnalysisError>;
-}
-
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub weights: HashMap<AnalyzerKind, f64>,
-    pub sensitivity: f64,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        let mut weights = HashMap::new();
-        weights.insert(AnalyzerKind::MarketRegime, 1.5);
-        weights.insert(AnalyzerKind::Momentum, 1.0);
-        weights.insert(AnalyzerKind::VolumeProfile, 1.0);
-        weights.insert(AnalyzerKind::SupportResistance, 0.8);
-        weights.insert(AnalyzerKind::Volatility, 0.5);
-        weights.insert(AnalyzerKind::Fakeout, 1.2);
-
-        Self {
-            weights,
-            sensitivity: 0.02,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-pub struct FinalSignal {
-    pub symbol: Symbol,
-    pub net_score: f64,
-    pub is_rejected: bool,
-    pub reason: String,
-    pub sub_reports: Vec<AnalysisResult>,
-}
-
-impl FinalSignal {
-    pub fn new_with_reports(symbol: Symbol, score: f64, reports: Vec<AnalysisResult>) -> Self {
-        Self {
-            symbol,
-            net_score: score,
-            is_rejected: false,
-            reason: "OK".into(),
-            sub_reports: reports,
-        }
-    }
-    pub fn rejected_with_reports(symbol: Symbol, tag: &str, reports: Vec<AnalysisResult>) -> Self {
-        Self {
-            symbol,
-            net_score: 0.0,
-            is_rejected: true,
-            reason: format!("Violation: {}", tag),
-            sub_reports: reports,
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum AnalysisError {
-    #[error("Missing data for role {0:?}")]
-    InsufficientData(Role),
-    #[error("Calculation error: {0}")]
-    Calculation(String),
 }
