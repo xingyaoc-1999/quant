@@ -15,13 +15,15 @@ use common::{
     Symbol,
 };
 use notify::telegram::BotApp;
-use quant::analyzer::{
-    context::{
-        gravity::GravityAnalyzer, regime::MarketRegimeAnalyzer,
-        volatility::VolatilityEnvironmentAnalyzer, volume::VolumeStructureAnalyzer,
+use quant::analyzer::ConfigurableAnalyzer;
+
+use quant::{
+    analyzer::{
+        AnalysisEngine, AnalyzerWrapper, Config, FakeoutDetector, GravityAnalyzer,
+        MarketRegimeAnalyzer, ResonanceAnalyzer, VolatilityEnvironmentAnalyzer,
+        VolumeStructureAnalyzer,
     },
-    signal::{fakeout_detector::FakeoutDetector, momentum_resonance::ResonanceAnalyzer},
-    AnalysisEngine, Analyzer, Config,
+    config::AnalyzerConfig,
 };
 use ractor::{cast, Actor};
 use rig::tool::ToolSet;
@@ -46,18 +48,28 @@ async fn main() -> Result<()> {
     let storage = Arc::new(init_storage(&config.database).await?);
     let archive = Arc::new(ArchiveProvider::new(proxy_pool.clone()));
 
-    // ========== 核心分析层 ==========
     let ctx_manager = Arc::new(FeatureContextManager::new(&symbols));
-    let analyzers: Vec<Box<dyn Analyzer>> = vec![
-        Box::new(VolatilityEnvironmentAnalyzer),
-        Box::new(MarketRegimeAnalyzer),
-        Box::new(GravityAnalyzer),
-        Box::new(VolumeStructureAnalyzer),
-        Box::new(ResonanceAnalyzer),
-        Box::new(FakeoutDetector),
+    let analyzer_config = AnalyzerConfig::default();
+
+    let analyzers: Vec<Box<dyn AnalyzerWrapper>> = vec![
+        Box::new(VolatilityEnvironmentAnalyzer::with_config(
+            analyzer_config.clone(),
+        )),
+        Box::new(GravityAnalyzer::with_config(analyzer_config.clone())),
+        Box::new(MarketRegimeAnalyzer::with_config(analyzer_config.clone())),
+        Box::new(VolumeStructureAnalyzer::with_config(
+            analyzer_config.clone(),
+        )),
+        Box::new(FakeoutDetector::with_config(analyzer_config.clone())),
+        Box::new(ResonanceAnalyzer::with_config(analyzer_config.clone())),
     ];
+
     let engine = Arc::new(AnalysisEngine::new(Config::default(), analyzers));
-    let analysis_service = Arc::new(AnalysisService::new(engine.clone()));
+    let analysis_service = Arc::new(AnalysisService::new(
+        engine.clone(),
+        ctx_manager.clone(),
+        analyzer_config.clone(),
+    ));
 
     let integrity = Arc::new(DataIntegrityManager::new(
         symbols.clone(),

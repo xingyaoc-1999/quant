@@ -119,7 +119,7 @@ impl Analyzer for ResonanceAnalyzer {
                 }
                 (DivergenceType::Bearish, false) => {
                     m_resonance *= cfg.bearish_div_short_boost;
-                    extra_score += cfg.bearish_div_short_score_boost;
+                    extra_score -= cfg.bearish_div_short_score_boost;
                     description.push("BEAR_DIV:SHORT_OK".to_string());
                 }
                 (DivergenceType::Bullish, true) => {
@@ -134,7 +134,6 @@ impl Analyzer for ResonanceAnalyzer {
                 }
             }
         }
-
         // MTF 对齐检查
         let mtf_aligned = match ctx.get_cached::<TrendStructure>(ContextKey::RegimeStructure) {
             Some(TrendStructure::StrongBullish | TrendStructure::Bullish) => is_long,

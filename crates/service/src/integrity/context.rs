@@ -1,10 +1,14 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use common::{config::Appconfig, Candle, Interval, OpenInterestRecord, Symbol};
 use dashmap::DashMap;
 use quant::{
-    analyzer::{MarketContext, Role},
+    analyzer::{ContextKey, MarketContext},
     calculator::FeatureCalculator,
-    types::{DerivativeSnapshot, OIData, RoleData, TakerFlowData},
+    types::{
+        futures::{OIData, Role, RoleData, TakerFlowData},
+        gravity::PriceGravityWell,
+        market::DerivativeSnapshot,
+    },
 };
 use rayon::prelude::*;
 use std::sync::{
@@ -15,21 +19,16 @@ use std::{
     collections::{HashMap, VecDeque},
     f64,
 };
-use tracing::{info, warn};
-
-// ==================== 1. Role 处理器 (逻辑计算单元) ====================
+use tracing::info;
 
 pub struct RoleProcessor {
     pub interval: Interval,
     pub calculator: FeatureCalculator,
     pub current_acc: Option<Candle>,
     pub last_processed_ts: i64,
-
-    // --- 惰性计算相关字段 ---
-    pub last_calc_volume: f64,              // 上次计算时的累积成交量
-    pub last_calc_ts: i64,                  // 上次计算时的 Acc 时间戳
-    pub cached_role_data: Option<RoleData>, // 缓存上一次 Peek 的结果
-
+    pub last_calc_volume: f64,
+    pub last_calc_ts: i64,
+    pub cached_role_data: Option<RoleData>,
     pub oi_history: VecDeque<f64>,
     pub max_history_size: usize,
 }
@@ -42,7 +41,6 @@ impl RoleProcessor {
             Interval::M15 => 121,
             _ => 61,
         };
-
         Self {
             interval,
             calculator: FeatureCalculator::new(interval),
@@ -56,7 +54,6 @@ impl RoleProcessor {
         }
     }
 
-    /// 检查当前累加器数据是否相对于缓存已更新
     #[inline]
     pub fn is_dirty(&self) -> bool {
         if let Some(acc) = &self.current_acc {
@@ -75,13 +72,11 @@ impl RoleProcessor {
 
         if let Some(ref mut acc) = self.current_acc {
             if bucket_ts > acc.timestamp {
-                // 周期切换，返回旧的闭合 Bar
                 return self.current_acc.replace(Candle {
                     timestamp: bucket_ts,
                     ..*m1
                 });
             }
-            // 增量更新当前 Acc
             acc.high = acc.high.max(m1.high);
             acc.low = acc.low.min(m1.low);
             acc.close = m1.close;
@@ -104,19 +99,16 @@ impl RoleProcessor {
         if cur_price <= f64::EPSILON || cur_oi <= f64::EPSILON {
             return None;
         }
-
         let steps = [1, 3, 7, 14];
         let len = self.oi_history.len();
         if len == 0 {
             return Some(OIData::new(cur_oi, cur_oi_val, vec![0.0; 4]));
         }
-
         let is_already_pushed = self
             .oi_history
             .back()
             .map_or(false, |&last| (last - cur_oi).abs() < f64::EPSILON);
         let offset = if is_already_pushed { 1 } else { 0 };
-
         let change_history = steps
             .iter()
             .map(|&step| {
@@ -132,22 +124,29 @@ impl RoleProcessor {
                 0.0
             })
             .collect();
-
         Some(OIData::new(cur_oi, cur_oi_val, change_history))
     }
 }
 
-// ==================== 2. 上下文管理器 (FeatureContextManager) ====================
+// ==================== 跨周期持久化状态 ====================
+#[derive(Debug, Clone, Default)]
+pub struct CrossCycleState {
+    /// 引力井列表（包含磨损计数、磁力状态）
+    pub gravity_wells: Vec<PriceGravityWell>,
+    /// 假突破状态缓存 (well_key -> (confirm_count, cooldown_remaining))
+    pub fakeout_state: HashMap<String, (usize, usize)>,
+}
 
+// ==================== 上下文管理器 ====================
 pub struct SymbolContext {
     pub roles: RwLock<HashMap<Role, RoleProcessor>>,
     pub latest_snap: RwLock<DerivativeSnapshot>,
 }
 
 pub struct FeatureContextManager {
-    pub registry: DashMap<Symbol, MarketContext>,
     pub symbol_contexts: DashMap<Symbol, SymbolContext>,
     pub global_btc_price: AtomicU64,
+    pub cross_cycle_state: DashMap<Symbol, CrossCycleState>,
 }
 
 impl FeatureContextManager {
@@ -170,9 +169,9 @@ impl FeatureContextManager {
         }
 
         Self {
-            registry: DashMap::new(),
             symbol_contexts,
             global_btc_price: AtomicU64::new(f64::NAN.to_bits()),
+            cross_cycle_state: DashMap::new(), // 修复：DashMap 初始化正确语法
         }
     }
 
@@ -192,15 +191,12 @@ impl FeatureContextManager {
             self.global_btc_price
                 .store(candle.close.to_bits(), Ordering::Relaxed);
         }
-
-        // 更新快照价格
         self.update_price_from_m1(symbol, candle.close, candle.timestamp);
 
         let symbol_ctx = match self.symbol_contexts.get(&symbol) {
             Some(ctx) => ctx,
             None => return,
         };
-
         let mut roles_guard = symbol_ctx.roles.write().expect("Lock poisoned");
         let g_close = self.get_global_btc();
 
@@ -232,18 +228,15 @@ impl FeatureContextManager {
                         snap.current_oi_amount,
                         snap.current_oi_value,
                     );
-
                     let new_data = RoleData {
                         interval: proc.interval,
                         feature_set,
                         taker_flow: TakerFlowData::from_candle(acc),
                         oi_data,
                     };
-
                     proc.last_calc_ts = acc.timestamp;
                     proc.last_calc_volume = acc.volume;
                     proc.cached_role_data = Some(new_data.clone());
-
                     current_roles_data.insert(*role, new_data);
                 }
             } else if let Some(cache) = &proc.cached_role_data {
@@ -255,9 +248,31 @@ impl FeatureContextManager {
         mc.global = snap;
         mc.roles = current_roles_data;
 
-        // 同步到 Registry
-        self.registry.insert(symbol, mc.clone());
+        // 从跨周期持久化存储中读取状态，注入到缓存
+        if let Some(state) = self.cross_cycle_state.get(&symbol) {
+            mc.set_cached(ContextKey::SpaceGravityWells, state.gravity_wells.clone());
+            mc.set_cached(ContextKey::FakeoutState, state.fakeout_state.clone());
+        }
         Some(mc)
+    }
+
+    pub fn save_cross_cycle_state(&self, symbol: Symbol, ctx: &MarketContext) {
+        let gravity_wells = ctx
+            .get_cached::<Vec<PriceGravityWell>>(ContextKey::SpaceGravityWells)
+            .cloned()
+            .unwrap_or_default();
+        let fakeout_state = ctx
+            .get_cached::<HashMap<String, (usize, usize)>>(ContextKey::FakeoutState)
+            .cloned()
+            .unwrap_or_default();
+
+        self.cross_cycle_state.insert(
+            symbol,
+            CrossCycleState {
+                gravity_wells,
+                fakeout_state,
+            },
+        );
     }
 
     pub fn warmup_symbols(
@@ -289,7 +304,6 @@ impl FeatureContextManager {
             Some(ctx) => ctx,
             None => return,
         };
-
         let mut roles_guard = symbol_ctx.roles.write().expect("Lock poisoned");
 
         for (_, proc) in roles_guard.iter_mut() {
@@ -345,7 +359,6 @@ impl FeatureContextManager {
     pub fn update_oi_from_poller(&self, symbol: Symbol, amount: f64, ts: i64) {
         if let Some(symbol_ctx) = self.symbol_contexts.get(&symbol) {
             let mut lock = symbol_ctx.latest_snap.write().expect("Lock poisoned");
-
             lock.current_oi_amount = amount;
             if lock.last_price > 0.0 {
                 lock.current_oi_value = amount * lock.last_price;
@@ -357,7 +370,6 @@ impl FeatureContextManager {
     pub fn update_price_from_m1(&self, symbol: Symbol, price: f64, ts: i64) {
         if let Some(symbol_ctx) = self.symbol_contexts.get(&symbol) {
             let mut lock = symbol_ctx.latest_snap.write().expect("Lock poisoned");
-
             lock.last_price = price;
             lock.timestamp = ts;
             if lock.current_oi_amount > 0.0 {

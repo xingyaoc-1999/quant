@@ -1,5 +1,5 @@
 use common::Symbol;
-use quant::{analyzer::AnalysisEngine, report::AnalysisAudit, risk_manager::TradeDirection};
+use quant::{analyzer::AnalysisEngine, config::AnalyzerConfig, report::AnalysisAudit};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::info;
@@ -15,35 +15,35 @@ pub struct AnalysisEvent {
 pub struct AnalysisService {
     event_tx: broadcast::Sender<AnalysisEvent>,
     engine: Arc<AnalysisEngine>,
+    config: AnalyzerConfig,
+    manager: Arc<FeatureContextManager>,
 }
 
 impl AnalysisService {
-    pub fn new(engine: Arc<AnalysisEngine>) -> Self {
+    pub fn new(
+        engine: Arc<AnalysisEngine>,
+        manager: Arc<FeatureContextManager>,
+        config: AnalyzerConfig,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(256);
-        Self { event_tx, engine }
+        Self {
+            event_tx,
+            engine,
+            config,
+            manager,
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<AnalysisEvent> {
         self.event_tx.subscribe()
     }
 
-    pub async fn analyze(
-        &self,
-        manager: &FeatureContextManager,
-        symbol: Symbol,
-    ) -> Option<AnalysisAudit> {
-        let mut ctx = manager.get_market_context(symbol)?;
+    pub async fn analyze(&self, symbol: Symbol) -> Option<AnalysisAudit> {
+        let mut ctx = self.manager.get_market_context(symbol)?;
         let mut audit = self.engine.run(&mut ctx);
+        self.manager.save_cross_cycle_state(symbol, &ctx);
 
-        let direction = if audit.signal.net_score > 15.0 {
-            Some(TradeDirection::Long)
-        } else if audit.signal.net_score < -15.0 {
-            Some(TradeDirection::Short)
-        } else {
-            None
-        };
-
-        audit.attach_risk(&ctx, direction);
+        audit.attach_risk(&ctx, &self.config);
 
         let _ = self.event_tx.send(AnalysisEvent {
             audit: audit.clone(),
@@ -55,7 +55,6 @@ impl AnalysisService {
     pub fn spawn_worker(
         self: Arc<Self>,
         mut event_rx: mpsc::Receiver<MarketEvent>,
-        manager: Arc<FeatureContextManager>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!("Analysis worker started");
@@ -63,7 +62,7 @@ impl AnalysisService {
             while let Some(event) = event_rx.recv().await {
                 match event {
                     MarketEvent::KlineClosed { symbol } => {
-                        self.analyze(&manager, symbol).await;
+                        self.analyze(symbol).await;
                     }
                 }
             }

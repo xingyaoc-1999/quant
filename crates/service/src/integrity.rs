@@ -196,7 +196,7 @@ impl DataIntegrityManager {
                 }
             });
 
-            service.spawn_worker(event_rx, self.feature_context.clone());
+            service.spawn_worker(event_rx);
 
             let mut buffer = Vec::with_capacity(100);
             let mut flush_interval = interval(Duration::from_secs(5));

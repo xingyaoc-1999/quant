@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// 全局分析器配置（精简版，共21个高层参数）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyzerConfig {
     pub gravity: GravityConfig,
@@ -323,9 +322,7 @@ impl RegimeConfig {
     pub(crate) fn tsunami_base_oi_delta(&self) -> f64 {
         0.02 - self.tsunami_threshold * 0.015
     }
-    pub(crate) fn tsunami_base_taker_ratio(&self) -> f64 {
-        0.55
-    }
+
     pub(crate) fn slope_momentum_boost(&self) -> f64 {
         0.15
     }
@@ -578,6 +575,10 @@ pub struct RiskConfig {
     pub enable_funding_rate: bool,
     pub funding_rate_threshold: f64,
     pub funding_rate_penalty: f64,
+    pub max_loss_per_trade: f64,
+    pub entry_atr_step_mult: f64,
+    pub default_entry_allocations: [f64; 3],
+    pub direction_base_threshold: f64,
 }
 
 impl Default for RiskConfig {
@@ -605,6 +606,10 @@ impl Default for RiskConfig {
             enable_funding_rate: false,
             funding_rate_threshold: 0.001,
             funding_rate_penalty: 0.7,
+            max_loss_per_trade: 0.08,
+            entry_atr_step_mult: 0.5,
+            default_entry_allocations: [0.5, 0.3, 0.2],
+            direction_base_threshold: 10.0,
         }
     }
 }

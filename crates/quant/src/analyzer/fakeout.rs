@@ -56,6 +56,7 @@ impl Analyzer for FakeoutDetector {
             ContextKey::LastEfficiency,
             ContextKey::LastRVol,
             ContextKey::VolumeState,
+            ContextKey::VolPercentile,
         ]
     }
 

@@ -1,9 +1,10 @@
+use crate::config::AnalyzerConfig;
 use crate::types::gravity::PriceGravityWell;
-use crate::types::market::TrendStructure;
-use crate::{config::AnalyzerConfig, types::market::TradeDirection};
+use crate::types::market::{TradeDirection, TrendStructure};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+// ==================== 风险输出结构 ====================
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RiskAssessment {
     pub direction: TradeDirection,
@@ -35,6 +36,7 @@ impl RiskManager {
         Self { config }
     }
 
+    // ---------- 主入口 ----------
     pub fn assess(
         &self,
         direction: Option<TradeDirection>,
@@ -55,23 +57,18 @@ impl RiskManager {
         let mut tags = Vec::with_capacity(16);
         let atr_v = atr_ratio * last_price;
 
-        // 1. 计算分批建仓点位及分配
         let (entry_levels, entry_allocations) =
             self.calculate_entry_levels(wells, last_price, atr_v, is_long, is_tsunami, &mut tags);
 
-        // 2. 计算交易空间结构（SL / TP / 分配）
         let (mut sl, mut tp, alloc) = self
             .calculate_trade_structure(wells, last_price, atr_v, is_long, is_tsunami, &mut tags);
 
-        // 3. 盈亏比计算
         let (wrr, rr_levels) = self.calculate_weighted_rr(last_price, &sl, &tp, &alloc);
 
-        // 4. 动态止盈止损调整
         let (trailing, dynamic) = self.apply_dynamic_adjustments(
             &mut sl, &mut tp, last_price, atr_v, is_long, is_tsunami, &regime, &mut tags,
         );
 
-        // 5. 似然比集合
         let likelihoods = self.compute_likelihoods(
             is_long,
             regime,
@@ -86,13 +83,11 @@ impl RiskManager {
             &mut tags,
         );
 
-        // 6. 贝叶斯融合 → 乘数
         let posterior = self.bayesian_update(self.config.risk.confidence_prior, &likelihoods);
         let conf_mult =
             (posterior * 2.4 - 0.4).clamp(self.config.risk.mult_min, self.config.risk.mult_max);
         tags.push(format!("CONF_MULT:{:.2}", conf_mult));
 
-        // 7. 仓位与亏损计算
         let def_strength = self.get_defense_strength(wells, last_price, is_long);
         let (size, est_loss, violated) = self.calculate_final_position(
             def_strength,
@@ -126,7 +121,182 @@ impl RiskManager {
         })
     }
 
-    // ---------------- 分批建仓点位 ----------------
+    // ---------- 预估计置信乘数（用于动态阈值） ----------
+    pub fn estimate_confidence(
+        &self,
+        is_long_hint: bool,
+        regime: TrendStructure,
+        taker_ratio: f64,
+        vol_p: f64,
+        ma20_dist: Option<f64>,
+        atr_ratio: f64,
+        net_score: f64,
+        is_tsunami: bool,
+        funding_rate: Option<f64>,
+    ) -> f64 {
+        let mut tags = Vec::new(); // 不需要实际标签
+        let lrs = self.compute_base_likelihoods(
+            is_long_hint,
+            regime,
+            taker_ratio,
+            vol_p,
+            ma20_dist,
+            atr_ratio,
+            net_score,
+            is_tsunami,
+            funding_rate,
+            &mut tags,
+        );
+        let posterior = self.bayesian_update(self.config.risk.confidence_prior, &lrs);
+        (posterior * 2.4 - 0.4).clamp(self.config.risk.mult_min, self.config.risk.mult_max)
+    }
+
+    // ---------- 基础似然计算（不含 RR） ----------
+    fn compute_base_likelihoods(
+        &self,
+        is_long: bool,
+        regime: TrendStructure,
+        taker_ratio: f64,
+        vol_p: f64,
+        ma_dist: Option<f64>,
+        atr_r: f64,
+        net_score: f64,
+        is_tsunami: bool,
+        funding_rate: Option<f64>,
+        tags: &mut Vec<String>,
+    ) -> Vec<f64> {
+        let mut lrs = Vec::with_capacity(7);
+        let cfg = &self.config.risk;
+
+        // 1. 趋势结构
+        let trend_ok = match regime {
+            TrendStructure::StrongBullish | TrendStructure::Bullish => is_long,
+            TrendStructure::StrongBearish | TrendStructure::Bearish => !is_long,
+            _ => false,
+        };
+        if trend_ok {
+            tags.push("TREND_OK".into());
+            lrs.push(cfg.lr_trend_strong);
+        } else {
+            tags.push("TREND_WEAK".into());
+            lrs.push(cfg.lr_trend_weak);
+        }
+
+        // 2. Taker 流向
+        let threshold = 0.52 - ((vol_p - 50.0) / 200.0).clamp(-0.05, 0.05);
+        let taker_ok =
+            (is_long && taker_ratio > threshold) || (!is_long && taker_ratio < 1.0 - threshold);
+        if taker_ok {
+            tags.push("TAKER_FLOW_OK".into());
+            lrs.push(cfg.lr_taker_aligned);
+        } else {
+            tags.push("TAKER_MISMATCH".into());
+            lrs.push(cfg.lr_taker_mismatch);
+        }
+
+        // 3. 资金费率
+        if cfg.enable_funding_rate {
+            if let Some(rate) = funding_rate {
+                if (is_long && rate > cfg.funding_rate_threshold)
+                    || (!is_long && rate < -cfg.funding_rate_threshold)
+                {
+                    tags.push(format!("FUNDING_CROWDED:{:.4}", rate));
+                    lrs.push(cfg.funding_rate_penalty);
+                }
+            }
+        }
+
+        // 4. MA 乖离
+        if let Some(dist) = ma_dist {
+            let limit = atr_r * cfg.ma20_extreme_mult;
+            let exceed = (dist.abs() / limit.max(f64::EPSILON)).min(2.0);
+            if exceed > 0.5 {
+                tags.push(format!("MA_OVEREXTEND:{:.1}%", exceed * 100.0));
+                lrs.push(if exceed < 1.0 {
+                    0.85
+                } else if exceed < 1.5 {
+                    0.7
+                } else {
+                    0.55
+                });
+            }
+        }
+
+        // 5. 波动率
+        lrs.push(if vol_p > 70.0 {
+            tags.push("HIGH_VOL".into());
+            1.25
+        } else if vol_p < 20.0 {
+            tags.push("LOW_VOL".into());
+            0.8
+        } else {
+            1.0
+        });
+
+        // 6. 净得分
+        lrs.push(1.0 + (net_score / 100.0).clamp(-1.0, 1.0) * 0.6);
+
+        // 7. 海啸
+        if is_tsunami {
+            lrs.push(cfg.lr_tsunami);
+        }
+        lrs
+    }
+
+    // ---------- 完整似然计算（含 RR） ----------
+    fn compute_likelihoods(
+        &self,
+        is_long: bool,
+        regime: TrendStructure,
+        taker_ratio: f64,
+        vol_p: f64,
+        rr: f64,
+        ma_dist: Option<f64>,
+        atr_r: f64,
+        net_score: f64,
+        is_tsunami: bool,
+        funding_rate: Option<f64>,
+        tags: &mut Vec<String>,
+    ) -> Vec<f64> {
+        let mut lrs = self.compute_base_likelihoods(
+            is_long,
+            regime,
+            taker_ratio,
+            vol_p,
+            ma_dist,
+            atr_r,
+            net_score,
+            is_tsunami,
+            funding_rate,
+            tags,
+        );
+        let min_rr = self.config.risk.rr_min_acceptable;
+        lrs.push(if rr >= min_rr * 1.2 {
+            1.4
+        } else if rr >= min_rr {
+            1.15
+        } else if rr >= 1.5 {
+            0.9
+        } else {
+            0.6
+        });
+        lrs
+    }
+
+    // ---------- 贝叶斯更新 ----------
+    fn bayesian_update(&self, prior: f64, likelihoods: &[f64]) -> f64 {
+        if likelihoods.is_empty() {
+            return prior;
+        }
+        let mut log_odds = (prior / (1.0 - prior).max(f64::EPSILON)).ln();
+        for &lr in likelihoods {
+            log_odds += lr.clamp(0.1, 10.0).ln();
+        }
+        let posterior = 1.0 / (1.0 + (-log_odds).exp());
+        posterior.clamp(0.05, 0.95)
+    }
+
+    // ---------- 分批建仓点位 ----------
     fn calculate_entry_levels(
         &self,
         wells: &[PriceGravityWell],
@@ -137,6 +307,7 @@ impl RiskManager {
         tags: &mut Vec<String>,
     ) -> (Vec<f64>, Vec<f64>) {
         let dir_sign = if is_long { 1.0 } else { -1.0 };
+        let cfg = &self.config.risk;
 
         let mut defense_wells: Vec<_> = wells
             .iter()
@@ -149,7 +320,6 @@ impl RiskManager {
                     }
             })
             .collect();
-
         defense_wells.sort_by(|a, b| {
             (a.level - last_price)
                 .abs()
@@ -161,21 +331,20 @@ impl RiskManager {
 
         if defense_wells.is_empty() {
             tags.push("ENTRY_NO_DEFENSE".into());
-            let step = atr_v * 0.5;
+            let step = atr_v * cfg.entry_atr_step_mult;
             levels.push(last_price);
-            allocs.push(0.5);
+            allocs.push(cfg.default_entry_allocations[0]);
             levels.push(last_price - dir_sign * step);
-            allocs.push(0.3);
+            allocs.push(cfg.default_entry_allocations[1]);
             levels.push(last_price - dir_sign * step * 2.0);
-            allocs.push(0.2);
+            allocs.push(cfg.default_entry_allocations[2]);
         } else {
             let count = defense_wells.len().min(3);
             let mut total_strength = 0.0;
             for i in 0..count {
                 let w = defense_wells[i];
                 levels.push(w.level);
-                let s = w.strength.clamp(0.2, 3.0);
-                total_strength += s;
+                total_strength += w.strength.clamp(0.2, 3.0);
             }
             for i in 0..count {
                 let s = defense_wells[i].strength.clamp(0.2, 3.0);
@@ -183,7 +352,7 @@ impl RiskManager {
             }
             if count < 3 {
                 let last_level = defense_wells[count - 1].level;
-                let step = atr_v * 0.5;
+                let step = atr_v * cfg.entry_atr_step_mult;
                 for i in count..3 {
                     levels.push(last_level - dir_sign * step * (i - count + 1) as f64);
                 }
@@ -205,24 +374,10 @@ impl RiskManager {
             levels[0] = last_price;
             tags.push("ENTRY_TSUNAMI_ADJUST".into());
         }
-
         (levels, allocs)
     }
 
-    // ---------------- 贝叶斯更新 ----------------
-    fn bayesian_update(&self, prior: f64, likelihoods: &[f64]) -> f64 {
-        if likelihoods.is_empty() {
-            return prior;
-        }
-        let mut log_odds = (prior / (1.0 - prior).max(f64::EPSILON)).ln();
-        for &lr in likelihoods {
-            log_odds += lr.clamp(0.1, 10.0).ln();
-        }
-        let posterior = 1.0 / (1.0 + (-log_odds).exp());
-        posterior.clamp(0.05, 0.95)
-    }
-
-    // ---------------- 交易结构计算 ----------------
+    // ---------- 交易结构 ----------
     fn calculate_trade_structure(
         &self,
         wells: &[PriceGravityWell],
@@ -233,6 +388,7 @@ impl RiskManager {
         tags: &mut Vec<String>,
     ) -> (Vec<f64>, Vec<f64>, [f64; 3]) {
         let dir_sign = if is_long { 1.0 } else { -1.0 };
+        let cfg = &self.config.risk;
 
         let mut targets: Vec<_> = wells
             .iter()
@@ -270,17 +426,15 @@ impl RiskManager {
         let base_def = defense
             .map(|w| w.level)
             .unwrap_or_else(|| last_price * (1.0 - dir_sign * 0.015));
-        let sl_levels: Vec<f64> = self
-            .config
-            .risk
+        let sl_levels: Vec<f64> = cfg
             .atr_sl_buffers
             .iter()
             .map(|&buf| {
                 let raw = base_def - dir_sign * atr_v * buf;
                 if is_long {
-                    raw.min(last_price - atr_v * self.config.risk.min_sl_atr_mult)
+                    raw.min(last_price - atr_v * cfg.min_sl_atr_mult)
                 } else {
-                    raw.max(last_price + atr_v * self.config.risk.min_sl_atr_mult)
+                    raw.max(last_price + atr_v * cfg.min_sl_atr_mult)
                 }
             })
             .collect();
@@ -304,11 +458,10 @@ impl RiskManager {
 
         let allocation = if is_tsunami {
             tags.push("TSUNAMI_ALLOC".into());
-            self.config.risk.tsunami_allocation
+            cfg.tsunami_allocation
         } else {
             self.dynamic_allocation(&targets, tags)
         };
-
         (sl_levels, vec![tp1, tp2, tp3], allocation)
     }
 
@@ -348,7 +501,7 @@ impl RiskManager {
         }
     }
 
-    // ---------------- 动态调整 ----------------
+    // ---------- 动态调整 ----------
     fn apply_dynamic_adjustments(
         &self,
         sl: &mut Vec<f64>,
@@ -362,11 +515,12 @@ impl RiskManager {
     ) -> (bool, bool) {
         let mut trailing = false;
         let mut dynamic = false;
+        let cfg = &self.config.risk;
 
         let trail_sl = if is_long {
-            last_price - atr_v * self.config.risk.trailing_atr_mult
+            last_price - atr_v * cfg.trailing_atr_mult
         } else {
-            last_price + atr_v * self.config.risk.trailing_atr_mult
+            last_price + atr_v * cfg.trailing_atr_mult
         };
         let new_sl = if is_long {
             trail_sl.max(sl[0])
@@ -376,10 +530,7 @@ impl RiskManager {
         if (is_long && new_sl > sl[0]) || (!is_long && new_sl < sl[0]) {
             sl[0] = new_sl;
             trailing = true;
-            tags.push(format!(
-                "TRAILING_SL:ATR_{:.1}x",
-                self.config.risk.trailing_atr_mult
-            ));
+            tags.push(format!("TRAILING_SL:ATR_{:.1}x", cfg.trailing_atr_mult));
         }
 
         if (is_long && last_price > tp[0]) || (!is_long && last_price < tp[0]) {
@@ -430,7 +581,7 @@ impl RiskManager {
         (trailing, dynamic)
     }
 
-    // ---------------- RR 计算 ----------------
+    // ---------- 加权盈亏比 ----------
     fn calculate_weighted_rr(
         &self,
         price: f64,
@@ -463,111 +614,7 @@ impl RiskManager {
         (wrr, rr_levels)
     }
 
-    // ---------------- 似然计算 ----------------
-    fn compute_likelihoods(
-        &self,
-        is_long: bool,
-        regime: TrendStructure,
-        taker_ratio: f64,
-        vol_p: f64,
-        rr: f64,
-        ma_dist: Option<f64>,
-        atr_r: f64,
-        net_score: f64,
-        is_tsunami: bool,
-        funding_rate: Option<f64>,
-        tags: &mut Vec<String>,
-    ) -> Vec<f64> {
-        let mut lrs = Vec::with_capacity(8);
-        let cfg = &self.config.risk;
-
-        // 趋势
-        let trend_ok = match regime {
-            TrendStructure::StrongBullish | TrendStructure::Bullish => is_long,
-            TrendStructure::StrongBearish | TrendStructure::Bearish => !is_long,
-            _ => false,
-        };
-        if trend_ok {
-            tags.push("TREND_OK".into());
-            lrs.push(cfg.lr_trend_strong);
-        } else {
-            tags.push("TREND_WEAK".into());
-            lrs.push(cfg.lr_trend_weak);
-        }
-
-        // Taker
-        let threshold = 0.52 - ((vol_p - 50.0) / 200.0).clamp(-0.05, 0.05);
-        let taker_ok =
-            (is_long && taker_ratio > threshold) || (!is_long && taker_ratio < 1.0 - threshold);
-        if taker_ok {
-            tags.push("TAKER_FLOW_OK".into());
-            lrs.push(cfg.lr_taker_aligned);
-        } else {
-            tags.push("TAKER_MISMATCH".into());
-            lrs.push(cfg.lr_taker_mismatch);
-        }
-
-        // 资金费率
-        if cfg.enable_funding_rate {
-            if let Some(rate) = funding_rate {
-                if (is_long && rate > cfg.funding_rate_threshold)
-                    || (!is_long && rate < -cfg.funding_rate_threshold)
-                {
-                    tags.push(format!("FUNDING_CROWDED:{:.4}", rate));
-                    lrs.push(cfg.funding_rate_penalty);
-                }
-            }
-        }
-
-        // MA乖离
-        if let Some(dist) = ma_dist {
-            let limit = atr_r * cfg.ma20_extreme_mult;
-            let exceed = (dist.abs() / limit.max(f64::EPSILON)).min(2.0);
-            if exceed > 0.5 {
-                tags.push(format!("MA_OVEREXTEND:{:.1}%", exceed * 100.0));
-                lrs.push(if exceed < 1.0 {
-                    0.85
-                } else if exceed < 1.5 {
-                    0.7
-                } else {
-                    0.55
-                });
-            }
-        }
-
-        // 波动率
-        lrs.push(if vol_p > 70.0 {
-            tags.push("HIGH_VOL".into());
-            1.25
-        } else if vol_p < 20.0 {
-            tags.push("LOW_VOL".into());
-            0.8
-        } else {
-            1.0
-        });
-
-        // RR
-        let min_rr = cfg.rr_min_acceptable;
-        lrs.push(if rr >= min_rr * 1.2 {
-            1.4
-        } else if rr >= min_rr {
-            1.15
-        } else if rr >= 1.5 {
-            0.9
-        } else {
-            0.6
-        });
-
-        // 净得分
-        lrs.push(1.0 + (net_score / 100.0).clamp(-1.0, 1.0) * 0.6);
-
-        if is_tsunami {
-            lrs.push(cfg.lr_tsunami);
-        }
-        lrs
-    }
-
-    // ---------------- 防御强度 ----------------
+    // ---------- 防御强度 ----------
     fn get_defense_strength(
         &self,
         wells: &[PriceGravityWell],
@@ -589,7 +636,7 @@ impl RiskManager {
             .unwrap_or(1.0)
     }
 
-    // ---------------- 最终仓位 ----------------
+    // ---------- 最终仓位 ----------
     fn calculate_final_position(
         &self,
         def_strength: f64,

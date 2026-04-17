@@ -351,6 +351,16 @@ impl FeatureCalculator {
                 None
             }
         };
+        self.prev_macd = Some(macd_out.macd);
+        self.prev_signal = Some(macd_out.signal);
+        self.prev_macd_histogram = Some(macd_out.histogram);
+        self.prev_ma20_satisfied = Some(curr_above_m20);
+        self.volume_history = [
+            Some(candle.volume),
+            self.volume_history[0],
+            self.volume_history[1],
+        ];
+        self.rsi_history = [Some(rsi_v), self.rsi_history[0], self.rsi_history[1]];
         FeatureSet {
             bucket,
             symbol: candle.symbol,

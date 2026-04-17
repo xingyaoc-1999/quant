@@ -1,4 +1,3 @@
-use anyhow::Result;
 use chrono::{DateTime, Utc};
 use common::Symbol;
 use schemars::JsonSchema;
@@ -22,30 +21,26 @@ pub mod resonance;
 pub mod volatility;
 pub mod volume;
 
-// 重导出分析器，便于外部使用
+pub use fakeout::FakeoutDetector;
 pub use gravity::GravityAnalyzer;
+pub use regime::MarketRegimeAnalyzer;
+pub use resonance::ResonanceAnalyzer;
 pub use volatility::VolatilityEnvironmentAnalyzer;
+pub use volume::VolumeStructureAnalyzer;
 
 // ==================== ContextKey ====================
 #[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Clone, Copy)]
 pub enum ContextKey {
-    // 波动率环境
     VolAtrRatio,
     VolIsCompressed,
     VolPercentile,
     VolumeState,
-    // 市场结构
     RegimeStructure,
     MarketCorrelation,
     IsMomentumTsunami,
     OiPositionState,
-
-    // 物理引擎数据
     SpaceGravityWells,
     GravitySigma,
-    StopLossLevels,
-    TakeProfitLevels,
-    WeightedRR,
     PositionSizePct,
     LastEfficiency,
     LastRVol,
@@ -74,7 +69,6 @@ pub struct AnalysisResult<Extra = ()> {
     pub weight_multiplier: f64,
     pub description: String,
     pub rationale: Vec<String>,
-    #[serde(skip)]
     pub extra: Extra,
 }
 
@@ -122,6 +116,72 @@ impl<Extra: Default> AnalysisResult<Extra> {
     }
 }
 
+// ==================== 类型擦除结果 ====================
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ErasedAnalysisResult {
+    pub kind: AnalyzerKind,
+    pub score: f64,
+    pub is_violation: bool,
+    pub weight_multiplier: f64,
+    pub description: String,
+    pub rationale: Vec<String>,
+}
+
+// ==================== Analyzer Trait ====================
+pub trait Analyzer: Send + Sync {
+    type Extra: Serialize + Clone + Send + Sync + Default + 'static;
+
+    fn kind(&self) -> AnalyzerKind;
+    fn name(&self) -> &'static str;
+    fn dependencies(&self) -> Vec<ContextKey> {
+        vec![]
+    }
+    fn analyze(
+        &self,
+        ctx: &mut MarketContext,
+    ) -> Result<AnalysisResult<Self::Extra>, AnalysisError>;
+}
+
+// ==================== AnalyzerWrapper ====================
+pub trait AnalyzerWrapper: Send + Sync {
+    fn analyze_erased(
+        &self,
+        ctx: &mut MarketContext,
+    ) -> Result<ErasedAnalysisResult, AnalysisError>;
+    fn kind(&self) -> AnalyzerKind;
+    fn name(&self) -> &'static str;
+    fn dependencies(&self) -> Vec<ContextKey>;
+}
+
+impl<T: Analyzer> AnalyzerWrapper for T {
+    fn analyze_erased(
+        &self,
+        ctx: &mut MarketContext,
+    ) -> Result<ErasedAnalysisResult, AnalysisError> {
+        let result = self.analyze(ctx)?;
+        Ok(ErasedAnalysisResult {
+            kind: result.kind,
+            score: result.score,
+            is_violation: result.is_violation,
+            weight_multiplier: result.weight_multiplier,
+            description: result.description,
+            rationale: result.rationale,
+        })
+    }
+
+    fn kind(&self) -> AnalyzerKind {
+        self.kind()
+    }
+
+    fn name(&self) -> &'static str {
+        self.name()
+    }
+
+    fn dependencies(&self) -> Vec<ContextKey> {
+        self.dependencies()
+    }
+}
+
 // ==================== MarketContext ====================
 #[derive(Debug)]
 pub struct MarketContext {
@@ -160,40 +220,7 @@ impl MarketContext {
     }
 }
 
-// ==================== Analyzer Trait ====================
-pub trait Analyzer: Send + Sync {
-    type Extra: Serialize + Clone + Send + Sync + Default + 'static;
-
-    fn kind(&self) -> AnalyzerKind;
-    fn name(&self) -> &'static str;
-    fn dependencies(&self) -> Vec<ContextKey> {
-        vec![]
-    }
-    fn analyze(
-        &self,
-        ctx: &mut MarketContext,
-    ) -> Result<AnalysisResult<Self::Extra>, AnalysisError>;
-}
-
-impl<T: Analyzer + ?Sized> Analyzer for Box<T> {
-    type Extra = T::Extra;
-    fn kind(&self) -> AnalyzerKind {
-        (**self).kind()
-    }
-    fn name(&self) -> &'static str {
-        (**self).name()
-    }
-    fn dependencies(&self) -> Vec<ContextKey> {
-        (**self).dependencies()
-    }
-    fn analyze(
-        &self,
-        ctx: &mut MarketContext,
-    ) -> Result<AnalysisResult<Self::Extra>, AnalysisError> {
-        (**self).analyze(ctx)
-    }
-}
-
+// ==================== ConfigurableAnalyzer ====================
 pub trait ConfigurableAnalyzer: Analyzer {
     fn with_config(config: AnalyzerConfig) -> Self;
     fn config(&self) -> &AnalyzerConfig;
@@ -205,6 +232,7 @@ pub struct Config {
     pub weights: HashMap<AnalyzerKind, f64>,
     pub sensitivity: f64,
     pub divergence_threshold: f64,
+    pub min_signal_threshold: f64,
 }
 
 impl Default for Config {
@@ -221,6 +249,7 @@ impl Default for Config {
             weights,
             sensitivity: 0.02,
             divergence_threshold: 0.2,
+            min_signal_threshold: 5.0,
         }
     }
 }
@@ -232,11 +261,15 @@ pub struct FinalSignal {
     pub net_score: f64,
     pub is_rejected: bool,
     pub reason: String,
-    pub sub_reports: Vec<AnalysisResult>,
+    pub sub_reports: Vec<ErasedAnalysisResult>,
 }
 
 impl FinalSignal {
-    pub fn new_with_reports(symbol: Symbol, score: f64, reports: Vec<AnalysisResult>) -> Self {
+    pub fn new_with_reports(
+        symbol: Symbol,
+        score: f64,
+        reports: Vec<ErasedAnalysisResult>,
+    ) -> Self {
         Self {
             symbol,
             net_score: score,
@@ -246,7 +279,7 @@ impl FinalSignal {
         }
     }
 
-    pub fn rejected_with_reports(symbol: Symbol, reports: Vec<AnalysisResult>) -> Self {
+    pub fn rejected_with_reports(symbol: Symbol, reports: Vec<ErasedAnalysisResult>) -> Self {
         let reason = reports
             .iter()
             .filter(|r| r.is_violation)
@@ -267,7 +300,7 @@ impl FinalSignal {
     pub fn rejected_with_reason(
         symbol: Symbol,
         reason: impl Into<String>,
-        reports: Vec<AnalysisResult>,
+        reports: Vec<ErasedAnalysisResult>,
     ) -> Self {
         Self {
             symbol,
@@ -290,26 +323,24 @@ pub enum AnalysisError {
 
 // ==================== AnalysisEngine ====================
 pub struct AnalysisEngine {
-    pub analyzers: Vec<Box<dyn Analyzer<Extra = ()>>>,
+    pub analyzers: Vec<Box<dyn AnalyzerWrapper>>,
     pub config: Config,
 }
 
 impl AnalysisEngine {
-    pub fn new(config: Config, analyzers: Vec<Box<dyn Analyzer<Extra = ()>>>) -> Self {
+    pub fn new(config: Config, analyzers: Vec<Box<dyn AnalyzerWrapper>>) -> Self {
         Self { analyzers, config }
     }
 
     pub fn run(&self, ctx: &mut MarketContext) -> AnalysisAudit {
         let mut results = Vec::new();
-        let mut warnings = Vec::new();
 
         for analyzer in &self.analyzers {
-            match analyzer.analyze(ctx) {
+            match analyzer.analyze_erased(ctx) {
                 Ok(res) => results.push(res),
                 Err(e) => {
                     let msg = format!("Analyzer {} failed: {}", analyzer.name(), e);
                     warn!("{}", msg);
-                    warnings.push(msg);
                 }
             }
         }
@@ -318,8 +349,7 @@ impl AnalysisEngine {
         AnalysisAudit::build(ctx, signal)
     }
 
-    fn aggregate(&self, ctx: &MarketContext, results: Vec<AnalysisResult>) -> FinalSignal {
-        // 1. 违规优先
+    fn aggregate(&self, ctx: &MarketContext, results: Vec<ErasedAnalysisResult>) -> FinalSignal {
         if results.iter().any(|r| r.is_violation) {
             return FinalSignal::rejected_with_reports(ctx.symbol, results);
         }
@@ -356,7 +386,6 @@ impl AnalysisEngine {
             1.0
         };
 
-        // 高分歧拒绝
         if self.config.divergence_threshold > 0.0
             && total_active_weight > 0.0
             && resonance_factor < self.config.divergence_threshold
@@ -366,6 +395,14 @@ impl AnalysisEngine {
 
         let raw_score = net_score * (0.5 + 0.5 * resonance_factor);
         let final_score = self.normalize_to_standard_range(raw_score);
+
+        if final_score.abs() < self.config.min_signal_threshold {
+            return FinalSignal::rejected_with_reason(
+                ctx.symbol,
+                format!("WEAK_SIGNAL({:.1})", final_score),
+                results,
+            );
+        }
 
         FinalSignal::new_with_reports(ctx.symbol, final_score, results)
     }

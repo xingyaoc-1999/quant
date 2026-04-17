@@ -251,7 +251,8 @@ impl MarketRegimeAnalyzer {
     fn calc_slope_factor(&self, slope: Option<f64>, bars: i32) -> f64 {
         if let Some(s) = slope {
             let slope_abs = s.abs().min(5.0);
-            let bars_factor = (bars as f64 / 10.0).min(1.5);
+            let bars_abs = bars.abs() as f64; // 取绝对值
+            let bars_factor = (bars_abs / 10.0).min(1.5);
             1.0 + slope_abs * 0.1 * bars_factor
         } else {
             1.0
@@ -261,7 +262,8 @@ impl MarketRegimeAnalyzer {
     fn calc_slope_boost(&self, slope: f64, bars: i32) -> f64 {
         let cfg = &self.config.regime;
         let slope_strength = slope.abs().min(3.0);
-        let bars_factor = if bars >= cfg.slope_bars_threshold() {
+        let bars_abs = bars.abs(); // 取绝对值
+        let bars_factor = if bars_abs >= cfg.slope_bars_threshold() {
             1.2
         } else {
             1.0
