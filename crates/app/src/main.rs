@@ -104,8 +104,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         info!("Analysis notification worker started");
         while let Ok(event) = analysis_rx.recv().await {
-            let msg = event.audit.to_markdown_v2();
-            let _ = tg_sender.send((msg, event.audit.signal.symbol)).await;
+            let _ = tg_sender.send((event.message, event.symbol)).await;
         }
         info!("Analysis notification worker stopped");
     });

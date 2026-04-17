@@ -6,6 +6,7 @@ use crate::{
         futures::Role,
         gravity::{PriceGravityWell, WellSide},
         market::{TradeDirection, TrendStructure},
+        session::TradingSession,
     },
 };
 use chrono::Utc;
@@ -162,13 +163,10 @@ impl AnalysisAudit {
             config.risk.direction_base_threshold, // 从配置读取
         );
 
-        let dir = direction?;
-
-        // ---- 完整风险评估（使用配置中的最大亏损比例） ----
         let max_loss_pct = Some(config.risk.max_loss_per_trade);
 
         let risk = risk_mgr.assess(
-            Some(dir),
+            direction,
             &self.gravity_wells,
             self.snapshot.price,
             atr_ratio,
@@ -186,11 +184,14 @@ impl AnalysisAudit {
         self.risk_assessment.as_ref()
     }
 
-    pub fn to_markdown_v2(&self) -> String {
+    pub fn to_markdown_v2(&self, ctx: &MarketContext) -> String {
         debug!(?self);
 
         let signal = &self.signal;
         let snapshot = &self.snapshot;
+
+        let session = TradingSession::from_timestamp(ctx.global.timestamp);
+        let session_str = session.as_str();
 
         let mut fakeout_score = 0.0;
         for report in &signal.sub_reports {
@@ -200,7 +201,7 @@ impl AnalysisAudit {
             }
         }
 
-        // 动态价格格式化：根据绝对值决定小数位数
+        // 动态价格格式化
         let fmt_price = |val: f64| {
             let prec = if val.abs() < 1.0 {
                 4
@@ -215,10 +216,10 @@ impl AnalysisAudit {
         };
         let fmt_price_esc = |val: f64| escape_markdown_v2(&fmt_price(val));
 
-        // 普通数值格式化
         let fmt_raw = |val: f64, prec: usize| format!("{:.1$}", val, prec);
         let fmt_esc = |val: f64, prec: usize| escape_markdown_v2(&fmt_raw(val, prec));
 
+        // 方向与状态图标
         let dir_icon = if signal.net_score > 0.0 {
             "📈"
         } else if signal.net_score < 0.0 {
@@ -234,6 +235,7 @@ impl AnalysisAudit {
             .map_or(false, |r| r.is_tsunami);
         let tsunami_tag = if is_tsunami { " 🌊 *TSUNAMI*" } else { "" };
 
+        // 活跃引力井显示
         let wells_str = self
             .gravity_wells
             .iter()
@@ -255,27 +257,32 @@ impl AnalysisAudit {
             .collect::<Vec<_>>()
             .join("  ");
 
+        // === 构建消息 ===
         let mut lines = Vec::new();
 
+        // 标题行：品种 + 方向 + 时段 + 海啸标签
         lines.push(format!(
-            "*{symbol}* {dir}{tsunami}",
+            "*{symbol}*  {dir}  `{session}`{tsunami}",
             symbol = escape_markdown_v2(signal.symbol.as_str()),
             dir = dir_icon,
+            session = session_str,
             tsunami = tsunami_tag,
         ));
 
-        lines.push("━━━━━━━━━━━━━━━".to_string());
+        lines.push("─────────────────────────".to_string());
+
+        // 核心指标行
         lines.push(format!(
-            "S: `{score}` {status}  │  OI: `{oi}%`",
+            "🎯 Score: `{score}`  {status}    💧 OI Δ: `{oi}%`",
             score = fmt_raw(signal.net_score, 0),
             status = status_icon,
             oi = format!("{:+}", fmt_raw(snapshot.entry_oi_change * 100.0, 2)),
         ));
 
-        lines.push(format!("Price: `${}`", fmt_price(snapshot.price)));
+        lines.push(format!("💵 Price: `${}`", fmt_price(snapshot.price)));
 
         if !wells_str.is_empty() {
-            lines.push(format!("Wells: {wells}", wells = wells_str));
+            lines.push(format!("🧲 Wells: {}", wells_str));
         }
 
         let mut msg = lines.join("\n");
@@ -288,16 +295,16 @@ impl AnalysisAudit {
                 "⚠️"
             };
             msg.push_str(&format!(
-                "\nFakeout: {icon} `{score:.0}`",
+                "\n⚠️ Fakeout: {icon} `{score:.0}`",
                 icon = fakeout_icon,
                 score = fakeout_score
             ));
         }
 
+        // 风险管理详情
         if let Some(risk) = &self.risk_assessment {
             let dir_str = risk.direction.as_str();
             let conf_stars = self.confidence_stars(risk.confidence_mult);
-
             let size_pct = fmt_raw(risk.position_size_pct * 100.0, 1);
 
             let sl_str = if risk.stop_loss_levels.len() >= 2 {
@@ -314,7 +321,7 @@ impl AnalysisAudit {
                 let tp = fmt_price(risk.take_profit_levels[idx]);
                 let rr = fmt_esc(risk.rr_levels[idx], 1);
                 let alloc = fmt_esc(risk.allocation[idx] * 100.0, 0);
-                format!("TP{}: `${}` \\(RR:{} \\| {}%\\)", idx + 1, tp, rr, alloc)
+                format!("TP{}: `${}`  (RR:{} | {}%)", idx + 1, tp, rr, alloc)
             };
 
             let entry_lines: Vec<String> = risk
@@ -324,7 +331,7 @@ impl AnalysisAudit {
                 .enumerate()
                 .map(|(i, (&level, &alloc))| {
                     format!(
-                        "ENTRY{}: `${}` \\({}%\\)",
+                        "  ▸ ENTRY{}: `${}`  ({}%)",
                         i + 1,
                         fmt_price_esc(level),
                         fmt_esc(alloc * 100.0, 0)
@@ -333,19 +340,20 @@ impl AnalysisAudit {
                 .collect();
 
             msg.push_str(&format!(
-                "\n\n━━━━━━━━━━━━━━━\n\
-                 *Risk Management*\n\
-                 Dir: `{dir}`  │  Size: `{size}%`  │  SL: `{sl}`\n\
-                 \n\
-                 *Entry Plan*\n\
-                 {entries}\n\
-                 \n\
-                 *Take Profit*\n\
-                 {tp1}\n\
-                 {tp2}\n\
-                 {tp3}\n\
-                 \n\
-                 WRR: `{wrr}`  │  Conf: `{stars}` `{conf}%`",
+                "\n\n─────────────────────────\n\
+             *📊 风险管理*\n\
+             🧭 方向: `{dir}`   |   💰 仓位: `{size}%`\n\
+             🛑 止损: `{sl}`\n\
+             \n\
+             *🚪 入场计划*\n\
+             {entries}\n\
+             \n\
+             *🎯 止盈目标*\n\
+               {tp1}\n\
+               {tp2}\n\
+               {tp3}\n\
+             \n\
+             ⚖️ 加权盈亏比: `{wrr}`   |   ⭐ 置信度: `{stars}` (`{conf}%`)",
                 dir = dir_str,
                 size = size_pct,
                 sl = sl_str,
@@ -359,14 +367,13 @@ impl AnalysisAudit {
             ));
 
             msg.push_str(&format!(
-                "\n`Est. Loss:` `{:.2}%` of capital",
+                "\n\n💸 预估亏损: `{:.2}%` of capital",
                 risk.estimated_loss_pct * 100.0
             ));
         }
 
         msg
     }
-
     /// 将置信乘数 (0.4~1.6) 映射为 1~5 星级
     fn confidence_stars(&self, mult: f64) -> String {
         let stars = ((mult - 0.4) / 0.3).clamp(0.0, 4.0).round() as usize + 1;

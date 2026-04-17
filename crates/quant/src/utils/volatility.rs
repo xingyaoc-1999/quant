@@ -37,9 +37,6 @@ pub fn compute_vol_factor_with_config(vol_p: f64, cfg: &VolFactorConfig) -> f64 
     factor.clamp(cfg.min_factor, cfg.max_factor)
 }
 
-/// 计算波动率自适应因子（连续分段线性插值）
-///
-/// 根据配置的关键点进行插值，超出最左/最右点则使用端点值外推（但会被 clamp）
 #[inline]
 pub fn volatility_adaptation_with_config(vol_p: f64, cfg: &VolAdaptationConfig) -> f64 {
     let knots = &cfg.knots;
@@ -47,7 +44,6 @@ pub fn volatility_adaptation_with_config(vol_p: f64, cfg: &VolAdaptationConfig) 
         return 1.0;
     }
 
-    // 边界处理：小于最小点或大于最大点，直接使用端点值
     if vol_p <= knots[0].0 {
         return knots[0].1.clamp(cfg.min_output, cfg.max_output);
     }

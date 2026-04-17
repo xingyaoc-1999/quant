@@ -2,18 +2,17 @@ mod command;
 mod menu;
 mod subscription;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use common::{
     utils::{retry_with_proxy_rotation_cooled, CooledProxyPool, ShouldRotate},
     Symbol,
 };
-use futures_util::future::join_all;
 use reqwest::Proxy;
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::{collections::HashMap, str::FromStr};
 use teloxide::{
     dispatching::{Dispatcher, HandlerExt, UpdateFilterExt},
     prelude::*,
@@ -207,9 +206,7 @@ impl BotApp {
                                         .reply_markup(kb.clone())
                                         .await
                                     {
-                                        Ok(msg) =>{
-
-                                             return},
+                                        Ok(_) =>return,
                                         Err(RequestError::Api(teloxide::ApiError::MessageNotModified)) => return, // No change: Exit task
                                         Err(RequestError::Api(teloxide::ApiError::MessageToEditNotFound)) => {
                                             // Message was deleted: Clear cache and CONTINUE to send_message

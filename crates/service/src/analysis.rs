@@ -8,7 +8,8 @@ use crate::{integrity::context::FeatureContextManager, types::MarketEvent};
 
 #[derive(Debug, Clone)]
 pub struct AnalysisEvent {
-    pub audit: AnalysisAudit,
+    pub symbol: Symbol,
+    pub message: String,
 }
 
 #[derive(Clone)]
@@ -44,10 +45,8 @@ impl AnalysisService {
         self.manager.save_cross_cycle_state(symbol, &ctx);
 
         audit.attach_risk(&ctx, &self.config);
-
-        let _ = self.event_tx.send(AnalysisEvent {
-            audit: audit.clone(),
-        });
+        let message = audit.to_markdown_v2(&ctx);
+        let _ = self.event_tx.send(AnalysisEvent { symbol, message });
 
         Some(audit)
     }

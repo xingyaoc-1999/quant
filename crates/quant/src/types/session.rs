@@ -11,6 +11,14 @@ pub enum TradingSession {
 }
 
 impl TradingSession {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TradingSession::Asian => "Asia",
+            TradingSession::European => "Europe",
+            TradingSession::American => "America",
+            TradingSession::Weekend => "Weekend",
+        }
+    }
     pub fn from_timestamp(timestamp_ms: i64) -> Self {
         let datetime =
             DateTime::<Utc>::from_timestamp_millis(timestamp_ms).unwrap_or_else(|| Utc::now());

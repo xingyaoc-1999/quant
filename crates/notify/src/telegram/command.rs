@@ -48,7 +48,6 @@ impl MyCommand {
                         .await?;
                 }
             }
-            _ => {}
         }
         Ok(())
     }

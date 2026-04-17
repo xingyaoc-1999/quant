@@ -106,7 +106,6 @@ pub struct RoleData {
     pub oi_data: Option<OIData>,
 }
 
-// ----- Role 枚举（保持原有位置，但放在 futures 中因为与期货数据紧密相关）-----
 use std::fmt;
 use std::str::FromStr;
 

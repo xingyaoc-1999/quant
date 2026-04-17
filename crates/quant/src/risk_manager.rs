@@ -121,7 +121,6 @@ impl RiskManager {
         })
     }
 
-    // ---------- 预估计置信乘数（用于动态阈值） ----------
     pub fn estimate_confidence(
         &self,
         is_long_hint: bool,
@@ -134,7 +133,7 @@ impl RiskManager {
         is_tsunami: bool,
         funding_rate: Option<f64>,
     ) -> f64 {
-        let mut tags = Vec::new(); // 不需要实际标签
+        let mut tags = Vec::new();
         let lrs = self.compute_base_likelihoods(
             is_long_hint,
             regime,
