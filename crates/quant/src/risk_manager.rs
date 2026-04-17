@@ -18,7 +18,8 @@ pub struct RiskAssessment {
     pub audit_tags: Vec<String>,
     pub allocation: [f64; 3],
     pub is_tsunami: bool,
-    pub estimated_loss_pct: f64,
+    pub estimated_loss_pct: f64, // 总资金亏损比例（用于风控裁剪）
+    pub margin_loss_pct: f64,    // 新增：保证金亏损比例（用于显示）
     pub max_loss_violated: bool,
     pub trailing_stop_activated: bool,
     pub dynamic_tp_activated: bool,
@@ -51,6 +52,7 @@ impl RiskManager {
         net_score: f64,
         max_loss_pct: Option<f64>,
         funding_rate: Option<f64>,
+        leverage: f64, // 新增：杠杆倍数
     ) -> Option<RiskAssessment> {
         let dir = direction?;
         let is_long = dir == TradeDirection::Long;
@@ -89,7 +91,7 @@ impl RiskManager {
         tags.push(format!("CONF_MULT:{:.2}", conf_mult));
 
         let def_strength = self.get_defense_strength(wells, last_price, is_long);
-        let (size, est_loss, violated) = self.calculate_final_position(
+        let (size, total_loss, margin_loss, violated) = self.calculate_final_position(
             def_strength,
             last_price,
             sl[0],
@@ -97,6 +99,7 @@ impl RiskManager {
             vol_p,
             is_tsunami,
             max_loss_pct,
+            leverage,
             &mut tags,
         );
 
@@ -112,7 +115,8 @@ impl RiskManager {
             audit_tags: tags,
             allocation: alloc,
             is_tsunami,
-            estimated_loss_pct: est_loss,
+            estimated_loss_pct: total_loss,
+            margin_loss_pct: margin_loss,
             max_loss_violated: violated,
             trailing_stop_activated: trailing,
             dynamic_tp_activated: dynamic,
@@ -645,8 +649,9 @@ impl RiskManager {
         vol_p: f64,
         is_tsunami: bool,
         max_loss_pct: Option<f64>,
+        leverage: f64,
         tags: &mut Vec<String>,
-    ) -> (f64, f64, bool) {
+    ) -> (f64, f64, f64, bool) {
         let cfg = &self.config.risk;
         let base =
             (def_strength / cfg.max_strength_cap).clamp(cfg.min_base_size, cfg.base_size_max);
@@ -661,25 +666,34 @@ impl RiskManager {
             size *= 1.2;
             tags.push("TSUNAMI_MODE".into());
         }
+
         let sl_pct = (last_price - sl_level).abs() / last_price;
-        let mut loss = size * sl_pct;
+        let mut total_loss = size * sl_pct;
         let mut violated = false;
+
         if let Some(max_l) = max_loss_pct {
-            if loss > max_l {
+            if total_loss > max_l {
                 violated = true;
                 size = max_l / sl_pct;
-                loss = max_l;
-                tags.push(format!("RISK_CAPPED:{:.2}%", loss * 100.0));
+                total_loss = max_l;
+                tags.push(format!("RISK_CAPPED:{:.2}%", total_loss * 100.0));
             }
         }
+
         let final_size = size.clamp(cfg.min_position_size, cfg.max_position_size);
-        let final_loss = final_size * sl_pct;
+        let final_total_loss = final_size * sl_pct;
+        let final_margin_loss = final_total_loss / (final_size / leverage);
+
         if let Some(max_l) = max_loss_pct {
-            if final_loss > max_l {
+            if final_total_loss > max_l {
                 violated = true;
-                tags.push(format!("FINAL_LOSS_VIOLATED:{:.2}%", final_loss * 100.0));
+                tags.push(format!(
+                    "FINAL_LOSS_VIOLATED:{:.2}%",
+                    final_total_loss * 100.0
+                ));
             }
         }
-        (final_size, final_loss, violated)
+
+        (final_size, final_total_loss, final_margin_loss, violated)
     }
 }

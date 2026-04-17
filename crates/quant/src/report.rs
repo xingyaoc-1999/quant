@@ -14,6 +14,47 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+// ==================== 报告格式化辅助器 ====================
+struct ReportFormatter;
+
+impl ReportFormatter {
+    /// 根据价格绝对值动态选择小数位数
+    fn price(val: f64) -> String {
+        let prec = if val.abs() < 1.0 {
+            4
+        } else if val.abs() < 10.0 {
+            3
+        } else if val.abs() < 1000.0 {
+            2
+        } else {
+            1
+        };
+        format!("{:.1$}", val, prec)
+    }
+
+    /// 转义后的价格字符串
+    fn price_esc(val: f64) -> String {
+        escape_markdown_v2(&Self::price(val))
+    }
+
+    /// 普通数值格式化（指定精度）
+    fn raw(val: f64, prec: usize) -> String {
+        format!("{:.1$}", val, prec)
+    }
+
+    /// 转义后的普通数值
+    fn raw_esc(val: f64, prec: usize) -> String {
+        escape_markdown_v2(&Self::raw(val, prec))
+    }
+
+    /// 置信乘数转星级 (0.4~1.6 → ★☆☆☆☆)
+    fn confidence_stars(mult: f64) -> String {
+        let stars = ((mult - 0.4) / 0.3).clamp(0.0, 4.0).round() as usize + 1;
+        "★".repeat(stars) + &"☆".repeat(5 - stars)
+    }
+}
+
+// ==================== 主结构体 ====================
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct MarketSnapshot {
     pub timestamp: i64,
@@ -43,7 +84,6 @@ impl AnalysisAudit {
         let snapshot = MarketSnapshot {
             timestamp: Utc::now().timestamp_millis(),
             price: ctx.global.last_price,
-
             trend_price_change: trend
                 .map(|r| {
                     let open = r.feature_set.price_action.open;
@@ -54,11 +94,9 @@ impl AnalysisAudit {
                     }
                 })
                 .unwrap_or(0.0),
-
             trend_taker_ratio: trend
                 .and_then(|r| r.taker_flow.taker_buy_ratio)
                 .unwrap_or(0.5),
-
             filter_volume_ratio: filter
                 .and_then(|r| {
                     let current_vol = r.feature_set.price_action.volume;
@@ -71,17 +109,14 @@ impl AnalysisAudit {
                     })
                 })
                 .unwrap_or(1.0),
-
             filter_vol_percentile: ctx
                 .get_cached::<f64>(ContextKey::VolPercentile)
                 .copied()
                 .unwrap_or(50.0),
-
             entry_oi_change: entry
                 .and_then(|r| r.oi_data.as_ref())
                 .map(|oi| oi.change_history.last().cloned().unwrap_or(0.0))
                 .unwrap_or(0.0),
-
             entry_taker_ratio: entry
                 .and_then(|r| r.taker_flow.taker_buy_ratio)
                 .unwrap_or(0.5),
@@ -105,7 +140,6 @@ impl AnalysisAudit {
         ctx: &MarketContext,
         config: &AnalyzerConfig,
     ) -> Option<&RiskAssessment> {
-        // ---- 提取环境数据 ----
         let vol_p = ctx
             .get_cached::<f64>(ContextKey::VolPercentile)
             .copied()
@@ -137,10 +171,8 @@ impl AnalysisAudit {
 
         let funding_rate = ctx.get_cached::<f64>(ContextKey::FundingRate).copied();
 
-        // 创建风险管理器
         let risk_mgr = RiskManager::new(config.clone());
 
-        // ---- 预估计置信乘数（用于动态阈值） ----
         let is_long_hint = self.signal.net_score > 0.0;
         let estimated_confidence = risk_mgr.estimate_confidence(
             is_long_hint,
@@ -154,13 +186,12 @@ impl AnalysisAudit {
             funding_rate,
         );
 
-        // ---- 动态方向判定（使用配置中的基础阈值） ----
         let direction = dynamic_direction_threshold(
             self.signal.net_score,
             vol_p,
             regime,
             estimated_confidence,
-            config.risk.direction_base_threshold, // 从配置读取
+            config.risk.direction_base_threshold,
         );
 
         let max_loss_pct = Some(config.risk.max_loss_per_trade);
@@ -178,6 +209,7 @@ impl AnalysisAudit {
             self.signal.net_score,
             max_loss_pct,
             funding_rate,
+            10.0,
         )?;
 
         self.risk_assessment = Some(risk);
@@ -187,39 +219,33 @@ impl AnalysisAudit {
     pub fn to_markdown_v2(&self, ctx: &MarketContext) -> String {
         debug!(?self);
 
-        let signal = &self.signal;
-        let snapshot = &self.snapshot;
+        let header = self.build_header(ctx);
+        let metrics = self.build_metrics();
+        let wells = self.build_wells_section();
+        let fakeout = self.build_fakeout_warning();
+        let risk = self.build_risk_section();
 
-        let session = TradingSession::from_timestamp(ctx.global.timestamp);
-        let session_str = session.as_str();
-
-        let mut fakeout_score = 0.0;
-        for report in &signal.sub_reports {
-            if report.kind == crate::analyzer::AnalyzerKind::Fakeout {
-                fakeout_score = report.score;
-                break;
-            }
+        let mut parts = vec![header, metrics];
+        if !wells.is_empty() {
+            parts.push(wells);
+        }
+        let mut msg = parts.join("\n");
+        if !fakeout.is_empty() {
+            msg.push_str(&fakeout);
+        }
+        if !risk.is_empty() {
+            msg.push_str(&risk);
         }
 
-        // 动态价格格式化
-        let fmt_price = |val: f64| {
-            let prec = if val.abs() < 1.0 {
-                4
-            } else if val.abs() < 10.0 {
-                3
-            } else if val.abs() < 1000.0 {
-                2
-            } else {
-                1
-            };
-            format!("{:.1$}", val, prec)
-        };
-        let fmt_price_esc = |val: f64| escape_markdown_v2(&fmt_price(val));
+        msg
+    }
 
-        let fmt_raw = |val: f64, prec: usize| format!("{:.1$}", val, prec);
-        let fmt_esc = |val: f64, prec: usize| escape_markdown_v2(&fmt_raw(val, prec));
+    // ---------- 私有构建方法 ----------
+    fn build_header(&self, ctx: &MarketContext) -> String {
+        let signal = &self.signal;
+        let session = TradingSession::from_timestamp(ctx.global.timestamp);
+        let session_str = escape_markdown_v2(session.as_str());
 
-        // 方向与状态图标
         let dir_icon = if signal.net_score > 0.0 {
             "📈"
         } else if signal.net_score < 0.0 {
@@ -227,15 +253,48 @@ impl AnalysisAudit {
         } else {
             "➖"
         };
-        let status_icon = if signal.is_rejected { "❌" } else { "✅" };
 
-        let is_tsunami = self
+        let tsunami = self
             .risk_assessment
             .as_ref()
             .map_or(false, |r| r.is_tsunami);
-        let tsunami_tag = if is_tsunami { " 🌊 *TSUNAMI*" } else { "" };
+        let tsunami_tag = if tsunami { " 🌊 *TSUNAMI*" } else { "" };
 
-        // 活跃引力井显示
+        format!(
+            "*{symbol}*  {dir}  `{session}`{tsunami}",
+            symbol = escape_markdown_v2(signal.symbol.as_str()),
+            dir = dir_icon,
+            session = session_str,
+            tsunami = tsunami_tag,
+        )
+    }
+
+    fn build_metrics(&self) -> String {
+        let signal = &self.signal;
+        let snapshot = &self.snapshot;
+
+        let status_icon = if signal.is_rejected { "❌" } else { "✅" };
+        let oi_str = format!(
+            "{:+}",
+            ReportFormatter::raw(snapshot.entry_oi_change * 100.0, 2)
+        );
+
+        let mut lines = Vec::new();
+        lines.push("───────────────────".to_string());
+        lines.push(format!(
+            "🎯 Score: `{score}`  {status}    💧 OI Δ: `{oi}%`",
+            score = ReportFormatter::raw(signal.net_score, 0),
+            status = status_icon,
+            oi = oi_str,
+        ));
+        lines.push(format!(
+            "💵 Price: `${}`",
+            ReportFormatter::price(snapshot.price)
+        ));
+        lines.join("\n")
+    }
+
+    fn build_wells_section(&self) -> String {
         let wells_str = self
             .gravity_wells
             .iter()
@@ -250,134 +309,122 @@ impl AnalysisAudit {
                 format!(
                     "{}{}·{}",
                     icon,
-                    fmt_price_esc(w.level),
-                    fmt_esc(w.strength, 1)
+                    ReportFormatter::price_esc(w.level),
+                    ReportFormatter::raw_esc(w.strength, 1)
                 )
             })
             .collect::<Vec<_>>()
             .join("  ");
 
-        // === 构建消息 ===
-        let mut lines = Vec::new();
+        if wells_str.is_empty() {
+            String::new()
+        } else {
+            format!("🧲 Wells: {}", wells_str)
+        }
+    }
 
-        // 标题行：品种 + 方向 + 时段 + 海啸标签
-        lines.push(format!(
-            "*{symbol}*  {dir}  `{session}`{tsunami}",
-            symbol = escape_markdown_v2(signal.symbol.as_str()),
-            dir = dir_icon,
-            session = session_str,
-            tsunami = tsunami_tag,
-        ));
+    fn build_fakeout_warning(&self) -> String {
+        let fakeout_score = self
+            .signal
+            .sub_reports
+            .iter()
+            .find(|r| r.kind == crate::analyzer::AnalyzerKind::Fakeout)
+            .map(|r| r.score)
+            .unwrap_or(0.0);
 
-        lines.push("─────────────────────────".to_string());
-
-        // 核心指标行
-        lines.push(format!(
-            "🎯 Score: `{score}`  {status}    💧 OI Δ: `{oi}%`",
-            score = fmt_raw(signal.net_score, 0),
-            status = status_icon,
-            oi = format!("{:+}", fmt_raw(snapshot.entry_oi_change * 100.0, 2)),
-        ));
-
-        lines.push(format!("💵 Price: `${}`", fmt_price(snapshot.price)));
-
-        if !wells_str.is_empty() {
-            lines.push(format!("🧲 Wells: {}", wells_str));
+        if fakeout_score >= -10.0 {
+            return String::new();
         }
 
-        let mut msg = lines.join("\n");
+        let icon = if fakeout_score < -30.0 {
+            "🚨"
+        } else {
+            "⚠️"
+        };
+        format!(
+            "\n⚠️ Fakeout: {icon} `{score:.0}`",
+            icon = icon,
+            score = fakeout_score
+        )
+    }
 
-        // 假突破警告
-        if fakeout_score < -10.0 {
-            let fakeout_icon = if fakeout_score < -30.0 {
-                "🚨"
-            } else {
-                "⚠️"
-            };
-            msg.push_str(&format!(
-                "\n⚠️ Fakeout: {icon} `{score:.0}`",
-                icon = fakeout_icon,
-                score = fakeout_score
-            ));
-        }
+    fn build_risk_section(&self) -> String {
+        let risk = match &self.risk_assessment {
+            Some(r) => r,
+            None => return String::new(),
+        };
 
-        // 风险管理详情
-        if let Some(risk) = &self.risk_assessment {
-            let dir_str = risk.direction.as_str();
-            let conf_stars = self.confidence_stars(risk.confidence_mult);
-            let size_pct = fmt_raw(risk.position_size_pct * 100.0, 1);
+        let dir_str = escape_markdown_v2(risk.direction.as_str());
+        let conf_stars = ReportFormatter::confidence_stars(risk.confidence_mult);
+        let size_pct = ReportFormatter::raw(risk.position_size_pct * 100.0, 1);
+        let wrr = ReportFormatter::raw(risk.weighted_rr, 2);
+        // 移除 conf_pct 变量
 
-            let sl_str = if risk.stop_loss_levels.len() >= 2 {
+        let sl_str = if risk.stop_loss_levels.len() >= 2 {
+            format!(
+                "{}/{}",
+                ReportFormatter::price(risk.stop_loss_levels[0]),
+                ReportFormatter::price(risk.stop_loss_levels[1])
+            )
+        } else {
+            ReportFormatter::price(risk.stop_loss_levels[0])
+        };
+
+        let entry_lines: Vec<String> = risk
+            .entry_levels
+            .iter()
+            .zip(&risk.entry_allocations)
+            .enumerate()
+            .map(|(i, (&level, &alloc))| {
                 format!(
-                    "{}/{}",
-                    fmt_price(risk.stop_loss_levels[0]),
-                    fmt_price(risk.stop_loss_levels[1])
+                    "  ▸ ENTRY{}: `${}`  \\({}%\\)",
+                    i + 1,
+                    ReportFormatter::price_esc(level),
+                    ReportFormatter::raw_esc(alloc * 100.0, 0)
                 )
-            } else {
-                fmt_price(risk.stop_loss_levels[0])
-            };
+            })
+            .collect();
 
-            let tp_line = |idx: usize| -> String {
-                let tp = fmt_price(risk.take_profit_levels[idx]);
-                let rr = fmt_esc(risk.rr_levels[idx], 1);
-                let alloc = fmt_esc(risk.allocation[idx] * 100.0, 0);
-                format!("TP{}: `${}`  (RR:{} | {}%)", idx + 1, tp, rr, alloc)
-            };
+        let tp_line = |idx: usize| -> String {
+            let tp = ReportFormatter::price(risk.take_profit_levels[idx]);
+            let rr = ReportFormatter::raw_esc(risk.rr_levels[idx], 1);
+            let alloc = ReportFormatter::raw_esc(risk.allocation[idx] * 100.0, 0);
+            format!("TP{}: `${}`  \\(RR:{} \\| {}%\\)", idx + 1, tp, rr, alloc)
+        };
 
-            let entry_lines: Vec<String> = risk
-                .entry_levels
-                .iter()
-                .zip(&risk.entry_allocations)
-                .enumerate()
-                .map(|(i, (&level, &alloc))| {
-                    format!(
-                        "  ▸ ENTRY{}: `${}`  ({}%)",
-                        i + 1,
-                        fmt_price_esc(level),
-                        fmt_esc(alloc * 100.0, 0)
-                    )
-                })
-                .collect();
+        let sep = escape_markdown_v2("|");
 
-            msg.push_str(&format!(
-                "\n\n─────────────────────────\n\
-             *📊 风险管理*\n\
-             🧭 方向: `{dir}`   |   💰 仓位: `{size}%`\n\
-             🛑 止损: `{sl}`\n\
-             \n\
-             *🚪 入场计划*\n\
-             {entries}\n\
-             \n\
-             *🎯 止盈目标*\n\
-               {tp1}\n\
-               {tp2}\n\
-               {tp3}\n\
-             \n\
-             ⚖️ 加权盈亏比: `{wrr}`   |   ⭐ 置信度: `{stars}` (`{conf}%`)",
-                dir = dir_str,
-                size = size_pct,
-                sl = sl_str,
-                entries = entry_lines.join("\n"),
-                tp1 = tp_line(0),
-                tp2 = tp_line(1),
-                tp3 = tp_line(2),
-                wrr = fmt_raw(risk.weighted_rr, 2),
-                stars = conf_stars,
-                conf = (risk.confidence_mult * 100.0).round() as i32,
-            ));
-
-            msg.push_str(&format!(
-                "\n\n💸 预估亏损: `{:.2}%` of capital",
-                risk.estimated_loss_pct * 100.0
-            ));
-        }
+        let mut msg = String::new();
+        msg.push_str("\n\n─────────────────────\n");
+        msg.push_str("*📊 风险管理*\n");
+        msg.push_str(&format!(
+            "🧭 方向: `{}`   {}   💰 仓位: `{}%`\n",
+            dir_str, sep, size_pct
+        ));
+        msg.push_str(&format!("🛑 止损: `{}`\n", sl_str));
+        msg.push_str("\n*🚪 入场计划*\n");
+        msg.push_str(&entry_lines.join("\n"));
+        msg.push_str("\n\n*🎯 止盈目标*\n");
+        msg.push_str(&format!(
+            "  {}\n  {}\n  {}\n",
+            tp_line(0),
+            tp_line(1),
+            tp_line(2)
+        ));
+        msg.push_str(&format!(
+            "\n⚖️ 加权盈亏比: `{}`   {}   ⭐ 置信度: `{}`",
+            wrr, sep, conf_stars
+        ));
+        msg.push_str(&format!(
+            "\n\n💸 总资金亏损: `{:.2}%`",
+            risk.estimated_loss_pct * 100.0
+        ));
+        msg.push_str(&format!(
+            "\n📉 保证金亏损 (10x): `{:.2}%`",
+            risk.margin_loss_pct * 100.0
+        ));
 
         msg
-    }
-    /// 将置信乘数 (0.4~1.6) 映射为 1~5 星级
-    fn confidence_stars(&self, mult: f64) -> String {
-        let stars = ((mult - 0.4) / 0.3).clamp(0.0, 4.0).round() as usize + 1;
-        "★".repeat(stars) + &"☆".repeat(5 - stars)
     }
 }
 
@@ -403,7 +450,7 @@ fn dynamic_direction_threshold(
     vol_p: f64,
     regime: TrendStructure,
     confidence_mult: f64,
-    base_threshold: f64, // 新增：从配置读取的基础阈值
+    base_threshold: f64,
 ) -> Option<TradeDirection> {
     let vol_factor = if vol_p > 70.0 {
         1.3
@@ -420,7 +467,6 @@ fn dynamic_direction_threshold(
     };
 
     let confidence_factor = 1.0 / confidence_mult.clamp(0.5, 2.0);
-
     let threshold = base_threshold * vol_factor * regime_factor * confidence_factor;
 
     if net_score > threshold {
