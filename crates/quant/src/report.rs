@@ -280,9 +280,9 @@ impl AnalysisAudit {
         );
 
         let mut lines = Vec::new();
-        lines.push("───────────────────".to_string());
+        lines.push("─────────".to_string());
         lines.push(format!(
-            "🎯 Score: `{score}`  {status}    💧 OI Δ: `{oi}%`",
+            "🎯 Score: `{score}` {status}  💧 OI Δ: `{oi}%`",
             score = ReportFormatter::raw(signal.net_score, 0),
             status = status_icon,
             oi = oi_str,
@@ -347,18 +347,18 @@ impl AnalysisAudit {
             score = fakeout_score
         )
     }
-
     fn build_risk_section(&self) -> String {
         let risk = match &self.risk_assessment {
             Some(r) => r,
             None => return String::new(),
         };
 
+        // 方向字符串需要转义
         let dir_str = escape_markdown_v2(risk.direction.as_str());
         let conf_stars = ReportFormatter::confidence_stars(risk.confidence_mult);
-        let size_pct = ReportFormatter::raw(risk.position_size_pct * 100.0, 1);
-        let wrr = ReportFormatter::raw(risk.weighted_rr, 2);
-        // 移除 conf_pct 变量
+        // 注意：size_pct 和 wrr 可能包含小数点，必须转义
+        let size_pct = escape_markdown_v2(&ReportFormatter::raw(risk.position_size_pct * 100.0, 1));
+        let wrr = escape_markdown_v2(&ReportFormatter::raw(risk.weighted_rr, 2));
 
         let sl_str = if risk.stop_loss_levels.len() >= 2 {
             format!(
@@ -369,40 +369,62 @@ impl AnalysisAudit {
         } else {
             ReportFormatter::price(risk.stop_loss_levels[0])
         };
+        // 止损价格可能包含小数点，也需要转义
+        let sl_str = escape_markdown_v2(&sl_str);
 
+        // 预转义固定特殊符号
+        let sep = escape_markdown_v2("|");
+        let lparen = escape_markdown_v2("(");
+        let rparen = escape_markdown_v2(")");
+        let lbrace = escape_markdown_v2("{");
+        let rbrace = escape_markdown_v2("}");
+
+        // 入场计划：所有数值部分都需要转义
         let entry_lines: Vec<String> = risk
             .entry_levels
             .iter()
             .zip(&risk.entry_allocations)
             .enumerate()
             .map(|(i, (&level, &alloc))| {
+                let level_str = ReportFormatter::price_esc(level);
+                let alloc_str = escape_markdown_v2(&format!("{:.0}", alloc * 100.0));
                 format!(
-                    "  ▸ ENTRY{}: `${}`  \\({}%\\)",
+                    "  ▸ ENTRY{}: `${}`  {}{}%{}",
                     i + 1,
-                    ReportFormatter::price_esc(level),
-                    ReportFormatter::raw_esc(alloc * 100.0, 0)
+                    level_str,
+                    lbrace,
+                    alloc_str,
+                    rbrace,
                 )
             })
             .collect();
 
+        // 止盈目标：RR 和分配比例数值需要转义
         let tp_line = |idx: usize| -> String {
-            let tp = ReportFormatter::price(risk.take_profit_levels[idx]);
-            let rr = ReportFormatter::raw_esc(risk.rr_levels[idx], 1);
-            let alloc = ReportFormatter::raw_esc(risk.allocation[idx] * 100.0, 0);
-            format!("TP{}: `${}`  \\(RR:{} \\| {}%\\)", idx + 1, tp, rr, alloc)
+            let tp = ReportFormatter::price_esc(risk.take_profit_levels[idx]);
+            let rr = escape_markdown_v2(&ReportFormatter::raw(risk.rr_levels[idx], 1));
+            let alloc = escape_markdown_v2(&ReportFormatter::raw(risk.allocation[idx] * 100.0, 0));
+            format!(
+                "TP{}: `${}`  {}RR:{} {} {}%{}",
+                idx + 1,
+                tp,
+                lparen,
+                rr,
+                sep,
+                alloc,
+                rparen
+            )
         };
 
-        let sep = escape_markdown_v2("|");
-
         let mut msg = String::new();
-        msg.push_str("\n\n─────────────────────\n");
+        msg.push_str("\n\n──────────\n");
         msg.push_str("*📊 风险管理*\n");
         msg.push_str(&format!(
-            "🧭 方向: `{}`   {}   💰 仓位: `{}%`\n",
+            "🧭 方向: `{}`   {}   💰 仓位: `{}%`",
             dir_str, sep, size_pct
         ));
-        msg.push_str(&format!("🛑 止损: `{}`\n", sl_str));
-        msg.push_str("\n*🚪 入场计划*\n");
+        msg.push_str(&format!("\n🛑 止损: `{}`", sl_str));
+        msg.push_str("\n\n*🚪 入场计划*\n");
         msg.push_str(&entry_lines.join("\n"));
         msg.push_str("\n\n*🎯 止盈目标*\n");
         msg.push_str(&format!(
@@ -415,13 +437,13 @@ impl AnalysisAudit {
             "\n⚖️ 加权盈亏比: `{}`   {}   ⭐ 置信度: `{}`",
             wrr, sep, conf_stars
         ));
+        // 亏损百分比数值需要转义
+        let total_loss_str = escape_markdown_v2(&format!("{:.2}", risk.estimated_loss_pct * 100.0));
+        let margin_loss_str = escape_markdown_v2(&format!("{:.2}", risk.margin_loss_pct * 100.0));
+        msg.push_str(&format!("\n\n💸 总资金亏损: `{}%`", total_loss_str));
         msg.push_str(&format!(
-            "\n\n💸 总资金亏损: `{:.2}%`",
-            risk.estimated_loss_pct * 100.0
-        ));
-        msg.push_str(&format!(
-            "\n📉 保证金亏损 (10x): `{:.2}%`",
-            risk.margin_loss_pct * 100.0
+            "\n📉 保证金亏损 \\(10x\\): `{}%`",
+            margin_loss_str
         ));
 
         msg
