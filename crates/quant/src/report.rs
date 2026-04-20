@@ -12,7 +12,7 @@ use crate::{
 use chrono::Utc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 // ==================== 报告格式化辅助器 ====================
 struct ReportFormatter;
@@ -217,7 +217,6 @@ impl AnalysisAudit {
     }
 
     pub fn to_markdown_v2(&self, ctx: &MarketContext) -> String {
-        debug!(?self);
 
         let header = self.build_header(ctx);
         let metrics = self.build_metrics();
@@ -466,7 +465,6 @@ pub fn escape_markdown_v2(s: &str) -> String {
     result
 }
 
-/// 动态方向阈值计算（参数从配置传入）
 fn dynamic_direction_threshold(
     net_score: f64,
     vol_p: f64,
