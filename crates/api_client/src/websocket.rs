@@ -28,6 +28,7 @@ pub trait WsProtocol: Send + Sync + 'static {
     fn build_subscribe_request(&self, subs: &[Self::Subscription]) -> Result<String>;
     fn parse_message(&self, text: &str) -> Option<Self::Output>;
 }
+
 pub struct GenericWsClient<P: WsProtocol> {
     protocol: Arc<P>,
     proxy_pool: Arc<CooledProxyPool>,
@@ -55,32 +56,42 @@ impl<P: WsProtocol> GenericWsClient<P> {
         SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
         SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     )> {
-        let proxy_addr = match self.proxy_pool.current_available().await {
-            Some(proxy) => proxy,
-            None => {
-                // warn!(?self.proxy_pool);
-                bail!("No available proxy in pool")
-            }
-        };
+        let proxy_opt = self.proxy_pool.current_available().await;
 
-        let (addr, user_name, password) = parse_proxy_auth(&proxy_addr)?;
-        match Socks5Stream::connect_with_password(
-            &*addr,
-            self.protocol.proxy_target(),
-            user_name,
-            password,
-        )
-        .await
-        {
-            Ok(stream) => {
-                let tcp = stream.into_inner();
-                let req = self.protocol.url().into_client_request()?;
-                let (ws, _) = client_async_tls_with_config(req, tcp, None, None).await?;
-                Ok(ws.split())
+        match proxy_opt {
+            Some(proxy_addr) => {
+                let (addr, user_name, password) = parse_proxy_auth(&proxy_addr)?;
+                match Socks5Stream::connect_with_password(
+                    &*addr,
+                    self.protocol.proxy_target(),
+                    user_name,
+                    password,
+                )
+                .await
+                {
+                    Ok(stream) => {
+                        let tcp = stream.into_inner();
+                        let req = self.protocol.url().into_client_request()?;
+                        let (ws, _) = client_async_tls_with_config(req, tcp, None, None).await?;
+                        Ok(ws.split())
+                    }
+                    Err(e) => {
+                        self.proxy_pool.mark_failed(proxy_addr.clone()).await;
+                        bail!("Proxy {} connection failed: {}", proxy_addr, e);
+                    }
+                }
             }
-            Err(e) => {
-                self.proxy_pool.mark_failed(proxy_addr.clone()).await;
-                bail!("Proxy {} connection failed: {}", proxy_addr, e);
+            None => {
+                // 直连：不使用代理，直接连接目标服务器
+                let target = self.protocol.proxy_target();
+                info!(
+                    "📡 [WS] No proxy available, connecting directly to {}",
+                    target
+                );
+                let stream = TcpStream::connect(target).await?;
+                let req = self.protocol.url().into_client_request()?;
+                let (ws, _) = client_async_tls_with_config(req, stream, None, None).await?;
+                Ok(ws.split())
             }
         }
     }
@@ -127,6 +138,7 @@ impl<P: WsProtocol> GenericWsClient<P> {
         }
         Ok(())
     }
+
     async fn handle_message(&self, msg: Message, tx: &Sender<P::Output>) -> Result<()> {
         match msg {
             Message::Text(text) => {
@@ -150,6 +162,7 @@ impl<P: WsProtocol> GenericWsClient<P> {
         }
         Ok(())
     }
+
     pub async fn run(&self, tx: Sender<P::Output>) -> Result<()> {
         const MAX_DELAY: Duration = Duration::from_secs(30);
         let mut retry_count = 0;

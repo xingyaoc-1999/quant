@@ -10,6 +10,7 @@ use crate::types::session::TradingSession;
 use crate::utils::effiency::{calculate_efficiency, consistency_penalty};
 use crate::utils::volatility::{compute_vol_factor, volatility_adaptation};
 
+// ==================== VolumeExtra ====================
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct VolumeExtra {
     pub efficiency: f64,
@@ -24,6 +25,7 @@ pub struct VolumeExtra {
     pub session_adj: f64,
 }
 
+// ==================== VolumeStructureAnalyzer ====================
 pub struct VolumeStructureAnalyzer {
     config: AnalyzerConfig,
 }
@@ -159,7 +161,9 @@ impl Analyzer for VolumeStructureAnalyzer {
                 );
                 score = signal.score * consistency * vol_adapt * session_adj * stress_adj;
                 m_vol = signal.multiplier;
-                res = res.because(signal.reason);
+                if !signal.reason.is_empty() {
+                    res = res.because(signal.reason);
+                }
             }
         }
 
@@ -176,7 +180,9 @@ impl Analyzer for VolumeStructureAnalyzer {
             );
             score = trend_score * consistency;
             m_vol = trend_mult;
-            res = res.because(reason);
+            if !reason.is_empty() {
+                res = res.because(reason);
+            }
         }
 
         ctx.set_cached(ContextKey::LastEfficiency, efficiency);
@@ -209,7 +215,7 @@ impl Analyzer for VolumeStructureAnalyzer {
     }
 }
 
-// ========== 辅助结构与逻辑 ==========
+// ==================== 辅助结构 ====================
 struct DynamicThresholds {
     rvol_break: f64,
     rvol_extreme: f64,
@@ -232,7 +238,7 @@ impl DynamicThresholds {
             rvol_extreme,
             eff_high,
             eff_low,
-            magnet_rvol_break: rvol_break * cfg.magnet_threshold_ratio(), // 配置化系数
+            magnet_rvol_break: rvol_break * cfg.magnet_threshold_ratio(),
             magnet_eff_high: eff_high * cfg.magnet_threshold_ratio(),
             magnet_rvol_shrink: cfg.magnet_shrink_base() / vol_factor,
             magnet_eff_low: eff_low * cfg.magnet_threshold_ratio(),
@@ -246,6 +252,25 @@ struct WellSignal {
     reason: String,
 }
 
+impl WellSignal {
+    fn new(score: f64, multiplier: f64, reason: impl Into<String>) -> Self {
+        Self {
+            score,
+            multiplier,
+            reason: reason.into(),
+        }
+    }
+
+    fn neutral() -> Self {
+        Self {
+            score: 0.0,
+            multiplier: 1.0,
+            reason: String::new(),
+        }
+    }
+}
+
+// ==================== 核心评估逻辑 ====================
 impl VolumeStructureAnalyzer {
     fn stress_adjustment(&self, level: MarketStressLevel) -> f64 {
         match level {
@@ -269,135 +294,112 @@ impl VolumeStructureAnalyzer {
         oi_delta: Option<f64>,
         cfg: &crate::config::VolumeConfig,
     ) -> WellSignal {
-        match well.side {
-            WellSide::Resistance => {
-                if rvol > thresh.rvol_break && efficiency > thresh.eff_high {
-                    WellSignal {
-                        score: 45.0,
-                        multiplier: 1.8,
-                        reason: format!("吸收突破: 价格高效贯穿阻力 {}", well.source_string()),
-                    }
-                } else if rvol > thresh.rvol_extreme && efficiency < thresh.eff_low {
-                    if matches!(oi_state, Some(OIPositionState::LongBuildUp)) && is_tsunami {
-                        WellSignal {
-                            score: 25.0,
-                            multiplier: 1.3,
-                            reason: "强力吸收: 阻力位多头持续接盘".into(),
-                        }
-                    } else {
-                        WellSignal {
-                            score: -80.0,
-                            multiplier: 1.8,
-                            reason: "派发陷阱: 阻力位放量滞涨".into(),
-                        }
-                    }
-                } else if taker_ratio.map_or(false, |tr| tr > cfg.absorption_taker_buy_min())
-                    && oi_delta.map_or(false, |d| d > cfg.absorption_oi_delta_min())
-                    && efficiency < thresh.eff_low
-                {
-                    WellSignal {
-                        score: -55.0,
-                        multiplier: 1.6,
-                        reason: "阻力被动吸收: 强力买盘被挂单截杀".into(),
-                    }
-                } else {
-                    WellSignal {
-                        score: 0.0,
-                        multiplier: 1.0,
-                        reason: String::new(),
-                    }
-                }
-            }
-            WellSide::Support => {
-                if rvol > thresh.rvol_break && efficiency > thresh.eff_high {
-                    WellSignal {
-                        score: -45.0,
-                        multiplier: 1.8,
-                        reason: format!("恐慌破位: 卖盘放量贯穿支撑 {}", well.source_string()),
-                    }
-                } else if rvol > thresh.rvol_extreme && efficiency < thresh.eff_low {
-                    if matches!(oi_state, Some(OIPositionState::ShortBuildUp)) && is_tsunami {
-                        WellSignal {
-                            score: -25.0,
-                            multiplier: 1.3,
-                            reason: "压制性抛售: 支撑位空头强行挤压".into(),
-                        }
-                    } else {
-                        WellSignal {
-                            score: 85.0,
-                            multiplier: 2.0,
-                            reason: "吸筹承接: 支撑位放量止跌".into(),
-                        }
-                    }
-                } else if taker_ratio.map_or(false, |tr| tr < cfg.absorption_taker_sell_max())
-                    && oi_delta.map_or(false, |d| d > cfg.absorption_oi_delta_min())
-                    && efficiency < thresh.eff_low
-                {
-                    WellSignal {
-                        score: 55.0,
-                        multiplier: 1.6,
-                        reason: "被动吸收: 卖盘沉重但价格拒绝下跌".into(),
-                    }
-                } else {
-                    WellSignal {
-                        score: 0.0,
-                        multiplier: 1.0,
-                        reason: String::new(),
-                    }
-                }
-            }
-            WellSide::Magnet => {
-                if is_up {
-                    if rvol > thresh.magnet_rvol_break && efficiency > thresh.magnet_eff_high {
-                        WellSignal {
-                            score: 55.0,
-                            multiplier: 1.7,
-                            reason: format!("磁力推进: 价格逼近清算区 {}", well.source_string()),
-                        }
-                    } else if rvol < thresh.magnet_rvol_shrink && efficiency < thresh.magnet_eff_low
-                    {
-                        WellSignal {
-                            score: 15.0,
-                            multiplier: 1.2,
-                            reason: format!(
-                                "磁力试探: 量能不足，关注是否站稳 {}",
-                                well.source_string()
-                            ),
-                        }
-                    } else {
-                        WellSignal {
-                            score: 0.0,
-                            multiplier: 1.0,
-                            reason: String::new(),
-                        }
-                    }
-                } else {
-                    if rvol > thresh.magnet_rvol_break && efficiency > thresh.magnet_eff_high {
-                        WellSignal {
-                            score: -55.0,
-                            multiplier: 1.7,
-                            reason: format!("磁力下压: 价格逼近清算区 {}", well.source_string()),
-                        }
-                    } else if rvol < thresh.magnet_rvol_shrink && efficiency < thresh.magnet_eff_low
-                    {
-                        WellSignal {
-                            score: -15.0,
-                            multiplier: 1.2,
-                            reason: format!(
-                                "磁力试探: 量能不足，关注是否跌破 {}",
-                                well.source_string()
-                            ),
-                        }
-                    } else {
-                        WellSignal {
-                            score: 0.0,
-                            multiplier: 1.0,
-                            reason: String::new(),
-                        }
-                    }
-                }
-            }
+        // 提取布尔特征（Rust 1.70+ 惯用写法）
+        let oi_surge = oi_delta.is_some_and(|d| d > cfg.absorption_oi_delta_min());
+        let taker_bullish = taker_ratio.is_some_and(|tr| tr > cfg.absorption_taker_buy_min());
+        let taker_bearish = taker_ratio.is_some_and(|tr| tr < cfg.absorption_taker_sell_max());
+
+        // 磁力井独立处理
+        if well.side == WellSide::Magnet {
+            return self.evaluate_magnet_signal(well, is_up, rvol, efficiency, thresh);
         }
+
+        // 核心量价情景匹配（Rust 风格守卫模式）
+        match (well.side, rvol, efficiency) {
+            // 情景1：高效放量突破
+            (side, r, e) if r > thresh.rvol_break && e > thresh.eff_high => {
+                let (score, reason) = match side {
+                    WellSide::Resistance => (
+                        45.0,
+                        format!("吸收突破: 价格高效贯穿阻力 {}", well.source_string()),
+                    ),
+                    WellSide::Support => (
+                        -45.0,
+                        format!("恐慌破位: 卖盘放量贯穿支撑 {}", well.source_string()),
+                    ),
+                    _ => unreachable!(),
+                };
+                WellSignal::new(score, 1.8, reason)
+            }
+            // 情景2：极端放量低效（派发/吸筹 或 陷阱）
+            (side, r, e) if r > thresh.rvol_extreme && e < thresh.eff_low => {
+                match side {
+                    WellSide::Resistance => {
+                        if matches!(oi_state, Some(OIPositionState::LongBuildUp)) && is_tsunami {
+                            WellSignal::new(25.0, 1.3, "强力吸收: 阻力位多头持续接盘")
+                        } else if !is_up && oi_surge && !taker_bearish {
+                            // 对称陷阱：多头爆仓砸盘
+                            WellSignal::new(65.0, 1.6, "虚假派发: 增仓但无主动卖盘，疑似多头爆仓")
+                        } else {
+                            WellSignal::new(-80.0, 1.8, "派发陷阱: 阻力位放量滞涨")
+                        }
+                    }
+                    WellSide::Support => {
+                        if matches!(oi_state, Some(OIPositionState::ShortBuildUp)) && is_tsunami {
+                            WellSignal::new(-25.0, 1.3, "压制性抛售: 支撑位空头强行挤压")
+                        } else if is_up && oi_surge && !taker_bullish {
+                            // 核心修复：空头爆仓拉盘
+                            WellSignal::new(-65.0, 1.6, "虚假吸筹: 增仓但无主动买盘，疑似空头爆仓")
+                        } else {
+                            WellSignal::new(85.0, 2.0, "吸筹承接: 支撑位放量止跌")
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            // 情景3：被动吸收
+            (WellSide::Resistance, _, e) if e < thresh.eff_low && taker_bullish && oi_surge => {
+                WellSignal::new(-55.0, 1.6, "阻力被动吸收: 强力买盘被挂单截杀")
+            }
+            (WellSide::Support, _, e) if e < thresh.eff_low && taker_bearish && oi_surge => {
+                WellSignal::new(55.0, 1.6, "被动吸收: 卖盘沉重但价格拒绝下跌")
+            }
+            _ => WellSignal::neutral(),
+        }
+    }
+
+    fn evaluate_magnet_signal(
+        &self,
+        well: &PriceGravityWell,
+        is_up: bool,
+        rvol: f64,
+        efficiency: f64,
+        thresh: &DynamicThresholds,
+    ) -> WellSignal {
+        let (score, multiplier, reason) = if is_up {
+            if rvol > thresh.magnet_rvol_break && efficiency > thresh.magnet_eff_high {
+                (
+                    55.0,
+                    1.7,
+                    format!("磁力推进: 价格逼近清算区 {}", well.source_string()),
+                )
+            } else if rvol < thresh.magnet_rvol_shrink && efficiency < thresh.magnet_eff_low {
+                (
+                    15.0,
+                    1.2,
+                    format!("磁力试探: 量能不足，关注是否站稳 {}", well.source_string()),
+                )
+            } else {
+                return WellSignal::neutral();
+            }
+        } else {
+            if rvol > thresh.magnet_rvol_break && efficiency > thresh.magnet_eff_high {
+                (
+                    -55.0,
+                    1.7,
+                    format!("磁力下压: 价格逼近清算区 {}", well.source_string()),
+                )
+            } else if rvol < thresh.magnet_rvol_shrink && efficiency < thresh.magnet_eff_low {
+                (
+                    -15.0,
+                    1.2,
+                    format!("磁力试探: 量能不足，关注是否跌破 {}", well.source_string()),
+                )
+            } else {
+                return WellSignal::neutral();
+            }
+        };
+        WellSignal::new(score, multiplier, reason)
     }
 
     fn evaluate_trend_extension(

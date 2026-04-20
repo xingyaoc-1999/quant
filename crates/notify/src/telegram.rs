@@ -3,6 +3,7 @@ mod menu;
 mod subscription;
 
 use anyhow::Result;
+use chrono::{FixedOffset, Utc};
 use common::{
     utils::{retry_with_proxy_rotation_cooled, CooledProxyPool, ShouldRotate},
     Symbol,
@@ -172,83 +173,85 @@ impl BotApp {
 
             loop {
                 tokio::select! {
-                                  Some((text, symbol)) = rx_in.recv() => {
-                        let subscribers = app.subscriptions.get_subscribers(&symbol).await;
-                        if subscribers.is_empty() {
-                            continue;
-                        }
+                                                               Some((text, symbol)) = rx_in.recv() => {
+                                                     let subscribers = app.subscriptions.get_subscribers(&symbol).await;
+                                                     if subscribers.is_empty() {
+                                                         continue;
+                                                     }
 
 
-                        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                                           let timestamp = Utc::now()
+                                .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap())
+                                 .format("%Y-%m-%d %H:%M:%S")
+                                .to_string();
+                let final_text = format!("{}\n\n🕒 Last update: `{}`", text, timestamp);
 
-                        let final_text = format!("{}\n\n🕒 最后更新: `{}`", text, timestamp);
+                                                     let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                                                         InlineKeyboardButton::callback("🔍 AI 深度审计", format!("audit_{}", symbol))
+                                                     ]]);
 
-                        let keyboard = InlineKeyboardMarkup::new(vec![vec![
-                            InlineKeyboardButton::callback("🔍 AI 深度审计", format!("audit_{}", symbol))
-                        ]]);
+                                                     for chat_id in subscribers {
+                                                         let bot = bot.clone();
+                                                         let text = final_text.clone();
+                                                         let kb = keyboard.clone();
+                                                         let storage = Arc::clone(&last_message_ids);
+                                                         let sym = symbol.clone();
 
-                        for chat_id in subscribers {
-                            let bot = bot.clone();
-                            let text = final_text.clone();
-                            let kb = keyboard.clone();
-                            let storage = Arc::clone(&last_message_ids);
-                            let sym = symbol.clone();
+                                                         tokio::spawn(async move {
+                                                             let key = (sym, chat_id);
 
-                            tokio::spawn(async move {
-                                let key = (sym, chat_id);
+                                                             // 1. Get old_id and immediately drop the lock
+                                                             let old_id = storage.lock().await.get(&key).copied();
 
-                                // 1. Get old_id and immediately drop the lock
-                                let old_id = storage.lock().await.get(&key).copied();
+                                                             if let Some(msg_id) = old_id {
+                                                                 match bot.edit_message_text(chat_id, msg_id, &text)
+                                                                     .parse_mode(ParseMode::MarkdownV2)
+                                                                     .reply_markup(kb.clone())
+                                                                     .await
+                                                                 {
+                                                                     Ok(_) =>return,
+                                                                     Err(RequestError::Api(teloxide::ApiError::MessageNotModified)) => return, // No change: Exit task
+                                                                     Err(RequestError::Api(teloxide::ApiError::MessageToEditNotFound)) => {
+                                                                         // Message was deleted: Clear cache and CONTINUE to send_message
+                                                                         info!("Message for [{}] not found (deleted), will resend.", key.0);
+                                                                         storage.lock().await.remove(&key);
+                                                                     }
+                                                                     Err(e) => {
+                                                                         error!("Edit failed for [{}]: {:?}", key.0, e);
+                                                                         return; // Critical error: Exit task
+                                                                     }
+                                                                 }
+                                                             }
 
-                                if let Some(msg_id) = old_id {
-                                    match bot.edit_message_text(chat_id, msg_id, &text)
-                                        .parse_mode(ParseMode::MarkdownV2)
-                                        .reply_markup(kb.clone())
-                                        .await
-                                    {
-                                        Ok(_) =>return,
-                                        Err(RequestError::Api(teloxide::ApiError::MessageNotModified)) => return, // No change: Exit task
-                                        Err(RequestError::Api(teloxide::ApiError::MessageToEditNotFound)) => {
-                                            // Message was deleted: Clear cache and CONTINUE to send_message
-                                            info!("Message for [{}] not found (deleted), will resend.", key.0);
-                                            storage.lock().await.remove(&key);
-                                        }
-                                        Err(e) => {
-                                            error!("Edit failed for [{}]: {:?}", key.0, e);
-                                            return; // Critical error: Exit task
-                                        }
-                                    }
-                                }
-
-                                // 3. Send new message:
-                                // This part runs IF old_id was None OR the edit failed with MessageToEditNotFound
-                                match bot.send_message(chat_id, &text)
-                                    .parse_mode(ParseMode::MarkdownV2)
-                                    .reply_markup(kb)
-                                    .await
-                                {
-                                    Ok(msg) => {
-                                        storage.lock().await.insert(key, msg.id);
-                                        info!("Resent/Pushed new message for [{}].", key.0);
-                                    }
-                                    Err(e) => error!("Send failed for [{}]: {:?}", key.0, e),
-                                }
-                            });
-                        }
-                    }
-                    _ = switch_rx.recv() => {
-                        info!("🔄 Switch signal received, restarting dispatcher...");
-                        let _ = shutdown_token.shutdown();
-                        let _ = dispatch_task.await;
-                        break;
-                    }
-                    result = &mut dispatch_task => {
-                        match result {
-                            Ok(_) => { info!("Dispatcher finished."); return Ok(()); }
-                            Err(e) => { error!("Dispatcher Task Panic: {:?}", e); break; }
-                        }
-                    }
-                }
+                                                             // 3. Send new message:
+                                                             // This part runs IF old_id was None OR the edit failed with MessageToEditNotFound
+                                                             match bot.send_message(chat_id, &text)
+                                                                 .parse_mode(ParseMode::MarkdownV2)
+                                                                 .reply_markup(kb)
+                                                                 .await
+                                                             {
+                                                                 Ok(msg) => {
+                                                                     storage.lock().await.insert(key, msg.id);
+                                                                     info!("Resent/Pushed new message for [{}].", key.0);
+                                                                 }
+                                                                 Err(e) => error!("Send failed for [{}]: {:?}", key.0, e),
+                                                             }
+                                                         });
+                                                     }
+                                                 }
+                                                 _ = switch_rx.recv() => {
+                                                     info!("🔄 Switch signal received, restarting dispatcher...");
+                                                     let _ = shutdown_token.shutdown();
+                                                     let _ = dispatch_task.await;
+                                                     break;
+                                                 }
+                                                 result = &mut dispatch_task => {
+                                                     match result {
+                                                         Ok(_) => { info!("Dispatcher finished."); return Ok(()); }
+                                                         Err(e) => { error!("Dispatcher Task Panic: {:?}", e); break; }
+                                                     }
+                                                 }
+                                             }
             }
 
             app.switching.store(false, Ordering::SeqCst);

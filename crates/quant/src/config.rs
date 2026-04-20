@@ -593,7 +593,7 @@ impl Default for RiskConfig {
             min_base_size: 0.15,
             confidence_prior: 0.5,
             min_position_size: 0.05,
-            max_position_size: 1.0,
+            max_position_size: 0.8,
             mult_min: 0.4,
             mult_max: 1.6,
             tsunami_allocation: [0.2, 0.3, 0.5],

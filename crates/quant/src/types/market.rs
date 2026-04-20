@@ -156,6 +156,7 @@ pub struct DerivativeSnapshot {
     pub last_price: f64,
     pub current_oi_amount: f64,
     pub current_oi_value: f64,
+    pub funding_rate: f64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MarketStressLevel {

@@ -169,7 +169,7 @@ impl AnalysisAudit {
             .copied()
             .unwrap_or(0.005);
 
-        let funding_rate = ctx.get_cached::<f64>(ContextKey::FundingRate).copied();
+        let funding_rate = Some(ctx.global.funding_rate);
 
         let risk_mgr = RiskManager::new(config.clone());
 

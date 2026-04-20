@@ -171,7 +171,7 @@ impl FeatureContextManager {
         Self {
             symbol_contexts,
             global_btc_price: AtomicU64::new(f64::NAN.to_bits()),
-            cross_cycle_state: DashMap::new(), // 修复：DashMap 初始化正确语法
+            cross_cycle_state: DashMap::new(),
         }
     }
 
@@ -248,7 +248,6 @@ impl FeatureContextManager {
         mc.global = snap;
         mc.roles = current_roles_data;
 
-        // 从跨周期持久化存储中读取状态，注入到缓存
         if let Some(state) = self.cross_cycle_state.get(&symbol) {
             mc.set_cached(ContextKey::SpaceGravityWells, state.gravity_wells.clone());
             mc.set_cached(ContextKey::FakeoutState, state.fakeout_state.clone());
@@ -364,6 +363,12 @@ impl FeatureContextManager {
                 lock.current_oi_value = amount * lock.last_price;
             }
             lock.timestamp = ts;
+        }
+    }
+    pub fn update_funding_rate(&self, symbol: Symbol, rate: f64) {
+        if let Some(ctx) = self.symbol_contexts.get(&symbol) {
+            let mut snap = ctx.latest_snap.write().expect("Lock poisoned");
+            snap.funding_rate = rate;
         }
     }
 

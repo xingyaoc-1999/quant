@@ -2,14 +2,18 @@ pub mod context;
 use anyhow::Result;
 use api_client::{
     http::binance::ArchiveProvider,
-    websocket::{biance::BinanceKlineProtocol, GenericWsClient},
+    websocket::{
+        biance::{funding_rate::BinanceFundingRateProtocol, kline::BinanceKlineProtocol},
+        GenericWsClient,
+    },
 };
 use context::FeatureContextManager;
 use futures_util::stream::{self, StreamExt};
 
 use chrono::{DateTime, DurationRound, Utc};
 use common::{
-    config::Appconfig, utils::CooledProxyPool, Candle, Interval, OpenInterestRecord, Symbol,
+    config::Appconfig, utils::CooledProxyPool, Candle, FundingRateUpdate, Interval,
+    OpenInterestRecord, Symbol,
 };
 use std::{
     collections::HashMap,
@@ -179,15 +183,19 @@ impl DataIntegrityManager {
         let manager = Arc::clone(&self);
         let pp = Arc::clone(&self.proxy_pool);
         let storage = Arc::clone(&self.storage);
-        let symbols = self.symbols.clone();
+        let symbols_kline = self.symbols.clone();
+        let symbols_funding = self.symbols.clone();
         let service = self.analysis_service.clone();
 
         tokio::spawn(async move {
             let (tx, mut rx) = mpsc::channel::<Candle>(2000);
+            let (funding_tx, mut funding_rx) = mpsc::channel::<FundingRateUpdate>(256);
+
             let (event_tx, event_rx) = mpsc::channel::<MarketEvent>(256);
 
             let protocol = BinanceKlineProtocol::new(Interval::M1);
-            let client = GenericWsClient::new(protocol, pp, symbols.into_iter().collect());
+            let client =
+                GenericWsClient::new(protocol, pp.clone(), symbols_kline.into_iter().collect());
 
             info!("📡 [Realtime] Launching WebSocket connectivity engine...");
             tokio::spawn(async move {
@@ -195,7 +203,18 @@ impl DataIntegrityManager {
                     error!("❌ [WS Client] Runtime error: {:?}", e);
                 }
             });
-
+            let funding_protocol = BinanceFundingRateProtocol;
+            let funding_client = GenericWsClient::new(
+                funding_protocol,
+                pp.clone(),
+                symbols_funding.into_iter().collect(),
+            );
+            info!("📡 [Realtime] Launching Funding Rate WebSocket...");
+            tokio::spawn(async move {
+                if let Err(e) = funding_client.run(funding_tx).await {
+                    error!("❌ [WS Funding] Runtime error: {:?}", e);
+                }
+            });
             service.spawn_worker(event_rx);
 
             let mut buffer = Vec::with_capacity(100);
@@ -204,43 +223,45 @@ impl DataIntegrityManager {
 
             loop {
                 tokio::select! {
-                    biased;
-                    Some(candle) = rx.recv() => {
-                        manager.feature_context.update_realtime_m1(candle.clone());
+                                 biased;
+                                 Some(candle) = rx.recv() => {
+                                     manager.feature_context.update_realtime_m1(candle.clone());
 
-                        let _ = event_tx.send(MarketEvent::KlineClosed {
-                            symbol: candle.symbol
-                        }).await;
+                                     let _ = event_tx.send(MarketEvent::KlineClosed {
+                                         symbol: candle.symbol
+                                     }).await;
 
-                        buffer.push(candle);
-                        if buffer.len() >= 50 {
-                            let s = Arc::clone(&storage);
-                            let batch = std::mem::take(&mut buffer);
-                            tokio::spawn(async move {
-                                if let Err(e) = s.insert_candles(&batch).await {
-                                    error!("❌ [Storage] Batch insert failed: {:?}", e);
-                                }
-                            });
-                        }
-                    }
+                                     buffer.push(candle);
+                                     if buffer.len() >= 50 {
+                                         let s = Arc::clone(&storage);
+                                         let batch = std::mem::take(&mut buffer);
+                                         tokio::spawn(async move {
+                                             if let Err(e) = s.insert_candles(&batch).await {
+                                                 error!("❌ [Storage] Batch insert failed: {:?}", e);
+                                             }
+                                         });
+                                     }
+                                 }
+                Some(update) = funding_rx.recv() => {
+                                 manager.feature_context.update_funding_rate(update.symbol, update.funding_rate);
+                             }
+                                 _ = flush_interval.tick() => {
+                                     if !buffer.is_empty() {
+                                         let s = Arc::clone(&storage);
+                                         let batch = std::mem::take(&mut buffer);
+                                         tokio::spawn(async move {
+                                             if let Err(e) = s.insert_candles(&batch).await {
+                                                 error!("❌ [Storage] Flush insert failed: {:?}", e);
+                                             }
+                                         });
+                                     }
+                                 }
 
-                    _ = flush_interval.tick() => {
-                        if !buffer.is_empty() {
-                            let s = Arc::clone(&storage);
-                            let batch = std::mem::take(&mut buffer);
-                            tokio::spawn(async move {
-                                if let Err(e) = s.insert_candles(&batch).await {
-                                    error!("❌ [Storage] Flush insert failed: {:?}", e);
-                                }
-                            });
-                        }
-                    }
-
-                    else => {
-                        warn!("⚠️ [Realtime] Receiver channel closed.");
-                        break;
-                    }
-                }
+                                 else => {
+                                     warn!("⚠️ [Realtime] Receiver channel closed.");
+                                     break;
+                                 }
+                             }
             }
         });
     }

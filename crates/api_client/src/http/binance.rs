@@ -87,7 +87,6 @@ impl ArchiveProvider {
 
                     let json: serde_json::Value = response.json().await?;
 
-                    // 业务错误检查
                     if let Some(code) = json.get("code").and_then(|v| v.as_i64()) {
                         let msg = json.get("msg").and_then(|v| v.as_str()).unwrap_or("");
                         return Err(RequestError::Api {

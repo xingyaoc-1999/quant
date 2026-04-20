@@ -52,10 +52,21 @@ impl RiskManager {
         net_score: f64,
         max_loss_pct: Option<f64>,
         funding_rate: Option<f64>,
-        leverage: f64, // 新增：杠杆倍数
+        leverage: f64,
     ) -> Option<RiskAssessment> {
         let dir = direction?;
         let is_long = dir == TradeDirection::Long;
+        if let Some(rate) = funding_rate {
+            let cfg = &self.config.risk;
+            if cfg.enable_funding_rate {
+                if is_long && rate > 0.1 {
+                    return None;
+                }
+                if !is_long && rate < -0.1 {
+                    return None;
+                }
+            }
+        }
         let mut tags = Vec::with_capacity(16);
         let atr_v = atr_ratio * last_price;
 
@@ -209,7 +220,6 @@ impl RiskManager {
             }
         }
 
-        // 4. MA 乖离
         if let Some(dist) = ma_dist {
             let limit = atr_r * cfg.ma20_extreme_mult;
             let exceed = (dist.abs() / limit.max(f64::EPSILON)).min(2.0);
@@ -225,7 +235,6 @@ impl RiskManager {
             }
         }
 
-        // 5. 波动率
         lrs.push(if vol_p > 70.0 {
             tags.push("HIGH_VOL".into());
             1.25

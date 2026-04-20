@@ -180,6 +180,14 @@ impl Candle {
         })
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct FundingRateUpdate {
+    pub symbol: Symbol,
+    pub funding_rate: f64,
+    pub next_funding_time: i64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema, Hash)]
 pub enum Interval {
     M1,

@@ -21,6 +21,7 @@ pub struct RegimeExtra {
     pub mtf_mult: f64,
     pub slope_bars: i32,
     pub session: String,
+    pub btc_corr_factor: f64, // 新增：记录相关性调节因子
 }
 
 // ==================== MarketRegimeAnalyzer ====================
@@ -61,9 +62,10 @@ impl Analyzer for MarketRegimeAnalyzer {
         &self,
         ctx: &mut MarketContext,
     ) -> Result<AnalysisResult<Self::Extra>, AnalysisError> {
-        // 0. 时段与基础环境
+        // ---- 1. 提取基础环境数据 ----
         let session = TradingSession::from_timestamp(ctx.global.timestamp);
         let session_adj = session.factor(&self.config.session);
+
         let vol_p = ctx
             .get_cached::<f64>(ContextKey::VolPercentile)
             .copied()
@@ -77,6 +79,7 @@ impl Analyzer for MarketRegimeAnalyzer {
             .cloned()
             .unwrap_or_default();
 
+        // ---- 2. 提取 Trend 角色特征 ----
         let trend_role = ctx.get_role(Role::Trend)?;
         let t_feat = &trend_role.feature_set;
         let struct_feat = &t_feat.structure;
@@ -94,9 +97,14 @@ impl Analyzer for MarketRegimeAnalyzer {
         let ma20_slope = struct_feat.ma20_slope;
         let ma20_slope_bars = struct_feat.ma20_slope_bars;
 
+        // ---- 3. BTC 相关性调节因子 ----
+        let btc_corr = struct_feat.correlation_with_global.unwrap_or(1.0);
+        let corr_factor = self.calc_correlation_factor(btc_corr);
+
+        // ---- 4. 配置与基础乘数 ----
         let cfg = &self.config.regime;
 
-        // 1. 基础乘数初始化并应用环境调整
+        // 波动率偏好
         let vol_bias = if vol_p > 80.0 {
             0.8
         } else if vol_p < 20.0 {
@@ -104,11 +112,13 @@ impl Analyzer for MarketRegimeAnalyzer {
         } else {
             1.0
         };
-        let mut m_regime = cfg.mult_regime_normal() * session_adj * vol_bias;
-        let mut m_momentum = 1.0 * session_adj;
+
+        // 基础乘数（应用时段、波动率、相关性因子）
+        let mut m_regime = cfg.mult_regime_normal() * session_adj * vol_bias * corr_factor;
+        let mut m_momentum = session_adj; // 动量乘数也应用时段因子
         let mut base_score = 0.0;
 
-        // 2. 趋势持续性调整
+        // ---- 5. 趋势持续性调节 ----
         let prev_structure = ctx
             .get_cached::<TrendStructure>(ContextKey::RegimeStructure)
             .copied();
@@ -118,20 +128,22 @@ impl Analyzer for MarketRegimeAnalyzer {
         let mut res = AnalysisResult::new(self.kind())
             .because(format!("结构: {:?} | 波动分位: {:.1}%", structure, vol_p));
 
-        // 3. 趋势结构评分
+        // ---- 6. 趋势结构评分（分支覆盖 m_regime 和 base_score）----
         match structure {
             TrendStructure::StrongBullish | TrendStructure::StrongBearish => {
                 let is_bull = matches!(structure, TrendStructure::StrongBullish);
                 let slope_factor = self.calc_slope_factor(ma20_slope, ma20_slope_bars);
                 base_score = (if is_bull { 70.0 } else { -70.0 }) * slope_factor;
-                m_regime = cfg.mult_regime_trend() * session_adj * vol_bias * persistence;
 
+                // 强趋势体制乘数（覆盖基础值，但仍保留持续性因子）
+                m_regime =
+                    cfg.mult_regime_trend() * session_adj * vol_bias * corr_factor * persistence;
                 m_momentum = self.evaluate_momentum(&rsi_state, is_bull, vol_p, is_vol_compressed)
                     * session_adj;
 
+                // 斜率共振加成
                 if let Some(slope) = ma20_slope {
-                    let aligned = (is_bull && slope > 0.0) || (!is_bull && slope < 0.0);
-                    if aligned {
+                    if (is_bull && slope > 0.0) || (!is_bull && slope < 0.0) {
                         let boost = self.calc_slope_boost(slope, ma20_slope_bars);
                         m_momentum *= boost;
                         res = res.because(format!("MA20斜率共振: {:.2}", slope));
@@ -139,7 +151,8 @@ impl Analyzer for MarketRegimeAnalyzer {
                 }
             }
             TrendStructure::Range => {
-                m_regime = cfg.mult_regime_range() * session_adj * vol_bias * persistence;
+                m_regime =
+                    cfg.mult_regime_range() * session_adj * vol_bias * corr_factor * persistence;
                 if let Some(rsi) = &rsi_state {
                     match rsi {
                         RsiState::Overbought | RsiState::Oversold => {
@@ -175,8 +188,9 @@ impl Analyzer for MarketRegimeAnalyzer {
                 base_score = (if is_bull { 30.0 } else { -30.0 }) * slope_factor;
 
                 if let Some(slope) = ma20_slope {
-                    let aligned = (is_bull && slope > 0.0) || (!is_bull && slope < 0.0);
-                    if aligned && ma20_slope_bars >= 2 {
+                    if ((is_bull && slope > 0.0) || (!is_bull && slope < 0.0))
+                        && ma20_slope_bars >= 2
+                    {
                         m_momentum *= 1.0 + slope.abs().min(2.0) * 0.1;
                     }
                 }
@@ -186,7 +200,7 @@ impl Analyzer for MarketRegimeAnalyzer {
 
         m_momentum = m_momentum.clamp(0.2, 2.5);
 
-        // 4. 海啸判定（双向，使用固定阈值）
+        // ---- 7. 海啸判定（双向）----
         let is_bullish = matches!(
             structure,
             TrendStructure::StrongBullish | TrendStructure::Bullish
@@ -221,10 +235,11 @@ impl Analyzer for MarketRegimeAnalyzer {
             m_momentum *= 1.8;
         }
 
-        // 5. Taker博弈乘数
+        // ---- 8. Taker博弈与MTF乘数 ----
         let m_game = self.calc_game_mult(taker_ratio, structure);
         let m_mtf = if mtf_aligned { 1.0 } else { 0.6 };
 
+        // ---- 9. 融合最终乘数 ----
         let raw_mult = m_regime + m_momentum + m_game + m_mtf - 3.0;
         let final_mult = raw_mult.clamp(0.2, cfg.max_mult_cap());
 
@@ -238,6 +253,7 @@ impl Analyzer for MarketRegimeAnalyzer {
             mtf_mult: m_mtf,
             slope_bars: ma20_slope_bars,
             session: format!("{:?}", session),
+            btc_corr_factor: corr_factor,
         };
 
         Ok(res
@@ -247,11 +263,22 @@ impl Analyzer for MarketRegimeAnalyzer {
     }
 }
 
+// ==================== 辅助方法实现 ====================
 impl MarketRegimeAnalyzer {
+    /// 计算 BTC 相关性调节因子
+    fn calc_correlation_factor(&self, corr: f64) -> f64 {
+        match corr {
+            v if v < 0.3 => 0.6, // 极低相关，大幅降权
+            v if v < 0.5 => 0.8, // 低相关，适度降权
+            v if v > 0.8 => 1.1, // 高相关，略微加成
+            _ => 1.0,
+        }
+    }
+
     fn calc_slope_factor(&self, slope: Option<f64>, bars: i32) -> f64 {
         if let Some(s) = slope {
             let slope_abs = s.abs().min(5.0);
-            let bars_abs = bars.abs() as f64; // 取绝对值
+            let bars_abs = bars.abs() as f64;
             let bars_factor = (bars_abs / 10.0).min(1.5);
             1.0 + slope_abs * 0.1 * bars_factor
         } else {
@@ -262,7 +289,7 @@ impl MarketRegimeAnalyzer {
     fn calc_slope_boost(&self, slope: f64, bars: i32) -> f64 {
         let cfg = &self.config.regime;
         let slope_strength = slope.abs().min(3.0);
-        let bars_abs = bars.abs(); // 取绝对值
+        let bars_abs = bars.abs();
         let bars_factor = if bars_abs >= cfg.slope_bars_threshold() {
             1.2
         } else {
