@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+// ==================== Top-Level Config ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyzerConfig {
     pub gravity: GravityConfig,
@@ -10,6 +11,7 @@ pub struct AnalyzerConfig {
     pub volatility: VolatilityConfig,
     pub resonance: ResonanceConfig,
     pub risk: RiskConfig,
+    pub signal_stability: SignalStabilityConfig,
 }
 
 impl Default for AnalyzerConfig {
@@ -23,45 +25,27 @@ impl Default for AnalyzerConfig {
             volatility: VolatilityConfig::default(),
             resonance: ResonanceConfig::default(),
             risk: RiskConfig::default(),
+            signal_stability: SignalStabilityConfig::default(),
         }
     }
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WearScales {
-    pub trend: f64,
-    pub filter: f64,
-    pub entry: f64,
-    pub ma20: f64,
 }
 
-impl Default for WearScales {
-    fn default() -> Self {
-        Self {
-            trend: 1.0,
-            filter: 1.0,
-            entry: 0.5,
-            ma20: 1.0,
-        }
-    }
-}
 // ==================== GravityConfig ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GravityConfig {
-    /// 引力作用范围 (0.3~1.8)，值越大井的影响半径越大
+    /// Gravity range (0.3~1.8), larger value = wider influence radius.
     pub gravity_range: f64,
-    /// 最小有效井强度 (0.02~0.20)，低于此值的井被忽略
+    /// Minimum strength to consider a well valid (0.02~0.20).
     pub min_well_strength: f64,
-    /// 井位合并敏感度 (0~1)，值越大越容易合并
+    /// Merge sensitivity (0~1), higher = more aggressive merging.
     pub merge_sensitivity: f64,
-    /// 磨损敏感度 (0~1)，值越大触碰后强度衰减越快
+    /// Wear sensitivity (0~1), higher = faster strength decay when hit.
     pub wear_sensitivity: f64,
-    /// 磨损恢复速率 (0~1)，值越大强度恢复越快
+    /// Wear recovery rate (0~1), higher = faster strength restoration.
     pub wear_recovery_rate: f64,
-    pub enable_entry_wells: bool,
-    pub weight_entry_res: f64,
-    pub weight_entry_sup: f64,
-    pub entry_wear_scale: f64,
+    /// Threshold for marking a well as active.
     pub active_well_threshold: f64,
+    /// Wear scales per role.
     pub wear_scales: WearScales,
 }
 
@@ -73,10 +57,6 @@ impl Default for GravityConfig {
             merge_sensitivity: 0.5,
             wear_sensitivity: 0.6,
             wear_recovery_rate: 0.5,
-            enable_entry_wells: true,
-            weight_entry_res: 0.6,
-            weight_entry_sup: 0.6,
-            entry_wear_scale: 0.5,
             active_well_threshold: 0.08,
             wear_scales: WearScales::default(),
         }
@@ -87,7 +67,6 @@ impl GravityConfig {
     pub fn min_well_strength(&self) -> f64 {
         self.min_well_strength
     }
-
     pub fn active_well_threshold(&self) -> f64 {
         self.active_well_threshold
     }
@@ -129,32 +108,39 @@ impl GravityConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WearScales {
+    pub trend: f64,
+    pub filter: f64,
+    pub entry: f64,
+    pub ma20: f64,
+}
+
+impl Default for WearScales {
+    fn default() -> Self {
+        Self {
+            trend: 1.0,
+            filter: 1.0,
+            entry: 0.5,
+            ma20: 1.0,
+        }
+    }
+}
+
 // ==================== VolatilityConfig ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolatilityConfig {
-    /// 低于中位数该比例视为死寂市场
     pub extreme_low_ratio: f64,
-    /// 低于该比例视为波动压缩
     pub squeeze_ratio: f64,
-    /// 低于该比例视为趋势动能不足
     pub low_momentum_ratio: f64,
-    /// 高于该比例视为绞肉机行情
     pub meat_grinder_ratio: f64,
-    /// 高于该比例视为加速段
     pub acceleration_ratio: f64,
-    /// 死寂市场的乘数
     pub dead_multiplier: f64,
-    /// 加速段的乘数
     pub acceleration_multiplier: f64,
-    /// 趋势动能不足的乘数
     pub weak_momentum_multiplier: f64,
-    /// 趋势共振的乘数
     pub trend_resonance_multiplier: f64,
-    /// 波动压缩的乘数
     pub squeeze_multiplier: f64,
-    /// 绞肉机行情的乘数
     pub meat_grinder_multiplier: f64,
-    /// 标准震荡的乘数
     pub normal_range_multiplier: f64,
     pub compressed_threshold: f64,
 }
@@ -178,18 +164,44 @@ impl Default for VolatilityConfig {
         }
     }
 }
+
 // ==================== VolumeConfig ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeConfig {
-    /// 量能敏感度 (0~1)
+    /// Volume sensitivity (0~1). Higher = more sensitive to volume surges/shrinks.
     pub volume_sensitivity: f64,
-    /// 效率门槛 (0~1)
+    /// Efficiency threshold (0~1). Higher = stricter requirement for efficient moves.
     pub efficiency_threshold: f64,
-    /// 趋势延伸激进程度 (0~1)
+    /// Aggressiveness of trend extension scoring (0~1).
     pub trend_extension_aggressiveness: f64,
-    pub efficiency: EfficiencyConfig,
-    pub magnet_threshold_ratio: f64, // 磁力突破/高效率阈值的比例系数（相对于普通阈值）
-    pub magnet_shrink_base: f64,     // 磁力缩量基准值（未经 vol_factor 调整）
+    /// Magnet sensitivity (0~1). Higher = easier magnet activation.
+    pub magnet_sensitivity: f64,
+
+    // Volatility adaptation parameters (merged from VolFactorConfig & VolAdaptationConfig)
+    /// Mid point of volatility percentile for factor calculation.
+    pub vol_factor_mid: f64,
+    /// Minimum factor at vol_p = 0.
+    pub vol_factor_min: f64,
+    /// Maximum factor at vol_p = 100.
+    pub vol_factor_max: f64,
+    /// Knots for volatility adaptation: [(vol_p, factor), ...] (must be sorted by vol_p).
+    pub vol_adapt_knots: [(f64, f64); 4],
+    /// Minimum output clamp for adaptation.
+    pub vol_adapt_min: f64,
+    /// Maximum output clamp for adaptation.
+    pub vol_adapt_max: f64,
+
+    // Efficiency calculation parameters (merged from EfficiencyConfig)
+    /// Minimum relative volume to avoid division by zero.
+    pub min_rvol: f64,
+    /// Low volume penalty threshold.
+    pub low_volume_threshold: f64,
+    /// Strength of low volume penalty (0~1).
+    pub low_volume_penalty_strength: f64,
+    /// Minimum compactness to prevent underestimation.
+    pub min_compactness: f64,
+    /// Maximum efficiency cap.
+    pub max_efficiency: f64,
 }
 
 impl Default for VolumeConfig {
@@ -198,14 +210,29 @@ impl Default for VolumeConfig {
             volume_sensitivity: 0.5,
             efficiency_threshold: 0.5,
             trend_extension_aggressiveness: 0.6,
-            magnet_threshold_ratio: 0.7, // 磁力阈值比普通阈值宽松 30%
-            magnet_shrink_base: 0.5,     // 缩量基准
-            efficiency: EfficiencyConfig::default(),
+            magnet_sensitivity: 0.7,
+            vol_factor_mid: 50.0,
+            vol_factor_min: 0.6,
+            vol_factor_max: 1.8,
+            vol_adapt_knots: [(0.0, 1.2), (25.0, 1.0), (60.0, 0.85), (75.0, 0.7)],
+            vol_adapt_min: 0.5,
+            vol_adapt_max: 1.5,
+            min_rvol: 0.1,
+            low_volume_threshold: 0.4,
+            low_volume_penalty_strength: 0.8,
+            min_compactness: 0.1,
+            max_efficiency: 5.0,
         }
     }
 }
 
 impl VolumeConfig {
+    pub(crate) fn magnet_threshold_ratio(&self) -> f64 {
+        0.5 + self.magnet_sensitivity * 0.5
+    }
+    pub(crate) fn magnet_shrink_base(&self) -> f64 {
+        0.8 - self.magnet_sensitivity * 0.4
+    }
     pub(crate) fn rvol_break_base(&self) -> f64 {
         1.0 + self.volume_sensitivity * 0.4
     }
@@ -248,28 +275,15 @@ impl VolumeConfig {
     pub(crate) fn background_mult(&self) -> f64 {
         1.1
     }
-    pub(crate) fn magnet_threshold_ratio(&self) -> f64 {
-        self.magnet_threshold_ratio
-    }
-
-    pub(crate) fn magnet_shrink_base(&self) -> f64 {
-        self.magnet_shrink_base
-    }
 }
 
 // ==================== RegimeConfig ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegimeConfig {
-    /// 趋势偏好 (>1 偏好趋势市，<1 偏好震荡市)
     pub trend_bias: f64,
-    /// 动量敏感度 (0~1)
     pub momentum_sensitivity: f64,
-    /// 主动流向权重 (0~1)
     pub taker_flow_weight: f64,
-    /// 海啸触发门槛 (0~1)，值越小越易触发
     pub tsunami_threshold: f64,
-    pub trend_persistence_boost: f64,
-    pub range_persistence_boost: f64,
 }
 
 impl Default for RegimeConfig {
@@ -279,8 +293,6 @@ impl Default for RegimeConfig {
             momentum_sensitivity: 0.6,
             taker_flow_weight: 0.7,
             tsunami_threshold: 0.5,
-            trend_persistence_boost: 1.05,
-            range_persistence_boost: 1.0,
         }
     }
 }
@@ -322,7 +334,6 @@ impl RegimeConfig {
     pub(crate) fn tsunami_base_oi_delta(&self) -> f64 {
         0.02 - self.tsunami_threshold * 0.015
     }
-
     pub(crate) fn slope_momentum_boost(&self) -> f64 {
         0.15
     }
@@ -340,9 +351,7 @@ impl RegimeConfig {
 // ==================== FakeoutConfig ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FakeoutConfig {
-    /// 假突破严厉程度 (0~1)
     pub severity: f64,
-    /// 假突破持续性要求 (0~1)
     pub persistence: f64,
 }
 
@@ -426,71 +435,7 @@ impl Default for SessionConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct EfficiencyConfig {
-    /// 最低允许的相对成交量（避免除零，同时限制低量时的分母下限）
-    pub min_rvol: f64,
-    /// 低量惩罚的起始阈值（当 rvol < low_volume_threshold 时开始衰减）
-    pub low_volume_threshold: f64,
-    /// 低量惩罚的强度（0: 无惩罚，1: 完全按比例惩罚）
-    pub low_volume_penalty_strength: f64,
-    /// 紧凑度下限（防止影线过长导致效率被低估过度）
-    pub min_compactness: f64,
-    /// 效率上限
-    pub max_efficiency: f64,
-}
-
-impl Default for EfficiencyConfig {
-    fn default() -> Self {
-        Self {
-            min_rvol: 0.1,
-            low_volume_threshold: 0.4,
-            low_volume_penalty_strength: 0.8,
-            min_compactness: 0.1,
-            max_efficiency: 5.0,
-        }
-    }
-}
-/// 波动率因子计算配置
-#[derive(Debug, Clone, Copy)]
-pub struct VolFactorConfig {
-    /// 波动率百分位数中点（此处因子为 1.0），默认 50.0
-    pub mid_point: f64,
-    /// 最小因子（vol_p = 0 时），默认 0.6
-    pub min_factor: f64,
-    /// 最大因子（vol_p = 100 时），默认 1.8
-    pub max_factor: f64,
-}
-
-impl Default for VolFactorConfig {
-    fn default() -> Self {
-        Self {
-            mid_point: 50.0,
-            min_factor: 0.6,
-            max_factor: 1.8,
-        }
-    }
-}
-#[derive(Debug, Clone, Copy)]
-pub struct VolAdaptationConfig {
-    /// 关键点列表 (vol_p, factor)，必须按 vol_p 递增排序
-    /// 默认使用四个点: (0.0, 1.2), (25.0, 1.0), (60.0, 0.85), (75.0, 0.7)
-    pub knots: [(f64, f64); 4],
-    /// 输出因子的安全下限，默认 0.5
-    pub min_output: f64,
-    /// 输出因子的安全上限，默认 1.5
-    pub max_output: f64,
-}
-
-impl Default for VolAdaptationConfig {
-    fn default() -> Self {
-        Self {
-            knots: [(0.0, 1.2), (25.0, 1.0), (60.0, 0.85), (75.0, 0.7)],
-            min_output: 0.5,
-            max_output: 1.5,
-        }
-    }
-}
+// ==================== ResonanceConfig (Simplified) ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResonanceConfig {
     pub ma20_trigger_score: f64,
@@ -498,18 +443,11 @@ pub struct ResonanceConfig {
     pub early_trend_bars: i32,
     pub early_trend_mult: f64,
     pub aging_trend_bars: i32,
-    pub aging_decay_period: f64,
     pub max_aging_penalty: f64,
     pub momentum_confirm_mult: f64,
     pub momentum_div_penalty: f64,
-    pub bearish_div_long_penalty: f64,
-    pub bearish_div_long_score_penalty: f64,
     pub bearish_div_short_boost: f64,
-    pub bearish_div_short_score_boost: f64,
     pub bullish_div_long_boost: f64,
-    pub bullish_div_long_score_boost: f64,
-    pub bullish_div_short_penalty: f64,
-    pub bullish_div_short_score_penalty: f64,
     pub mtf_misalign_penalty: f64,
 }
 
@@ -521,57 +459,46 @@ impl Default for ResonanceConfig {
             early_trend_bars: 12,
             early_trend_mult: 1.3,
             aging_trend_bars: 24,
-            aging_decay_period: 30.0,
             max_aging_penalty: 0.7,
             momentum_confirm_mult: 1.25,
             momentum_div_penalty: 0.8,
-            bearish_div_long_penalty: 0.6,
-            bearish_div_long_score_penalty: 30.0,
             bearish_div_short_boost: 1.3,
-            bearish_div_short_score_boost: 20.0,
             bullish_div_long_boost: 1.3,
-            bullish_div_long_score_boost: 20.0,
-            bullish_div_short_penalty: 0.6,
-            bullish_div_short_score_penalty: 30.0,
             mtf_misalign_penalty: 0.7,
         }
     }
 }
 
+// ==================== RiskConfig ====================
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub enum EntryStrategy {
+    Limit,
+    Stop,
+    #[default]
+    Hybrid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskConfig {
-    /// 最低可接受加权盈亏比
     pub rr_min_acceptable: f64,
-    /// MA20 极端乖离倍数（用于似然比）
     pub ma20_extreme_mult: f64,
-    /// 三档止损的 ATR 缓冲倍数
     pub atr_sl_buffers: [f64; 3],
-    /// 止损的最小 ATR 倍数（防止止损过近）
     pub min_sl_atr_mult: f64,
-    /// 最大井强度上限（用于基础仓位计算）
     pub max_strength_cap: f64,
-    /// 基础仓位上下限（占总资金比例）
     pub base_size_max: f64,
     pub min_base_size: f64,
-    /// 贝叶斯先验置信度
     pub confidence_prior: f64,
-    /// 最终仓位上下限
     pub min_position_size: f64,
     pub max_position_size: f64,
-    /// 置信乘数裁剪范围
     pub mult_min: f64,
     pub mult_max: f64,
-    /// 海啸模式下的止盈分配比例
     pub tsunami_allocation: [f64; 3],
-    /// 跟踪止损的 ATR 倍数
     pub trailing_atr_mult: f64,
-    /// 贝叶斯似然比
     pub lr_trend_strong: f64,
     pub lr_trend_weak: f64,
     pub lr_taker_aligned: f64,
     pub lr_taker_mismatch: f64,
     pub lr_tsunami: f64,
-    /// 资金费率风控
     pub enable_funding_rate: bool,
     pub funding_rate_threshold: f64,
     pub funding_rate_penalty: f64,
@@ -579,6 +506,9 @@ pub struct RiskConfig {
     pub entry_atr_step_mult: f64,
     pub default_entry_allocations: [f64; 3],
     pub direction_base_threshold: f64,
+    pub min_weighted_rr: f64,
+    pub entry_strategy: EntryStrategy,
+    pub stop_entry_offset_pct: f64,
 }
 
 impl Default for RiskConfig {
@@ -610,6 +540,25 @@ impl Default for RiskConfig {
             entry_atr_step_mult: 0.5,
             default_entry_allocations: [0.5, 0.3, 0.2],
             direction_base_threshold: 10.0,
+            min_weighted_rr: 1.2,
+            entry_strategy: EntryStrategy::Hybrid,
+            stop_entry_offset_pct: 0.001,
+        }
+    }
+}
+
+// ==================== SignalStabilityConfig ====================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalStabilityConfig {
+    pub confirm_bars: usize,
+    pub latch_bars: usize,
+}
+
+impl Default for SignalStabilityConfig {
+    fn default() -> Self {
+        Self {
+            confirm_bars: 1,
+            latch_bars: 2,
         }
     }
 }

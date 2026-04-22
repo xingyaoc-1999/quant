@@ -8,6 +8,7 @@ use crate::{
         market::{TradeDirection, TrendStructure},
         session::TradingSession,
     },
+    utils::math::dynamic_direction_threshold,
 };
 use chrono::Utc;
 use schemars::JsonSchema;
@@ -217,7 +218,6 @@ impl AnalysisAudit {
     }
 
     pub fn to_markdown_v2(&self, ctx: &MarketContext) -> String {
-
         let header = self.build_header(ctx);
         let metrics = self.build_metrics();
         let wells = self.build_wells_section();
@@ -463,37 +463,4 @@ pub fn escape_markdown_v2(s: &str) -> String {
         }
     }
     result
-}
-
-fn dynamic_direction_threshold(
-    net_score: f64,
-    vol_p: f64,
-    regime: TrendStructure,
-    confidence_mult: f64,
-    base_threshold: f64,
-) -> Option<TradeDirection> {
-    let vol_factor = if vol_p > 70.0 {
-        1.3
-    } else if vol_p < 30.0 {
-        0.7
-    } else {
-        1.0
-    };
-
-    let regime_factor = match regime {
-        TrendStructure::StrongBullish | TrendStructure::StrongBearish => 0.8,
-        TrendStructure::Range => 1.2,
-        _ => 1.0,
-    };
-
-    let confidence_factor = 1.0 / confidence_mult.clamp(0.5, 2.0);
-    let threshold = base_threshold * vol_factor * regime_factor * confidence_factor;
-
-    if net_score > threshold {
-        Some(TradeDirection::Long)
-    } else if net_score < -threshold {
-        Some(TradeDirection::Short)
-    } else {
-        None
-    }
 }

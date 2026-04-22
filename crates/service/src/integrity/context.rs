@@ -4,10 +4,11 @@ use dashmap::DashMap;
 use quant::{
     analyzer::{ContextKey, MarketContext},
     calculator::FeatureCalculator,
+    config::SignalStabilityConfig,
     types::{
         futures::{OIData, Role, RoleData, TakerFlowData},
         gravity::PriceGravityWell,
-        market::DerivativeSnapshot,
+        market::{DerivativeSnapshot, TradeDirection},
     },
 };
 use rayon::prelude::*;
@@ -20,6 +21,13 @@ use std::{
     f64,
 };
 use tracing::info;
+
+#[derive(Default, Clone)]
+pub struct SignalConfirmState {
+    last_direction: Option<TradeDirection>,
+    consecutive_count: usize,
+    latch_remaining: usize,
+}
 
 pub struct RoleProcessor {
     pub interval: Interval,
@@ -128,16 +136,12 @@ impl RoleProcessor {
     }
 }
 
-// ==================== 跨周期持久化状态 ====================
 #[derive(Debug, Clone, Default)]
 pub struct CrossCycleState {
-    /// 引力井列表（包含磨损计数、磁力状态）
     pub gravity_wells: Vec<PriceGravityWell>,
-    /// 假突破状态缓存 (well_key -> (confirm_count, cooldown_remaining))
     pub fakeout_state: HashMap<String, (usize, usize)>,
 }
 
-// ==================== 上下文管理器 ====================
 pub struct SymbolContext {
     pub roles: RwLock<HashMap<Role, RoleProcessor>>,
     pub latest_snap: RwLock<DerivativeSnapshot>,
@@ -147,10 +151,12 @@ pub struct FeatureContextManager {
     pub symbol_contexts: DashMap<Symbol, SymbolContext>,
     pub global_btc_price: AtomicU64,
     pub cross_cycle_state: DashMap<Symbol, CrossCycleState>,
+    pub signal_states: DashMap<Symbol, SignalConfirmState>,
+    pub signal_config: SignalStabilityConfig,
 }
 
 impl FeatureContextManager {
-    pub fn new(symbols: &[Symbol]) -> Self {
+    pub fn new(symbols: &[Symbol], signal_config: SignalStabilityConfig) -> Self {
         let symbol_contexts = DashMap::new();
         let cfg = Appconfig::global();
 
@@ -172,6 +178,8 @@ impl FeatureContextManager {
             symbol_contexts,
             global_btc_price: AtomicU64::new(f64::NAN.to_bits()),
             cross_cycle_state: DashMap::new(),
+            signal_states: DashMap::new(),
+            signal_config,
         }
     }
 
@@ -402,5 +410,47 @@ impl FeatureContextManager {
             }
         }
         updated_roles
+    }
+
+    pub fn filter_direction(
+        &self,
+        symbol: Symbol,
+        raw_direction: Option<TradeDirection>,
+    ) -> Option<TradeDirection> {
+        let mut state = self.signal_states.entry(symbol).or_default();
+
+        if state.latch_remaining > 0 {
+            state.latch_remaining -= 1;
+            return state.last_direction;
+        }
+
+        match (state.last_direction, raw_direction) {
+            (Some(prev), Some(curr)) if prev == curr => {
+                state.consecutive_count += 1;
+            }
+            (Some(_), Some(curr)) => {
+                // 方向改变，重置
+                state.consecutive_count = 1;
+                state.last_direction = Some(curr);
+            }
+            (None, Some(curr)) => {
+                state.consecutive_count = 1;
+                state.last_direction = Some(curr);
+            }
+            (Some(prev), None) => {
+                state.consecutive_count = 0;
+            }
+            (None, None) => {
+                state.consecutive_count = 0;
+            }
+        }
+
+        if state.consecutive_count >= self.signal_config.confirm_bars {
+            state.latch_remaining = self.signal_config.latch_bars;
+            state.consecutive_count = 0;
+            return state.last_direction;
+        }
+
+        None
     }
 }

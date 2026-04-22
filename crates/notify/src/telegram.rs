@@ -1,6 +1,4 @@
 mod command;
-mod menu;
-mod subscription;
 
 use anyhow::Result;
 use chrono::{FixedOffset, Utc};
@@ -14,6 +12,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use storage::postgres::Storage;
 use teloxide::{
     dispatching::{Dispatcher, HandlerExt, UpdateFilterExt},
     prelude::*,
@@ -27,9 +26,9 @@ use teloxide::{
 };
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
-use crate::telegram::{command::MyCommand, subscription::SubscriptionManager};
+use crate::telegram::command::MyCommand;
 
 struct BotRotator;
 impl ShouldRotate<RequestError> for BotRotator {
@@ -42,27 +41,20 @@ pub struct BotApp {
     proxy_pool: Arc<CooledProxyPool>,
     token: String,
     switching: Arc<AtomicBool>,
-    subscriptions: Arc<SubscriptionManager>,
+    storage: Arc<Storage>,
 }
 
 impl BotApp {
-    pub async fn new(token: String, proxy_pool: Arc<CooledProxyPool>) -> Result<Self> {
-        let subscriptions = Arc::new(SubscriptionManager::new());
-
-        let all_symbols = Symbol::all();
-        for symbol in all_symbols {
-            subscriptions.add(symbol, ChatId(5943539337)).await;
-            subscriptions.add(symbol, ChatId(8749052696)).await;
-
-            subscriptions.add(symbol, ChatId(454287823)).await;
-            subscriptions.add(symbol, ChatId(7541106291)).await;
-        }
-
+    pub async fn new(
+        token: String,
+        proxy_pool: Arc<CooledProxyPool>,
+        storage: Arc<Storage>,
+    ) -> Result<Self> {
         Ok(Self {
             proxy_pool,
             token,
             switching: Arc::new(AtomicBool::new(false)),
-            subscriptions,
+            storage,
         })
     }
 
@@ -85,7 +77,6 @@ impl BotApp {
                 Ok(bot)
             }
         };
-
         retry_with_proxy_rotation_cooled(&self.proxy_pool, request_fn, BotRotator).await
     }
 
@@ -127,16 +118,15 @@ impl BotApp {
                 }
             });
 
-            let subs_for_cmd = Arc::clone(&app.subscriptions);
-
+            let storage_for_cmd = Arc::clone(&app.storage);
             let handler = dptree::entry()
                 .branch(
                     Update::filter_message()
                         .filter_command::<MyCommand>()
                         .endpoint(move |bot: Bot, msg: Message, cmd: MyCommand| {
-                            let subs = Arc::clone(&subs_for_cmd);
+                            let storage = Arc::clone(&storage_for_cmd);
                             async move {
-                                if let Err(e) = cmd.handle(&bot, msg.chat.id, subs).await {
+                                if let Err(e) = cmd.handle(&bot, msg.chat.id, storage).await {
                                     error!("❌ [Command Error] {:#}", e);
                                 }
                                 Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
@@ -173,85 +163,86 @@ impl BotApp {
 
             loop {
                 tokio::select! {
-                                                               Some((text, symbol)) = rx_in.recv() => {
-                                                     let subscribers = app.subscriptions.get_subscribers(&symbol).await;
-                                                     if subscribers.is_empty() {
-                                                         continue;
-                                                     }
+                    Some((text, symbol)) = rx_in.recv() => {
+                        let subscribers = match app.storage.get_subscribed_users(symbol).await {
+                            Ok(list) => list,
+                            Err(e) => {
+                                error!("Failed to fetch subscribers for {}: {}", symbol, e);
+                                continue;
+                            }
+                        };
+                        if subscribers.is_empty() {
+                            continue;
+                        }
 
+                        let timestamp = Utc::now()
+                            .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap())
+                            .format("%Y-%m-%d %H:%M:%S")
+                            .to_string();
+                        let final_text = format!("{}\n\n🕒 Last update: `{}`", text, timestamp);
 
-                                           let timestamp = Utc::now()
-                                .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap())
-                                 .format("%Y-%m-%d %H:%M:%S")
-                                .to_string();
-                let final_text = format!("{}\n\n🕒 Last update: `{}`", text, timestamp);
+                        let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                            InlineKeyboardButton::callback("🔍 AI 深度审计", format!("audit_{}", symbol))
+                        ]]);
 
-                                                     let keyboard = InlineKeyboardMarkup::new(vec![vec![
-                                                         InlineKeyboardButton::callback("🔍 AI 深度审计", format!("audit_{}", symbol))
-                                                     ]]);
+                        for telegram_id in subscribers {
+                            let chat_id = ChatId(telegram_id);
+                            let bot = bot.clone();
+                            let text = final_text.clone();
+                            let kb = keyboard.clone();
+                            let storage = Arc::clone(&last_message_ids);
+                            let sym = symbol.clone();
 
-                                                     for chat_id in subscribers {
-                                                         let bot = bot.clone();
-                                                         let text = final_text.clone();
-                                                         let kb = keyboard.clone();
-                                                         let storage = Arc::clone(&last_message_ids);
-                                                         let sym = symbol.clone();
+                            tokio::spawn(async move {
+                                let key = (sym, chat_id);
+                                let old_id = storage.lock().await.get(&key).copied();
 
-                                                         tokio::spawn(async move {
-                                                             let key = (sym, chat_id);
+                                if let Some(msg_id) = old_id {
+                                    match bot.edit_message_text(chat_id, msg_id, &text)
+                                        .parse_mode(ParseMode::MarkdownV2)
+                                        .reply_markup(kb.clone())
+                                        .await
+                                    {
+                                        Ok(_) => return,
+                                        Err(RequestError::Api(teloxide::ApiError::MessageNotModified)) => return,
+                                        Err(RequestError::Api(teloxide::ApiError::MessageToEditNotFound)) => {
+                                            info!("Message for [{}] not found, resending.", key.0);
+                                            storage.lock().await.remove(&key);
+                                        }
+                                        Err(e) => {
+                                            error!("Edit failed for [{}]: {:?}", key.0, e);
+                                            return;
+                                        }
+                                    }
+                                }
 
-                                                             // 1. Get old_id and immediately drop the lock
-                                                             let old_id = storage.lock().await.get(&key).copied();
-
-                                                             if let Some(msg_id) = old_id {
-                                                                 match bot.edit_message_text(chat_id, msg_id, &text)
-                                                                     .parse_mode(ParseMode::MarkdownV2)
-                                                                     .reply_markup(kb.clone())
-                                                                     .await
-                                                                 {
-                                                                     Ok(_) =>return,
-                                                                     Err(RequestError::Api(teloxide::ApiError::MessageNotModified)) => return, // No change: Exit task
-                                                                     Err(RequestError::Api(teloxide::ApiError::MessageToEditNotFound)) => {
-                                                                         // Message was deleted: Clear cache and CONTINUE to send_message
-                                                                         info!("Message for [{}] not found (deleted), will resend.", key.0);
-                                                                         storage.lock().await.remove(&key);
-                                                                     }
-                                                                     Err(e) => {
-                                                                         error!("Edit failed for [{}]: {:?}", key.0, e);
-                                                                         return; // Critical error: Exit task
-                                                                     }
-                                                                 }
-                                                             }
-
-                                                             // 3. Send new message:
-                                                             // This part runs IF old_id was None OR the edit failed with MessageToEditNotFound
-                                                             match bot.send_message(chat_id, &text)
-                                                                 .parse_mode(ParseMode::MarkdownV2)
-                                                                 .reply_markup(kb)
-                                                                 .await
-                                                             {
-                                                                 Ok(msg) => {
-                                                                     storage.lock().await.insert(key, msg.id);
-                                                                     info!("Resent/Pushed new message for [{}].", key.0);
-                                                                 }
-                                                                 Err(e) => error!("Send failed for [{}]: {:?}", key.0, e),
-                                                             }
-                                                         });
-                                                     }
-                                                 }
-                                                 _ = switch_rx.recv() => {
-                                                     info!("🔄 Switch signal received, restarting dispatcher...");
-                                                     let _ = shutdown_token.shutdown();
-                                                     let _ = dispatch_task.await;
-                                                     break;
-                                                 }
-                                                 result = &mut dispatch_task => {
-                                                     match result {
-                                                         Ok(_) => { info!("Dispatcher finished."); return Ok(()); }
-                                                         Err(e) => { error!("Dispatcher Task Panic: {:?}", e); break; }
-                                                     }
-                                                 }
-                                             }
+                                match bot.send_message(chat_id, &text)
+                                    .parse_mode(ParseMode::MarkdownV2)
+                                    .reply_markup(kb)
+                                    .await
+                                {
+                                    Ok(msg) => {
+                                        storage.lock().await.insert(key, msg.id);
+                                        info!("Sent new message for [{}].", key.0);
+                                    }
+                                    Err(e) => error!("Send failed for [{}]: {:?}", key.0, e),
+                                }
+                            });
+                        }
+                    }
+                    _ = switch_rx.recv() => {
+                        info!("🔄 Switch signal received, restarting dispatcher...");
+                        let _ = shutdown_token.shutdown();
+                        let _ = dispatch_task.await;
+                        break;
+                    }
+                    result = &mut dispatch_task => {
+                        match result {
+                            Ok(_) => { info!("Dispatcher finished."); return Ok(()); }
+                            Err(e) => { error!("Dispatcher Task Panic: {:?}", e); break; }
+                        }
+                    }
+                }
             }
 
             app.switching.store(false, Ordering::SeqCst);

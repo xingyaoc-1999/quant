@@ -21,7 +21,7 @@ pub struct RegimeExtra {
     pub mtf_mult: f64,
     pub slope_bars: i32,
     pub session: String,
-    pub btc_corr_factor: f64, // 新增：记录相关性调节因子
+    pub btc_corr_factor: f64,
 }
 
 // ==================== MarketRegimeAnalyzer ====================
@@ -62,7 +62,7 @@ impl Analyzer for MarketRegimeAnalyzer {
         &self,
         ctx: &mut MarketContext,
     ) -> Result<AnalysisResult<Self::Extra>, AnalysisError> {
-        // ---- 1. 提取基础环境数据 ----
+        // ---- 1. 环境数据 ----
         let session = TradingSession::from_timestamp(ctx.global.timestamp);
         let session_adj = session.factor(&self.config.session);
 
@@ -79,7 +79,7 @@ impl Analyzer for MarketRegimeAnalyzer {
             .cloned()
             .unwrap_or_default();
 
-        // ---- 2. 提取 Trend 角色特征 ----
+        // ---- 2. Trend 角色特征 ----
         let trend_role = ctx.get_role(Role::Trend)?;
         let t_feat = &trend_role.feature_set;
         let struct_feat = &t_feat.structure;
@@ -97,14 +97,18 @@ impl Analyzer for MarketRegimeAnalyzer {
         let ma20_slope = struct_feat.ma20_slope;
         let ma20_slope_bars = struct_feat.ma20_slope_bars;
 
-        // ---- 3. BTC 相关性调节因子 ----
+        // ---- 3. BTC 相关性因子 ----
         let btc_corr = struct_feat.correlation_with_global.unwrap_or(1.0);
-        let corr_factor = self.calc_correlation_factor(btc_corr);
+        let corr_factor = match btc_corr {
+            v if v < 0.3 => 0.6,
+            v if v < 0.5 => 0.8,
+            v if v > 0.8 => 1.1,
+            _ => 1.0,
+        };
 
         // ---- 4. 配置与基础乘数 ----
         let cfg = &self.config.regime;
 
-        // 波动率偏好
         let vol_bias = if vol_p > 80.0 {
             0.8
         } else if vol_p < 20.0 {
@@ -113,35 +117,24 @@ impl Analyzer for MarketRegimeAnalyzer {
             1.0
         };
 
-        // 基础乘数（应用时段、波动率、相关性因子）
         let mut m_regime = cfg.mult_regime_normal() * session_adj * vol_bias * corr_factor;
-        let mut m_momentum = session_adj; // 动量乘数也应用时段因子
+        let mut m_momentum = session_adj;
         let mut base_score = 0.0;
-
-        // ---- 5. 趋势持续性调节 ----
-        let prev_structure = ctx
-            .get_cached::<TrendStructure>(ContextKey::RegimeStructure)
-            .copied();
-        let persistence = self.calc_persistence_factor(structure, prev_structure);
-        m_regime *= persistence;
 
         let mut res = AnalysisResult::new(self.kind())
             .because(format!("结构: {:?} | 波动分位: {:.1}%", structure, vol_p));
 
-        // ---- 6. 趋势结构评分（分支覆盖 m_regime 和 base_score）----
+        // ---- 5. 趋势结构评分 ----
         match structure {
             TrendStructure::StrongBullish | TrendStructure::StrongBearish => {
                 let is_bull = matches!(structure, TrendStructure::StrongBullish);
                 let slope_factor = self.calc_slope_factor(ma20_slope, ma20_slope_bars);
                 base_score = (if is_bull { 70.0 } else { -70.0 }) * slope_factor;
 
-                // 强趋势体制乘数（覆盖基础值，但仍保留持续性因子）
-                m_regime =
-                    cfg.mult_regime_trend() * session_adj * vol_bias * corr_factor * persistence;
+                m_regime = cfg.mult_regime_trend() * session_adj * vol_bias * corr_factor;
                 m_momentum = self.evaluate_momentum(&rsi_state, is_bull, vol_p, is_vol_compressed)
                     * session_adj;
 
-                // 斜率共振加成
                 if let Some(slope) = ma20_slope {
                     if (is_bull && slope > 0.0) || (!is_bull && slope < 0.0) {
                         let boost = self.calc_slope_boost(slope, ma20_slope_bars);
@@ -151,8 +144,7 @@ impl Analyzer for MarketRegimeAnalyzer {
                 }
             }
             TrendStructure::Range => {
-                m_regime =
-                    cfg.mult_regime_range() * session_adj * vol_bias * corr_factor * persistence;
+                m_regime = cfg.mult_regime_range() * session_adj * vol_bias * corr_factor;
                 if let Some(rsi) = &rsi_state {
                     match rsi {
                         RsiState::Overbought | RsiState::Oversold => {
@@ -200,7 +192,7 @@ impl Analyzer for MarketRegimeAnalyzer {
 
         m_momentum = m_momentum.clamp(0.2, 2.5);
 
-        // ---- 7. 海啸判定（双向）----
+        // ---- 6. 海啸判定 ----
         let is_bullish = matches!(
             structure,
             TrendStructure::StrongBullish | TrendStructure::Bullish
@@ -235,11 +227,11 @@ impl Analyzer for MarketRegimeAnalyzer {
             m_momentum *= 1.8;
         }
 
-        // ---- 8. Taker博弈与MTF乘数 ----
+        // ---- 7. 博弈与MTF乘数 ----
         let m_game = self.calc_game_mult(taker_ratio, structure);
         let m_mtf = if mtf_aligned { 1.0 } else { 0.6 };
 
-        // ---- 9. 融合最终乘数 ----
+        // ---- 8. 融合最终乘数 ----
         let raw_mult = m_regime + m_momentum + m_game + m_mtf - 3.0;
         let final_mult = raw_mult.clamp(0.2, cfg.max_mult_cap());
 
@@ -263,18 +255,8 @@ impl Analyzer for MarketRegimeAnalyzer {
     }
 }
 
-// ==================== 辅助方法实现 ====================
+// ==================== 辅助方法 ====================
 impl MarketRegimeAnalyzer {
-    /// 计算 BTC 相关性调节因子
-    fn calc_correlation_factor(&self, corr: f64) -> f64 {
-        match corr {
-            v if v < 0.3 => 0.6, // 极低相关，大幅降权
-            v if v < 0.5 => 0.8, // 低相关，适度降权
-            v if v > 0.8 => 1.1, // 高相关，略微加成
-            _ => 1.0,
-        }
-    }
-
     fn calc_slope_factor(&self, slope: Option<f64>, bars: i32) -> f64 {
         if let Some(s) = slope {
             let slope_abs = s.abs().min(5.0);
@@ -377,34 +359,6 @@ impl MarketRegimeAnalyzer {
                 base.clamp(0.5, 2.0)
             }
             None => 1.0,
-        }
-    }
-
-    fn calc_persistence_factor(
-        &self,
-        current: TrendStructure,
-        prev: Option<TrendStructure>,
-    ) -> f64 {
-        let cfg = &self.config.regime;
-        match (current, prev) {
-            (
-                TrendStructure::StrongBullish,
-                Some(TrendStructure::StrongBullish | TrendStructure::Bullish),
-            ) => cfg.trend_persistence_boost,
-            (
-                TrendStructure::StrongBearish,
-                Some(TrendStructure::StrongBearish | TrendStructure::Bearish),
-            ) => cfg.trend_persistence_boost,
-            (
-                TrendStructure::Bullish,
-                Some(TrendStructure::Bullish | TrendStructure::StrongBullish),
-            ) => cfg.trend_persistence_boost,
-            (
-                TrendStructure::Bearish,
-                Some(TrendStructure::Bearish | TrendStructure::StrongBearish),
-            ) => cfg.trend_persistence_boost,
-            (TrendStructure::Range, Some(TrendStructure::Range)) => cfg.range_persistence_boost,
-            _ => 1.0,
         }
     }
 }

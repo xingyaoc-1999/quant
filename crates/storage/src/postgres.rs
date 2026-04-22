@@ -8,6 +8,7 @@ use std::str::FromStr;
 use tokio_postgres::{NoTls, Row};
 use tracing::info;
 mod aggregator;
+mod user;
 const CANDLE_QUERY_FIELDS: &str = "symbol, bucket, open, high, low, close, volume, quote_volume, taker_buy_volume, taker_buy_quote_volume, trade_count";
 
 pub struct Storage {
@@ -208,7 +209,7 @@ impl Storage {
     async fn initialize_tables(&self) -> Result<()> {
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
-
+        self.initialize_user_tables().await?;
         tx.execute(
             &format!(
                 r#"

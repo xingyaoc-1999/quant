@@ -1,5 +1,15 @@
 use common::Symbol;
-use quant::{analyzer::AnalysisEngine, config::AnalyzerConfig, report::AnalysisAudit};
+use quant::{
+    analyzer::{AnalysisEngine, ContextKey, MarketContext},
+    config::AnalyzerConfig,
+    report::AnalysisAudit,
+    risk_manager::RiskManager,
+    types::{
+        futures::Role,
+        market::{TradeDirection, TrendStructure},
+    },
+    utils::math::dynamic_direction_threshold,
+};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::info;
@@ -41,14 +51,91 @@ impl AnalysisService {
 
     pub async fn analyze(&self, symbol: Symbol) -> Option<AnalysisAudit> {
         let mut ctx = self.manager.get_market_context(symbol)?;
-        let mut audit = self.engine.run(&mut ctx);
-        self.manager.save_cross_cycle_state(symbol, &ctx);
 
-        audit.attach_risk(&ctx, &self.config);
-        let message = audit.to_markdown_v2(&ctx);
-        let _ = self.event_tx.send(AnalysisEvent { symbol, message });
+        // 1. 快速计算原始方向
+        let raw_direction = self.compute_raw_direction(&mut ctx).await;
 
-        Some(audit)
+        // 2. 连续确认过滤
+        let confirmed_direction = self.manager.filter_direction(symbol, raw_direction);
+
+        // 3. 确认后执行完整分析
+        if confirmed_direction.is_some() {
+            let mut ctx = self.manager.get_market_context(symbol)?;
+            let mut audit = self.engine.run(&mut ctx);
+            self.manager.save_cross_cycle_state(symbol, &ctx);
+
+            audit.attach_risk(&ctx, &self.config);
+            let message = audit.to_markdown_v2(&ctx);
+            let _ = self.event_tx.send(AnalysisEvent { symbol, message });
+
+            Some(audit)
+        } else {
+            let mut ctx = self.manager.get_market_context(symbol)?;
+            self.engine.run(&mut ctx);
+            self.manager.save_cross_cycle_state(symbol, &ctx);
+            None
+        }
+    }
+
+    async fn compute_raw_direction(&self, ctx: &mut MarketContext) -> Option<TradeDirection> {
+        let audit = self.engine.run(ctx);
+        let net_score = audit.signal.net_score;
+
+        // 提取环境数据
+        let vol_p = ctx
+            .get_cached::<f64>(ContextKey::VolPercentile)
+            .copied()
+            .unwrap_or(50.0);
+        let regime = ctx
+            .get_cached::<TrendStructure>(ContextKey::RegimeStructure)
+            .copied()
+            .unwrap_or(TrendStructure::Range);
+        let is_tsunami = ctx
+            .get_cached::<bool>(ContextKey::IsMomentumTsunami)
+            .copied()
+            .unwrap_or(false);
+
+        // 提取 Taker 和 MA 数据（用于预估置信度）
+        let taker_ratio = ctx
+            .get_role(Role::Entry)
+            .ok()
+            .and_then(|r| r.taker_flow.taker_buy_ratio)
+            .unwrap_or(0.5);
+
+        let ma_dist = ctx
+            .get_role(Role::Trend)
+            .ok()
+            .and_then(|r| r.feature_set.space.ma20_dist_ratio);
+
+        let atr_ratio = ctx
+            .get_cached::<f64>(ContextKey::VolAtrRatio)
+            .copied()
+            .unwrap_or(0.005);
+
+        let funding_rate = ctx.get_cached::<f64>(ContextKey::FundingRate).copied();
+
+        let risk_mgr = RiskManager::new(self.config.clone());
+
+        let is_long_hint = net_score > 0.0;
+        let estimated_confidence = risk_mgr.estimate_confidence(
+            is_long_hint,
+            regime,
+            taker_ratio,
+            vol_p,
+            ma_dist,
+            atr_ratio,
+            net_score,
+            is_tsunami,
+            funding_rate,
+        );
+
+        dynamic_direction_threshold(
+            net_score,
+            vol_p,
+            regime,
+            estimated_confidence,
+            self.config.risk.direction_base_threshold,
+        )
     }
 
     pub fn spawn_worker(
@@ -57,7 +144,6 @@ impl AnalysisService {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!("Analysis worker started");
-
             while let Some(event) = event_rx.recv().await {
                 match event {
                     MarketEvent::KlineClosed { symbol } => {

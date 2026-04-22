@@ -114,14 +114,15 @@ impl Analyzer for VolumeStructureAnalyzer {
 
         let session = TradingSession::from_timestamp(timestamp);
         let session_adj = session.factor(&self.config.session);
-        let vol_adapt = volatility_adaptation(vol_p);
+        let vol_adapt = volatility_adaptation(vol_p, &self.config.volume);
         let stress_adj = self.stress_adjustment(stress_level);
 
-        let vol_factor = compute_vol_factor(vol_p);
+        let vol_factor = compute_vol_factor(vol_p, &self.config.volume);
         let cfg = &self.config.volume;
 
         let thresholds = DynamicThresholds::new(cfg, vol_factor);
-        let (efficiency, rvol) = calculate_efficiency(p_action, avg_volume, atr, &cfg.efficiency);
+        let (efficiency, rvol) =
+            calculate_efficiency(p_action, avg_volume, atr, &self.config.volume);
         let consistency = consistency_penalty(rvol, volume_state);
 
         let mut score = 0.0;

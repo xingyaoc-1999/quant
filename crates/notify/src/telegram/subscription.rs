@@ -1,7 +1,7 @@
 use common::Symbol;
 use std::collections::{HashMap, HashSet};
 use teloxide::prelude::ChatId;
-use tokio::sync::RwLock; // 假设您的 Symbol 类型位于 common crate
+use tokio::sync::RwLock;
 
 #[derive(Default)]
 pub struct SubscriptionManager {

@@ -15,7 +15,7 @@ use common::{
     Symbol,
 };
 use notify::telegram::BotApp;
-use quant::analyzer::ConfigurableAnalyzer;
+use quant::{analyzer::ConfigurableAnalyzer, config::SignalStabilityConfig};
 
 use quant::{
     analyzer::{
@@ -48,7 +48,10 @@ async fn main() -> Result<()> {
     let storage = Arc::new(init_storage(&config.database).await?);
     let archive = Arc::new(ArchiveProvider::new(proxy_pool.clone()));
 
-    let ctx_manager = Arc::new(FeatureContextManager::new(&symbols));
+    let ctx_manager = Arc::new(FeatureContextManager::new(
+        &symbols,
+        SignalStabilityConfig::default(),
+    ));
     let analyzer_config = AnalyzerConfig::default();
 
     let analyzers: Vec<Box<dyn AnalyzerWrapper>> = vec![
@@ -88,7 +91,12 @@ async fn main() -> Result<()> {
     let (cmd_tx, mut cmd_rx) = mpsc::channel(100);
 
     // 创建 BotApp（简化版仅需 proxy_pool 和 token）
-    let bot = BotApp::new(config.telegram.token.clone(), proxy_pool.clone()).await?;
+    let bot = BotApp::new(
+        config.telegram.token.clone(),
+        proxy_pool.clone(),
+        storage.clone(),
+    )
+    .await?;
 
     tokio::spawn(async move {
         if let Err(e) = bot.run(tg_rx).await {
@@ -97,7 +105,6 @@ async fn main() -> Result<()> {
     });
     info!("Telegram bot started");
 
-    // 分析结果订阅转发至广播通道
     let mut analysis_rx = analysis_service.subscribe();
     let tg_sender = tg_tx.clone();
 

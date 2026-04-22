@@ -74,7 +74,7 @@ impl Analyzer for GravityAnalyzer {
             return Ok(AnalysisResult::new(self.kind()).with_score(0.0));
         }
 
-        // 1. 读取缓存数据
+        // 1. Read cached data
         let vol_p = ctx
             .get_cached::<f64>(ContextKey::VolPercentile)
             .copied()
@@ -88,7 +88,7 @@ impl Analyzer for GravityAnalyzer {
         let sigma = atr_ratio * (cfg.sigma_atr_mult() + (vol_p / 120.0));
         let confluence_gate = sigma * cfg.confluence_gate_mult();
 
-        // 2. 获取角色特征（修复移动错误）
+        // 2. Acquire role features (fix move error by cloning)
         let trend_role = ctx.get_role(Role::Trend)?;
         let filter_role = ctx.get_role(Role::Filter).unwrap_or_else(|_| trend_role);
         let t_space = &trend_role.feature_set.space;
@@ -96,15 +96,15 @@ impl Analyzer for GravityAnalyzer {
 
         let ma_converging = t_space.ma_converging.unwrap_or(false);
 
-        // 3. 读取上一次的井位（用于状态继承）
+        // 3. Previous wells for state inheritance
         let prev_wells: Vec<PriceGravityWell> = ctx
             .get_cached::<Vec<PriceGravityWell>>(ContextKey::SpaceGravityWells)
             .cloned()
             .unwrap_or_default();
 
-        let mut wells: Vec<PriceGravityWell> = Vec::new();
+        let mut wells = Vec::new();
 
-        // 4. 处理 Trend 和 Filter 来源的井
+        // 4. Process Trend and Filter sources
         self.add_well_source(
             WellSourceInput {
                 dist_opt: t_space.dist_to_resistance,
@@ -182,45 +182,43 @@ impl Analyzer for GravityAnalyzer {
             );
         }
 
-        // 5. 处理 Entry 周期井（如果启用）
-        if cfg.enable_entry_wells {
-            if let Ok(entry_role) = ctx.get_role(Role::Entry) {
-                let e_space = &entry_role.feature_set.space;
-                self.add_well_source(
-                    WellSourceInput {
-                        dist_opt: e_space.dist_to_resistance,
-                        source: WellSource::EntryResistance,
-                        hits: e_space.res_hit_count,
-                        last_ts: e_space.res_last_hit,
-                    },
-                    &mut wells,
-                    sigma,
-                    ma_converging,
-                    now,
-                    last_price,
-                    confluence_gate,
-                );
-                self.add_well_source(
-                    WellSourceInput {
-                        dist_opt: e_space.dist_to_support.map(|d| -d),
-                        source: WellSource::EntrySupport,
-                        hits: e_space.sup_hit_count,
-                        last_ts: e_space.sup_last_hit,
-                    },
-                    &mut wells,
-                    sigma,
-                    ma_converging,
-                    now,
-                    last_price,
-                    confluence_gate,
-                );
-            }
+        // 5. Entry role wells (always enabled)
+        if let Ok(entry_role) = ctx.get_role(Role::Entry) {
+            let e_space = &entry_role.feature_set.space;
+            self.add_well_source(
+                WellSourceInput {
+                    dist_opt: e_space.dist_to_resistance,
+                    source: WellSource::EntryResistance,
+                    hits: e_space.res_hit_count,
+                    last_ts: e_space.res_last_hit,
+                },
+                &mut wells,
+                sigma,
+                ma_converging,
+                now,
+                last_price,
+                confluence_gate,
+            );
+            self.add_well_source(
+                WellSourceInput {
+                    dist_opt: e_space.dist_to_support.map(|d| -d),
+                    source: WellSource::EntrySupport,
+                    hits: e_space.sup_hit_count,
+                    last_ts: e_space.sup_last_hit,
+                },
+                &mut wells,
+                sigma,
+                ma_converging,
+                now,
+                last_price,
+                confluence_gate,
+            );
         }
 
-        // 6. 继承上一周期的状态
+        // 6. Inherit dynamic states from previous cycle
         Self::inherit_well_state(&mut wells, &prev_wells, last_price, confluence_gate * 1.5);
 
-        // 7. 磁力转换（海啸模式）
+        // 7. Magnet conversion (Tsunami mode)
         let is_tsunami = ctx
             .get_cached::<bool>(ContextKey::IsMomentumTsunami)
             .copied()
@@ -233,7 +231,7 @@ impl Analyzer for GravityAnalyzer {
             Self::apply_magnet_conversion(&mut wells, regime);
         }
 
-        // 8. 磁力确认与磨损处理
+        // 8. Magnet confirmation and wear processing
         let buffer = (sigma * 0.5).max(0.001);
         let effective_magnet = Self::process_magnet_confirmation(
             &mut wells,
@@ -245,7 +243,7 @@ impl Analyzer for GravityAnalyzer {
             regime,
         );
 
-        // 9. 计算总强度
+        // 9. Total strength
         let total_res = Self::composite_strength(
             wells
                 .iter()
@@ -277,7 +275,7 @@ impl Analyzer for GravityAnalyzer {
 
         let final_score = (raw_score * if is_tsunami { 0.7 } else { 1.0 }).clamp(-100.0, 100.0);
 
-        // 10. 缓存井位和 sigma
+        // 10. Cache wells and sigma
         ctx.set_cached(ContextKey::SpaceGravityWells, wells.clone());
         ctx.set_cached(ContextKey::GravitySigma, sigma);
 
@@ -298,7 +296,7 @@ impl Analyzer for GravityAnalyzer {
     }
 }
 
-// ==================== 辅助方法实现 ====================
+// ==================== Private Methods ====================
 impl GravityAnalyzer {
     fn add_well_source(
         &self,

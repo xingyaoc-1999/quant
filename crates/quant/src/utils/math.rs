@@ -1,14 +1,7 @@
 use std::collections::VecDeque;
 
-// ==================== 滑动窗口 ====================
+use crate::types::market::{TradeDirection, TrendStructure};
 
-/// 向固定大小的滑动窗口中推入新值。
-/// 如果窗口已满，则弹出最旧的值。
-///
-/// # 参数
-/// - `queue`: 双端队列，用于存储窗口数据
-/// - `value`: 待推入的新值
-/// - `window`: 窗口最大长度（必须 > 0，否则函数直接返回）
 #[inline]
 pub fn push_fixed_window(queue: &mut VecDeque<f64>, value: f64, window: usize) {
     if window == 0 {
@@ -86,5 +79,38 @@ mod tests {
         let mut empty_queue = VecDeque::new();
         push_fixed_window(&mut empty_queue, 1.0, 0);
         assert!(empty_queue.is_empty());
+    }
+}
+
+pub fn dynamic_direction_threshold(
+    net_score: f64,
+    vol_p: f64,
+    regime: TrendStructure,
+    confidence_mult: f64,
+    base_threshold: f64,
+) -> Option<TradeDirection> {
+    let vol_factor = if vol_p > 70.0 {
+        1.3
+    } else if vol_p < 30.0 {
+        0.7
+    } else {
+        1.0
+    };
+
+    let regime_factor = match regime {
+        TrendStructure::StrongBullish | TrendStructure::StrongBearish => 0.8,
+        TrendStructure::Range => 1.2,
+        _ => 1.0,
+    };
+
+    let confidence_factor = 1.0 / confidence_mult.clamp(0.5, 2.0);
+    let threshold = base_threshold * vol_factor * regime_factor * confidence_factor;
+
+    if net_score > threshold {
+        Some(TradeDirection::Long)
+    } else if net_score < -threshold {
+        Some(TradeDirection::Short)
+    } else {
+        None
     }
 }
