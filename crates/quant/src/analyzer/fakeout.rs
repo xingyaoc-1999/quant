@@ -8,7 +8,6 @@ use crate::types::market::{RsiState, VolumeState};
 use crate::types::session::TradingSession;
 use std::collections::HashMap;
 
-// 假突破状态： (连续确认次数, 冷却剩余K线数)
 type FakeoutState = HashMap<String, (usize, usize)>;
 
 // ==================== FakeoutExtra ====================

@@ -378,7 +378,6 @@ impl AnalysisAudit {
         let lbrace = escape_markdown_v2("{");
         let rbrace = escape_markdown_v2("}");
 
-        // 入场计划：所有数值部分都需要转义
         let entry_lines: Vec<String> = risk
             .entry_levels
             .iter()
@@ -398,7 +397,6 @@ impl AnalysisAudit {
             })
             .collect();
 
-        // 止盈目标：RR 和分配比例数值需要转义
         let tp_line = |idx: usize| -> String {
             let tp = ReportFormatter::price_esc(risk.take_profit_levels[idx]);
             let rr = escape_markdown_v2(&ReportFormatter::raw(risk.rr_levels[idx], 1));

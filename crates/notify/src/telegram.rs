@@ -1,5 +1,5 @@
+mod callback;
 mod command;
-
 use anyhow::Result;
 use chrono::{FixedOffset, Utc};
 use common::{
@@ -181,9 +181,24 @@ impl BotApp {
                             .to_string();
                         let final_text = format!("{}\n\n🕒 Last update: `{}`", text, timestamp);
 
-                        let keyboard = InlineKeyboardMarkup::new(vec![vec![
-                            InlineKeyboardButton::callback("🔍 AI 深度审计", format!("audit_{}", symbol))
-                        ]]);
+                        let keyboard = InlineKeyboardMarkup::new(vec![
+                            vec![
+                                InlineKeyboardButton::callback(
+                                    "📈 执行信号",
+                                    format!("exec_{}", symbol),
+                                ),
+                                InlineKeyboardButton::callback(
+                                    "🔍 AI 审计",
+                                    format!("audit_{}", symbol),
+                                ),
+                            ],
+                            vec![
+                                InlineKeyboardButton::callback(
+                                    "🚫 不再提示",
+                                    format!("mute_{}", symbol),
+                                ),
+                            ],
+                        ]);
 
                         for telegram_id in subscribers {
                             let chat_id = ChatId(telegram_id);

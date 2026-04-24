@@ -9,7 +9,6 @@ use crate::types::market::{RsiState, TrendStructure};
 use crate::types::session::TradingSession;
 use std::f64;
 
-// ==================== RegimeExtra ====================
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct RegimeExtra {
     pub structure: TrendStructure,
@@ -24,7 +23,6 @@ pub struct RegimeExtra {
     pub btc_corr_factor: f64,
 }
 
-// ==================== MarketRegimeAnalyzer ====================
 pub struct MarketRegimeAnalyzer {
     config: AnalyzerConfig,
 }
@@ -62,7 +60,6 @@ impl Analyzer for MarketRegimeAnalyzer {
         &self,
         ctx: &mut MarketContext,
     ) -> Result<AnalysisResult<Self::Extra>, AnalysisError> {
-        // ---- 1. 环境数据 ----
         let session = TradingSession::from_timestamp(ctx.global.timestamp);
         let session_adj = session.factor(&self.config.session);
 
@@ -79,7 +76,6 @@ impl Analyzer for MarketRegimeAnalyzer {
             .cloned()
             .unwrap_or_default();
 
-        // ---- 2. Trend 角色特征 ----
         let trend_role = ctx.get_role(Role::Trend)?;
         let t_feat = &trend_role.feature_set;
         let struct_feat = &t_feat.structure;
@@ -97,7 +93,6 @@ impl Analyzer for MarketRegimeAnalyzer {
         let ma20_slope = struct_feat.ma20_slope;
         let ma20_slope_bars = struct_feat.ma20_slope_bars;
 
-        // ---- 3. BTC 相关性因子 ----
         let btc_corr = struct_feat.correlation_with_global.unwrap_or(1.0);
         let corr_factor = match btc_corr {
             v if v < 0.3 => 0.6,
@@ -106,7 +101,6 @@ impl Analyzer for MarketRegimeAnalyzer {
             _ => 1.0,
         };
 
-        // ---- 4. 配置与基础乘数 ----
         let cfg = &self.config.regime;
 
         let vol_bias = if vol_p > 80.0 {
@@ -124,7 +118,6 @@ impl Analyzer for MarketRegimeAnalyzer {
         let mut res = AnalysisResult::new(self.kind())
             .because(format!("结构: {:?} | 波动分位: {:.1}%", structure, vol_p));
 
-        // ---- 5. 趋势结构评分 ----
         match structure {
             TrendStructure::StrongBullish | TrendStructure::StrongBearish => {
                 let is_bull = matches!(structure, TrendStructure::StrongBullish);
@@ -192,7 +185,6 @@ impl Analyzer for MarketRegimeAnalyzer {
 
         m_momentum = m_momentum.clamp(0.2, 2.5);
 
-        // ---- 6. 海啸判定 ----
         let is_bullish = matches!(
             structure,
             TrendStructure::StrongBullish | TrendStructure::Bullish
@@ -227,11 +219,9 @@ impl Analyzer for MarketRegimeAnalyzer {
             m_momentum *= 1.8;
         }
 
-        // ---- 7. 博弈与MTF乘数 ----
         let m_game = self.calc_game_mult(taker_ratio, structure);
         let m_mtf = if mtf_aligned { 1.0 } else { 0.6 };
 
-        // ---- 8. 融合最终乘数 ----
         let raw_mult = m_regime + m_momentum + m_game + m_mtf - 3.0;
         let final_mult = raw_mult.clamp(0.2, cfg.max_mult_cap());
 
@@ -255,7 +245,6 @@ impl Analyzer for MarketRegimeAnalyzer {
     }
 }
 
-// ==================== 辅助方法 ====================
 impl MarketRegimeAnalyzer {
     fn calc_slope_factor(&self, slope: Option<f64>, bars: i32) -> f64 {
         if let Some(s) = slope {
