@@ -43,7 +43,6 @@ async fn main() -> Result<()> {
     let config = Appconfig::global();
     let symbols = Symbol::all();
 
-    // ========== 基础设施层 ==========
     let proxy_pool = Arc::new(create_proxy_pool(&config.proxy));
     let storage = Arc::new(init_storage(&config.database).await?);
     let archive = Arc::new(ArchiveProvider::new(proxy_pool.clone()));

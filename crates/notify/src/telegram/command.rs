@@ -13,7 +13,6 @@ pub enum MyCommand {
     Help,
     #[command(description = "订阅交易对")]
     Subscribe { symbol: Symbol },
-
     #[command(description = "查看当前订阅")]
     MySubs,
 }
@@ -24,10 +23,7 @@ impl MyCommand {
 
         match self {
             Self::Start => {
-                storage
-                    .ensure_user(telegram_id, None, None)
-                    .await
-                    .unwrap_or_default();
+                storage.ensure_user(telegram_id).await.unwrap_or_default();
                 bot.send_message(
                     chat_id,
                     "👋 欢迎使用量化交易机器人！\n使用 /help 查看可用命令。",
@@ -39,10 +35,7 @@ impl MyCommand {
                     .await?;
             }
             Self::Subscribe { symbol } => {
-                storage
-                    .ensure_user(telegram_id, None, None)
-                    .await
-                    .unwrap_or_default();
+                storage.ensure_user(telegram_id).await.unwrap_or_default();
 
                 match storage.subscribe_symbol(telegram_id, symbol).await {
                     Ok(()) => {

@@ -33,15 +33,15 @@ impl Default for AnalyzerConfig {
 // ==================== GravityConfig ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GravityConfig {
-    /// Gravity range (0.3~1.8), larger value = wider influence radius.
+    /// Gravity range (0.3~1.8). Larger value = wider influence radius.
     pub gravity_range: f64,
     /// Minimum strength to consider a well valid (0.02~0.20).
     pub min_well_strength: f64,
-    /// Merge sensitivity (0~1), higher = more aggressive merging.
+    /// Merge sensitivity (0~1). Higher = more aggressive merging.
     pub merge_sensitivity: f64,
-    /// Wear sensitivity (0~1), higher = faster strength decay when hit.
+    /// Wear sensitivity (0~1). Higher = faster strength decay when hit.
     pub wear_sensitivity: f64,
-    /// Wear recovery rate (0~1), higher = faster strength restoration.
+    /// Wear recovery rate (0~1). Higher = faster strength restoration.
     pub wear_recovery_rate: f64,
     /// Threshold for marking a well as active.
     pub active_well_threshold: f64,
@@ -121,7 +121,7 @@ impl Default for WearScales {
         Self {
             trend: 1.0,
             filter: 1.0,
-            entry: 0.5,
+            entry: 0.7, // increased for 1h reliability
             ma20: 1.0,
         }
     }
@@ -177,30 +177,19 @@ pub struct VolumeConfig {
     /// Magnet sensitivity (0~1). Higher = easier magnet activation.
     pub magnet_sensitivity: f64,
 
-    // Volatility adaptation parameters (merged from VolFactorConfig & VolAdaptationConfig)
-    /// Mid point of volatility percentile for factor calculation.
+    // Volatility adaptation parameters
     pub vol_factor_mid: f64,
-    /// Minimum factor at vol_p = 0.
     pub vol_factor_min: f64,
-    /// Maximum factor at vol_p = 100.
     pub vol_factor_max: f64,
-    /// Knots for volatility adaptation: [(vol_p, factor), ...] (must be sorted by vol_p).
     pub vol_adapt_knots: [(f64, f64); 4],
-    /// Minimum output clamp for adaptation.
     pub vol_adapt_min: f64,
-    /// Maximum output clamp for adaptation.
     pub vol_adapt_max: f64,
 
-    // Efficiency calculation parameters (merged from EfficiencyConfig)
-    /// Minimum relative volume to avoid division by zero.
+    // Efficiency calculation parameters
     pub min_rvol: f64,
-    /// Low volume penalty threshold.
     pub low_volume_threshold: f64,
-    /// Strength of low volume penalty (0~1).
     pub low_volume_penalty_strength: f64,
-    /// Minimum compactness to prevent underestimation.
     pub min_compactness: f64,
-    /// Maximum efficiency cap.
     pub max_efficiency: f64,
 }
 
@@ -338,8 +327,8 @@ impl RegimeConfig {
         0.15
     }
     pub(crate) fn slope_bars_threshold(&self) -> i32 {
-        3
-    }
+        2
+    } // lowered for 1h
     pub(crate) fn max_mult_cap(&self) -> f64 {
         3.0
     }
@@ -435,7 +424,7 @@ impl Default for SessionConfig {
     }
 }
 
-// ==================== ResonanceConfig (Simplified) ====================
+// ==================== ResonanceConfig ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResonanceConfig {
     pub ma20_trigger_score: f64,
@@ -456,7 +445,7 @@ impl Default for ResonanceConfig {
         Self {
             ma20_trigger_score: 45.0,
             macd_trigger_score: 30.0,
-            early_trend_bars: 12,
+            early_trend_bars: 6, // lowered for 1h
             early_trend_mult: 1.3,
             aging_trend_bars: 24,
             max_aging_penalty: 0.7,
@@ -533,7 +522,7 @@ impl Default for RiskConfig {
             lr_taker_aligned: 1.8,
             lr_taker_mismatch: 0.7,
             lr_tsunami: 1.5,
-            enable_funding_rate: false,
+            enable_funding_rate: true,
             funding_rate_threshold: 0.001,
             funding_rate_penalty: 0.7,
             max_loss_per_trade: 0.08,

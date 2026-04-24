@@ -429,7 +429,6 @@ impl FeatureContextManager {
                 state.consecutive_count += 1;
             }
             (Some(_), Some(curr)) => {
-                // 方向改变，重置
                 state.consecutive_count = 1;
                 state.last_direction = Some(curr);
             }

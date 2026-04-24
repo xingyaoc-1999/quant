@@ -48,7 +48,6 @@ pub fn volatility_adaptation(vol_p: f64, cfg: &VolumeConfig) -> f64 {
             .clamp(cfg.vol_adapt_min, cfg.vol_adapt_max);
     }
 
-    // 分段线性插值
     for i in 0..knots.len() - 1 {
         let (x1, y1) = knots[i];
         let (x2, y2) = knots[i + 1];

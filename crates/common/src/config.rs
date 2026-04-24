@@ -49,7 +49,7 @@ impl Default for RoleConfig {
         Self {
             trend: Interval::D1,
             filter: Interval::H4,
-            entry: Interval::M15,
+            entry: Interval::H1,
         }
     }
 }
