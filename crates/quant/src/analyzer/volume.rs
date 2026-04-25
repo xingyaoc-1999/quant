@@ -81,8 +81,7 @@ impl Analyzer for VolumeStructureAnalyzer {
             .max(f64::EPSILON);
         let oi_delta = role_data.oi_data.as_ref().map(|oi| oi.delta_ratio());
         let taker_ratio = role_data.taker_flow.taker_buy_ratio;
-        let volume_state = role_data.feature_set.structure.volume_state;
-
+        // 不再从此处获取旧状态，直接根据当前 rvol 计算新状态
         let sigma = ctx
             .get_cached::<f64>(ContextKey::GravitySigma)
             .copied()
@@ -123,7 +122,16 @@ impl Analyzer for VolumeStructureAnalyzer {
         let thresholds = DynamicThresholds::new(cfg, vol_factor);
         let (efficiency, rvol) =
             calculate_efficiency(p_action, avg_volume, atr, &self.config.volume);
-        let consistency = consistency_penalty(rvol, volume_state);
+
+        // ✅ 先根据当前 rvol 计算最新 VolumeState，确保一致性评估使用同步状态
+        let current_volume_state = if rvol > thresholds.rvol_break {
+            VolumeState::Expand
+        } else if rvol < 0.8 {
+            VolumeState::Shrink
+        } else {
+            VolumeState::Normal
+        };
+        let consistency = consistency_penalty(rvol, Some(current_volume_state));
 
         let is_up = p_action.close > p_action.open;
         let target_side = if is_up {
@@ -142,18 +150,17 @@ impl Analyzer for VolumeStructureAnalyzer {
                 dist_a.total_cmp(&dist_b)
             });
 
-        let mut score = 0.0;
-        let mut m_vol = 1.0;
+        let score;
+        let m_vol;
         let mut res = AnalysisResult::new(self.kind());
 
-        // 使用 Option 链式调用，并传入 last_price
         let well_signal = active_well
             .filter(|well| (well.level - last_price).abs() / last_price < sigma * 1.5)
             .and_then(|well| {
                 self.evaluate_well_signal(
                     well,
                     is_up,
-                    last_price, // ← 新增参数
+                    last_price,
                     rvol,
                     efficiency,
                     &thresholds,
@@ -191,16 +198,8 @@ impl Analyzer for VolumeStructureAnalyzer {
 
         ctx.set_cached(ContextKey::LastEfficiency, efficiency);
         ctx.set_cached(ContextKey::LastRVol, rvol);
-
-        // 紧凑的 VolumeState 生成逻辑
-        let new_volume_state = if rvol > thresholds.rvol_break {
-            VolumeState::Expand
-        } else if rvol < 0.8 {
-            VolumeState::Shrink
-        } else {
-            VolumeState::Normal
-        };
-        ctx.set_cached(ContextKey::VolumeState, new_volume_state);
+        // 写入新状态（已计算）
+        ctx.set_cached(ContextKey::VolumeState, current_volume_state);
 
         let extra = VolumeExtra {
             efficiency,
@@ -282,12 +281,11 @@ impl VolumeStructureAnalyzer {
         }
     }
 
-    // 新增 last_price 参数，并传递给磁吸评估
     fn evaluate_well_signal(
         &self,
         well: &PriceGravityWell,
         is_up: bool,
-        last_price: f64, // ← 新增
+        last_price: f64,
         rvol: f64,
         efficiency: f64,
         thresh: &DynamicThresholds,
@@ -301,7 +299,6 @@ impl VolumeStructureAnalyzer {
         let taker_bullish = taker_ratio.is_some_and(|tr| tr > cfg.absorption_taker_buy_min());
         let taker_bearish = taker_ratio.is_some_and(|tr| tr < cfg.absorption_taker_sell_max());
 
-        // 磁吸信号使用独立逻辑，传入 last_price
         if well.side == WellSide::Magnet {
             return self.evaluate_magnet_signal(well, last_price, rvol, efficiency, thresh);
         }
@@ -354,7 +351,6 @@ impl VolumeStructureAnalyzer {
         Some(signal)
     }
 
-    // 磁吸方向修正：使用价格与井的相对位置决定看涨/看跌
     fn evaluate_magnet_signal(
         &self,
         well: &PriceGravityWell,
@@ -394,7 +390,6 @@ impl VolumeStructureAnalyzer {
                 return None;
             };
 
-        // 方向：价格在磁吸井下方 → 看涨（正分），反之看跌
         let final_score = if last_price < well.level {
             base_score
         } else {

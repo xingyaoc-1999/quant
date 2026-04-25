@@ -60,10 +60,13 @@ impl Analyzer for VolatilityEnvironmentAnalyzer {
         &self,
         ctx: &mut MarketContext,
     ) -> Result<AnalysisResult<Self::Extra>, AnalysisError> {
-        // 1. 提取输入数据
         let input = self.extract_volatility_input(ctx, &self.config.volatility)?;
 
-        // 2. 写入基础缓存（其他分析器依赖）
+        if ctx.global.last_price <= 0.0 {
+            return Ok(AnalysisResult::new(self.kind())
+                .with_score(0.0)
+                .because("Invalid last_price"));
+        }
         ctx.set_cached(ContextKey::VolAtrRatio, input.atr_ratio);
         ctx.set_cached(ContextKey::VolPercentile, input.vol_p);
         ctx.set_cached(ContextKey::VolIsCompressed, input.is_compressed);

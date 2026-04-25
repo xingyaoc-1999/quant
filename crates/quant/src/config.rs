@@ -504,6 +504,8 @@ pub struct RiskConfig {
     pub min_weighted_rr: f64,
     pub entry_strategy: EntryStrategy,
     pub stop_entry_offset_pct: f64,
+    pub tsunami_tp3_atr_mult: f64,          // 默认 5.0
+    pub min_reliable_defense_strength: f64, // 默认 0.3
 }
 
 impl Default for RiskConfig {
@@ -538,6 +540,8 @@ impl Default for RiskConfig {
             min_weighted_rr: 1.2,
             entry_strategy: EntryStrategy::Hybrid,
             stop_entry_offset_pct: 0.001,
+            tsunami_tp3_atr_mult: 5.0,
+            min_reliable_defense_strength: 0.3,
         }
     }
 }

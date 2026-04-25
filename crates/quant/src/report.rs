@@ -172,6 +172,16 @@ impl AnalysisAudit {
 
         let funding_rate = Some(ctx.global.funding_rate);
 
+        // ---------- 获取平均 ATR（绝对值） ----------
+        let average_atr = {
+            let trend_role = ctx.get_role(Role::Trend).ok();
+            let filter_role = ctx.get_role(Role::Filter).ok();
+            let median_atr = trend_role
+                .and_then(|r| r.feature_set.indicators.atr_median_20)
+                .or_else(|| filter_role.and_then(|r| r.feature_set.indicators.atr_median_20));
+            median_atr.unwrap_or(atr_ratio * self.snapshot.price)
+        };
+
         let risk_mgr = RiskManager::new(config.clone());
 
         let is_long_hint = self.signal.net_score > 0.0;
@@ -202,6 +212,7 @@ impl AnalysisAudit {
             &self.gravity_wells,
             self.snapshot.price,
             atr_ratio,
+            average_atr,
             vol_p,
             regime,
             is_tsunami,
@@ -216,7 +227,6 @@ impl AnalysisAudit {
         self.risk_assessment = Some(risk);
         self.risk_assessment.as_ref()
     }
-
     pub fn to_markdown_v2(&self, ctx: &MarketContext) -> String {
         let header = self.build_header(ctx);
         let metrics = self.build_metrics();

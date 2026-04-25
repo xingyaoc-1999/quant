@@ -8,7 +8,8 @@ use crate::types::market::{PriceAction, RsiState, VolumeState};
 use crate::types::session::TradingSession;
 use std::collections::HashMap;
 
-type WellKey = (u64, WellSide);
+// 使用 (价格百分比离散值, WellSide) 作为键，避免浮点位微调导致键变化
+type WellKey = (i32, WellSide);
 type FakeoutState = HashMap<WellKey, (usize, usize)>;
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -61,7 +62,18 @@ impl Analyzer for FakeoutDetector {
         ctx: &mut MarketContext,
     ) -> Result<AnalysisResult<Self::Extra>, AnalysisError> {
         // 1. 提取数据
-        let (price, wells, atr, slope, rsi_state, efficiency, rvol, volume_state, vol_p) = {
+        let (
+            price,
+            wells,
+            atr,
+            slope,
+            rsi_state,
+            efficiency,
+            rvol,
+            volume_state,
+            vol_p,
+            last_price,
+        ) = {
             let role_data = ctx
                 .get_role(Role::Entry)
                 .or_else(|_| ctx.get_role(Role::Trend))?;
@@ -94,6 +106,7 @@ impl Analyzer for FakeoutDetector {
                 ctx.get_cached::<f64>(ContextKey::VolPercentile)
                     .copied()
                     .unwrap_or(50.0),
+                last_price,
             )
         };
 
@@ -116,7 +129,7 @@ impl Analyzer for FakeoutDetector {
             .unwrap_or_default();
 
         let cfg = &self.config.fakeout;
-        let mut total_score = 0.0; // 现在分数有正有负
+        let mut total_score = 0.0;
         let mut reasons = Vec::with_capacity(4);
 
         // 3. 只处理支撑/阻力井，过滤掉 Magnet
@@ -137,6 +150,7 @@ impl Analyzer for FakeoutDetector {
                 vol_bias,
                 cfg,
                 &mut state,
+                last_price, // 传入 last_price 用于键计算
             ) {
                 total_score += score;
                 reasons.push(reason);
@@ -146,7 +160,6 @@ impl Analyzer for FakeoutDetector {
         ctx.set_cached(ContextKey::FakeoutState, state);
 
         let final_score = total_score.clamp(-100.0, 100.0);
-        // 根据绝对值强度选择乘数，现在乘数 >1 以放大信号权重
         let mult = if final_score.abs() > 30.0 {
             cfg.fakeout_mult_penalty()
         } else if final_score.abs() > 10.0 {
@@ -206,10 +219,17 @@ impl FakeoutDetector {
         vol_bias: f64,
         cfg: &FakeoutConfig,
         state: &mut FakeoutState,
+        last_price: f64, // 新增参数
     ) -> Option<(f64, String)> {
-        let well_key = (well.level.to_bits(), well.side);
+        // 新键计算：将井价相对当前价格取万分之一离散值，避免浮点微调导致键变化
+        let discrete_pct = if last_price > f64::EPSILON {
+            ((well.level / last_price) * 10000.0).round() as i32
+        } else {
+            // 极端情况回退（理论上不会出现）
+            well.level.to_bits() as i32
+        };
+        let well_key = (discrete_pct, well.side);
 
-        // 只检测对应方向的突破
         let check_up = well.side == WellSide::Resistance;
         let check_down = well.side == WellSide::Support;
 
@@ -277,12 +297,7 @@ impl FakeoutDetector {
 
         let penalty = cfg.fakeout_base_penalty() * strength * adjustment;
 
-        // ---- 方向性得分 ----
-        let score = if breach_up {
-            -penalty // 阻力假突破 → 看跌
-        } else {
-            penalty // 支撑假突破 → 看涨
-        };
+        let score = if breach_up { -penalty } else { penalty };
 
         let direction_str = if breach_up { "向上" } else { "向下" };
         let bias_str = if breach_up { "看跌" } else { "看涨" };
@@ -294,13 +309,13 @@ impl FakeoutDetector {
             adjustment
         );
 
-        // 重置计数与冷却
         *count = 0;
         *cooldown = cfg.fakeout_cooldown_bars();
 
         Some((score, reason))
     }
 
+    // 其余函数保持不变...
     fn calculate_total_adjustment(
         &self,
         up: bool,
