@@ -2,15 +2,15 @@ use crate::analyzer::{
     AnalysisError, AnalysisResult, Analyzer, AnalyzerKind, ConfigurableAnalyzer, ContextKey,
     MarketContext, Role,
 };
-use crate::config::AnalyzerConfig;
-use crate::types::gravity::PriceGravityWell;
-use crate::types::market::{RsiState, VolumeState};
+use crate::config::{AnalyzerConfig, FakeoutConfig};
+use crate::types::gravity::{PriceGravityWell, WellSide};
+use crate::types::market::{PriceAction, RsiState, VolumeState};
 use crate::types::session::TradingSession;
 use std::collections::HashMap;
 
-type FakeoutState = HashMap<String, (usize, usize)>;
+type WellKey = (u64, WellSide);
+type FakeoutState = HashMap<WellKey, (usize, usize)>;
 
-// ==================== FakeoutExtra ====================
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct FakeoutExtra {
     pub total_penalty: f64,
@@ -22,7 +22,6 @@ pub struct FakeoutExtra {
     pub vol_adapt: f64,
 }
 
-// ==================== FakeoutDetector ====================
 pub struct FakeoutDetector {
     config: AnalyzerConfig,
 }
@@ -31,7 +30,6 @@ impl ConfigurableAnalyzer for FakeoutDetector {
     fn with_config(config: AnalyzerConfig) -> Self {
         Self { config }
     }
-
     fn config(&self) -> &AnalyzerConfig {
         &self.config
     }
@@ -43,7 +41,6 @@ impl Analyzer for FakeoutDetector {
     fn name(&self) -> &'static str {
         "fakeout_detector_v4"
     }
-
     fn kind(&self) -> AnalyzerKind {
         AnalyzerKind::Fakeout
     }
@@ -63,106 +60,107 @@ impl Analyzer for FakeoutDetector {
         &self,
         ctx: &mut MarketContext,
     ) -> Result<AnalysisResult<Self::Extra>, AnalysisError> {
-        let entry_role = ctx.get_role(Role::Entry)?;
-        let fs = &entry_role.feature_set;
-        let price = &fs.price_action;
+        // 1. 提取数据
+        let (price, wells, atr, slope, rsi_state, efficiency, rvol, volume_state, vol_p) = {
+            let role_data = ctx
+                .get_role(Role::Entry)
+                .or_else(|_| ctx.get_role(Role::Trend))?;
+            let fs = &role_data.feature_set;
 
-        let wells = ctx
-            .get_cached::<Vec<PriceGravityWell>>(ContextKey::SpaceGravityWells)
-            .cloned()
-            .unwrap_or_default();
+            let last_price = ctx.global.last_price;
+            let atr = ctx
+                .get_cached::<f64>(ContextKey::VolAtrRatio)
+                .copied()
+                .unwrap_or(0.005)
+                * last_price;
 
-        let atr_ratio = ctx
-            .get_cached::<f64>(ContextKey::VolAtrRatio)
-            .copied()
-            .unwrap_or(0.005);
-        let atr = atr_ratio * ctx.global.last_price;
+            (
+                fs.price_action.clone(),
+                ctx.get_cached::<Vec<PriceGravityWell>>(ContextKey::SpaceGravityWells)
+                    .cloned()
+                    .unwrap_or_default(),
+                atr,
+                fs.structure.ma20_slope.unwrap_or(0.0),
+                fs.structure.rsi_state.unwrap_or(RsiState::Neutral),
+                ctx.get_cached::<f64>(ContextKey::LastEfficiency)
+                    .copied()
+                    .unwrap_or(0.5),
+                ctx.get_cached::<f64>(ContextKey::LastRVol)
+                    .copied()
+                    .unwrap_or(1.0),
+                ctx.get_cached::<VolumeState>(ContextKey::VolumeState)
+                    .copied()
+                    .unwrap_or(VolumeState::Normal),
+                ctx.get_cached::<f64>(ContextKey::VolPercentile)
+                    .copied()
+                    .unwrap_or(50.0),
+            )
+        };
 
         if atr <= f64::EPSILON || wells.is_empty() {
             return Ok(AnalysisResult::new(self.kind())
                 .with_score(0.0)
-                .because("ATR 无效或无引力井，跳过检测"));
+                .because("数据不足"));
         }
-
-        let slope = fs.structure.ma20_slope.unwrap_or(0.0);
-        let rsi_state = fs.structure.rsi_state.unwrap_or(RsiState::Neutral);
-        let efficiency = ctx
-            .get_cached::<f64>(ContextKey::LastEfficiency)
-            .copied()
-            .unwrap_or(0.5);
-        let rvol = ctx
-            .get_cached::<f64>(ContextKey::LastRVol)
-            .copied()
-            .unwrap_or(1.0);
-        let volume_state = ctx
-            .get_cached::<VolumeState>(ContextKey::VolumeState)
-            .copied()
-            .unwrap_or(VolumeState::Normal);
-        let vol_p = ctx
-            .get_cached::<f64>(ContextKey::VolPercentile)
-            .copied()
-            .unwrap_or(50.0);
 
         let session = TradingSession::from_timestamp(ctx.global.timestamp);
         let session_adj = session.factor(&self.config.session);
-        let vol_bias = Self::compute_vol_bias(vol_p);
+        let vol_bias = self.compute_vol_bias(vol_p);
 
-        let state: FakeoutState = ctx
-            .get_cached::<FakeoutState>(ContextKey::FakeoutState)
-            .cloned()
+        // 2. 状态提取（排除 Magnet 井）
+        let mut state = ctx
+            .cache
+            .remove(&ContextKey::FakeoutState)
+            .and_then(|boxed| boxed.downcast::<FakeoutState>().ok())
+            .map(|boxed| *boxed)
             .unwrap_or_default();
 
         let cfg = &self.config.fakeout;
+        let mut total_score = 0.0; // 现在分数有正有负
+        let mut reasons = Vec::with_capacity(4);
 
-        // 处理每个活跃井，收集惩罚结果
-        let (total_penalty, reasons, new_state) = wells.iter().filter(|w| w.is_active).fold(
-            (0.0, Vec::new(), state.clone()),
-            |(penalty, mut reasons, mut st), well| {
-                if let Some((p, reason)) = self.process_well(
-                    well,
-                    price,
-                    atr,
-                    slope,
-                    rsi_state,
-                    efficiency,
-                    rvol,
-                    volume_state,
-                    session_adj,
-                    vol_bias,
-                    cfg,
-                    &mut st,
-                ) {
-                    reasons.push(reason);
-                    (penalty + p, reasons, st)
-                } else {
-                    (penalty, reasons, st)
-                }
-            },
-        );
+        // 3. 只处理支撑/阻力井，过滤掉 Magnet
+        for well in wells
+            .iter()
+            .filter(|w| w.is_active && w.side != WellSide::Magnet)
+        {
+            if let Some((score, reason)) = self.process_well(
+                well,
+                &price,
+                atr,
+                slope,
+                rsi_state,
+                efficiency,
+                rvol,
+                volume_state,
+                session_adj,
+                vol_bias,
+                cfg,
+                &mut state,
+            ) {
+                total_score += score;
+                reasons.push(reason);
+            }
+        }
 
-        ctx.set_cached(ContextKey::FakeoutState, new_state);
+        ctx.set_cached(ContextKey::FakeoutState, state);
 
-        let final_score = total_penalty.clamp(-100.0, 100.0);
-        let mult = match final_score {
-            s if s < -30.0 => cfg.fakeout_mult_penalty(),
-            s if s < -10.0 => cfg.minor_fakeout_mult(),
-            _ => 1.0,
+        let final_score = total_score.clamp(-100.0, 100.0);
+        // 根据绝对值强度选择乘数，现在乘数 >1 以放大信号权重
+        let mult = if final_score.abs() > 30.0 {
+            cfg.fakeout_mult_penalty()
+        } else if final_score.abs() > 10.0 {
+            cfg.minor_fakeout_mult()
+        } else {
+            1.0
         };
 
         let description = match final_score {
-            s if s < -30.0 => "强烈假突破信号",
-            s if s < 0.0 => "疑似假突破",
+            s if s > 30.0 => "强烈支撑假突破（看涨）",
+            s if s > 0.0 => "疑似支撑假突破（偏多）",
+            s if s < -30.0 => "强烈阻力假突破（看跌）",
+            s if s < 0.0 => "疑似阻力假突破（偏空）",
             _ => "未发现假突破",
-        };
-
-        let extra = FakeoutExtra {
-            total_penalty,
-            wells_scanned: wells.iter().filter(|w| w.is_active).count(),
-            efficiency,
-            rvol,
-            session: format!("{:?}", session),
-            session_adj,
-            vol_adapt: vol_bias,
         };
 
         Ok(AnalysisResult::new(self.kind())
@@ -170,23 +168,34 @@ impl Analyzer for FakeoutDetector {
             .with_mult(mult)
             .because(description)
             .because(reasons.join("; "))
-            .with_extra(extra))
+            .with_extra(FakeoutExtra {
+                total_penalty: total_score,
+                wells_scanned: wells.iter().filter(|w| w.side != WellSide::Magnet).count(),
+                efficiency,
+                rvol,
+                session: format!("{:?}", session),
+                session_adj,
+                vol_adapt: vol_bias,
+            }))
     }
 }
 
 impl FakeoutDetector {
-    fn compute_vol_bias(vol_p: f64) -> f64 {
-        match vol_p {
-            v if v > 80.0 => 0.8,
-            v if v < 20.0 => 1.2,
-            _ => 1.0,
+    #[inline]
+    fn compute_vol_bias(&self, vol_p: f64) -> f64 {
+        if vol_p > 80.0 {
+            0.8
+        } else if vol_p < 20.0 {
+            1.2
+        } else {
+            1.0
         }
     }
 
     fn process_well(
         &self,
         well: &PriceGravityWell,
-        price: &crate::types::market::PriceAction,
+        price: &PriceAction,
         atr: f64,
         slope: f64,
         rsi_state: RsiState,
@@ -195,31 +204,35 @@ impl FakeoutDetector {
         volume_state: VolumeState,
         session_adj: f64,
         vol_bias: f64,
-        cfg: &crate::config::FakeoutConfig,
+        cfg: &FakeoutConfig,
         state: &mut FakeoutState,
     ) -> Option<(f64, String)> {
-        let level = well.level;
-        let strength = well.strength.clamp(0.2, 3.0);
-        let well_key = format!("{:.2}_{:?}", level, well.side);
+        let well_key = (well.level.to_bits(), well.side);
 
-        let breach_up = Self::is_breach(
-            price.high,
-            price.low,
-            level,
-            atr,
-            cfg.breach_atr_mult(),
-            true,
-        );
-        let breach_down = Self::is_breach(
-            price.high,
-            price.low,
-            level,
-            atr,
-            cfg.breach_atr_mult(),
-            false,
-        );
+        // 只检测对应方向的突破
+        let check_up = well.side == WellSide::Resistance;
+        let check_down = well.side == WellSide::Support;
 
-        // 未突破：更新冷却/重置计数
+        let breach_up = check_up
+            && self.is_breach(
+                price.high,
+                price.low,
+                well.level,
+                atr,
+                cfg.breach_atr_mult(),
+                true,
+            );
+        let breach_down = check_down
+            && self.is_breach(
+                price.high,
+                price.low,
+                well.level,
+                atr,
+                cfg.breach_atr_mult(),
+                false,
+            );
+
+        // 未突破：处理冷却
         if !breach_up && !breach_down {
             if let Some((count, cooldown)) = state.get_mut(&well_key) {
                 if *cooldown > 0 {
@@ -231,13 +244,13 @@ impl FakeoutDetector {
             return None;
         }
 
-        // 突破但未收盘收回：清除状态
-        if !Self::is_closed_inside(price.close, level, cfg.close_return_threshold()) {
+        // 收盘必须回到井内
+        if !self.is_closed_inside(price.close, well.level, cfg.close_return_threshold()) {
             state.remove(&well_key);
             return None;
         }
 
-        let (count, cooldown) = state.entry(well_key.clone()).or_insert((0, 0));
+        let (count, cooldown) = state.entry(well_key).or_insert((0, 0));
         if *cooldown > 0 {
             *cooldown -= 1;
             return None;
@@ -248,98 +261,130 @@ impl FakeoutDetector {
             return None;
         }
 
-        // 计算惩罚
-        let mut penalty = cfg.fakeout_base_penalty() * strength;
-        let mut adjustment = Self::slope_adjustment(breach_up, slope, cfg);
-        adjustment *= Self::rsi_adjustment(breach_up, breach_down, rsi_state, cfg);
-        adjustment *= Self::volume_efficiency_penalty(efficiency, rvol, volume_state, cfg);
-        adjustment *= vol_bias * session_adj;
-
-        penalty *= adjustment;
-
-        let reason = format!(
-            "{}: {}突破后收盘收回 (adj={:.2}, eff={:.2}, rvol={:.2})",
-            well.source_string(),
-            if breach_up { "向上" } else { "向下" },
-            adjustment,
+        let strength = well.strength.clamp(0.2, 3.0);
+        let adjustment = self.calculate_total_adjustment(
+            breach_up,
+            breach_down,
+            slope,
+            rsi_state,
             efficiency,
-            rvol
+            rvol,
+            volume_state,
+            vol_bias,
+            session_adj,
+            cfg,
         );
 
-        // 触发后重置计数并进入冷却
+        let penalty = cfg.fakeout_base_penalty() * strength * adjustment;
+
+        // ---- 方向性得分 ----
+        let score = if breach_up {
+            -penalty // 阻力假突破 → 看跌
+        } else {
+            penalty // 支撑假突破 → 看涨
+        };
+
+        let direction_str = if breach_up { "向上" } else { "向下" };
+        let bias_str = if breach_up { "看跌" } else { "看涨" };
+        let reason = format!(
+            "{}: {}突破假突破 → {} (adj={:.2})",
+            well.source_string(),
+            direction_str,
+            bias_str,
+            adjustment
+        );
+
+        // 重置计数与冷却
         *count = 0;
         *cooldown = cfg.fakeout_cooldown_bars();
 
-        Some((-penalty, reason))
+        Some((score, reason))
     }
 
-    fn is_breach(high: f64, low: f64, level: f64, atr: f64, mult: f64, is_above: bool) -> bool {
-        let threshold = atr * mult;
+    fn calculate_total_adjustment(
+        &self,
+        up: bool,
+        down: bool,
+        slope: f64,
+        rsi: RsiState,
+        eff: f64,
+        rvol: f64,
+        vol_s: VolumeState,
+        v_bias: f64,
+        session_adj: f64,
+        cfg: &FakeoutConfig,
+    ) -> f64 {
+        let slope_adj = self.slope_adjustment(up, slope, cfg);
+        let rsi_adj = self.rsi_adjustment(up, down, rsi, cfg);
+        let vol_adj = self.volume_efficiency_penalty(eff, rvol, vol_s, cfg);
+        slope_adj * rsi_adj * vol_adj * v_bias * session_adj
+    }
+
+    #[inline]
+    fn is_breach(
+        &self,
+        high: f64,
+        low: f64,
+        level: f64,
+        atr: f64,
+        mult: f64,
+        is_above: bool,
+    ) -> bool {
+        let limit = atr * mult;
         if is_above {
-            high > level + threshold
+            high > level + limit
         } else {
-            low < level - threshold
+            low < level - limit
         }
     }
 
-    fn is_closed_inside(close: f64, level: f64, threshold: f64) -> bool {
+    #[inline]
+    fn is_closed_inside(&self, close: f64, level: f64, threshold: f64) -> bool {
         (close - level).abs() / level < threshold
     }
 
-    fn slope_adjustment(breach_up: bool, slope: f64, cfg: &crate::config::FakeoutConfig) -> f64 {
-        let strong_threshold = cfg.slope_strong_threshold();
-        if breach_up && slope > strong_threshold {
-            cfg.slope_strong_factor()
-        } else if !breach_up && slope < -strong_threshold {
-            cfg.slope_strong_factor()
-        } else if breach_up && slope < -strong_threshold {
-            cfg.slope_weak_factor()
-        } else if !breach_up && slope > strong_threshold {
-            cfg.slope_weak_factor()
-        } else {
-            1.0
+    fn slope_adjustment(&self, up: bool, slope: f64, cfg: &FakeoutConfig) -> f64 {
+        let thresh = cfg.slope_strong_threshold();
+        match (up, slope) {
+            (true, s) if s > thresh => cfg.slope_strong_factor(),
+            (false, s) if s < -thresh => cfg.slope_strong_factor(),
+            (true, s) if s < -thresh => cfg.slope_weak_factor(),
+            (false, s) if s > thresh => cfg.slope_weak_factor(),
+            _ => 1.0,
         }
     }
 
-    fn rsi_adjustment(
-        breach_up: bool,
-        breach_down: bool,
-        rsi_state: RsiState,
-        cfg: &crate::config::FakeoutConfig,
-    ) -> f64 {
-        let mut adj = 1.0;
-        if breach_up && rsi_state == RsiState::Overbought {
-            adj *= cfg.rsi_overbought_factor();
+    fn rsi_adjustment(&self, up: bool, down: bool, rsi: RsiState, cfg: &FakeoutConfig) -> f64 {
+        match (up, down, rsi) {
+            (true, _, RsiState::Overbought) => cfg.rsi_overbought_factor(),
+            (_, true, RsiState::Oversold) => cfg.rsi_oversold_factor(),
+            _ => 1.0,
         }
-        if breach_down && rsi_state == RsiState::Oversold {
-            adj *= cfg.rsi_oversold_factor();
-        }
-        adj
     }
 
     fn volume_efficiency_penalty(
-        efficiency: f64,
+        &self,
+        eff: f64,
         rvol: f64,
-        volume_state: VolumeState,
-        cfg: &crate::config::FakeoutConfig,
+        vol_s: VolumeState,
+        cfg: &FakeoutConfig,
     ) -> f64 {
         let mut factor: f64 = 1.0;
-        let low_eff = efficiency < cfg.vol_eff_low_threshold();
-        let high_eff = efficiency > cfg.vol_eff_high_threshold();
-        let surge = rvol > cfg.vol_surge_mult();
-        let shrink = rvol < cfg.vol_shrink_mult();
+        let is_low_eff = eff < cfg.vol_eff_low_threshold();
+        let is_high_eff = eff > cfg.vol_eff_high_threshold();
+        let is_surge = rvol > cfg.vol_surge_mult();
 
-        if low_eff && surge {
-            factor *= 1.4;
-        } else if high_eff && surge {
-            factor *= 0.7;
-        } else if shrink {
-            factor *= 0.9;
-        }
+        factor *= match (is_low_eff, is_high_eff, is_surge) {
+            (true, _, true) => 1.4,
+            (_, true, true) => 0.7,
+            _ if rvol < cfg.vol_shrink_mult() => 0.9,
+            _ => 1.0,
+        };
 
-        if volume_state == VolumeState::Expand && low_eff {
+        if vol_s == VolumeState::Expand && is_low_eff {
             factor *= 1.2;
-        } else if volume_state == VolumeState::Shrink {
+        }
+        if vol_s == VolumeState::Shrink {
             factor *= 0.9;
         }
 

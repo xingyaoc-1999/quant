@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use common::Symbol;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::{any::Any, collections::HashMap, f64};
+use std::{any::Any, collections::HashMap};
 use tracing::warn;
 
 use crate::{
@@ -350,26 +350,38 @@ impl AnalysisEngine {
     }
 
     fn aggregate(&self, ctx: &MarketContext, results: Vec<ErasedAnalysisResult>) -> FinalSignal {
+        // 违规直接拒绝
         if results.iter().any(|r| r.is_violation) {
             return FinalSignal::rejected_with_reports(ctx.symbol, results);
         }
 
         let mut total_weighted_score = 0.0;
         let mut total_weight = 0.0;
-        let mut pos_weighted_sum = 0.0;
-        let mut neg_weighted_sum = 0.0;
+        let mut pos_power = 0.0;
+        let mut neg_power = 0.0;
+
+        // 提取波动环境乘数（默认 1.0）
+        let volatility_mult = results
+            .iter()
+            .find(|r| r.kind == AnalyzerKind::Volatility)
+            .map(|r| r.weight_multiplier)
+            .unwrap_or(1.0);
 
         for res in &results {
+            if res.score == 0.0 {
+                continue; // 仍然跳过无方向的分析器
+            }
             let base_weight = self.config.weights.get(&res.kind).copied().unwrap_or(1.0);
             let final_weight = base_weight * res.weight_multiplier;
+            let strength = res.score.abs() * final_weight;
 
             total_weighted_score += res.score * final_weight;
             total_weight += final_weight;
 
             if res.score > 0.0 {
-                pos_weighted_sum += final_weight;
-            } else if res.score < 0.0 {
-                neg_weighted_sum += final_weight;
+                pos_power += strength;
+            } else {
+                neg_power += strength;
             }
         }
 
@@ -379,22 +391,29 @@ impl AnalysisEngine {
             0.0
         };
 
-        let total_active_weight = pos_weighted_sum + neg_weighted_sum;
-        let resonance_factor = if total_active_weight > 0.0 {
-            (pos_weighted_sum - neg_weighted_sum).abs() / total_active_weight
+        // 共振因子计算（不变）
+        let total_power = pos_power + neg_power;
+        let resonance_factor = if total_power > 0.0 {
+            (pos_power - neg_power).abs() / total_power
         } else {
             1.0
         };
 
         if self.config.divergence_threshold > 0.0
-            && total_active_weight > 0.0
+            && total_power > 0.0
             && resonance_factor < self.config.divergence_threshold
         {
             return FinalSignal::rejected_with_reason(ctx.symbol, "HIGH_DIVERGENCE", results);
         }
 
-        let raw_score = net_score * (0.5 + 0.5 * resonance_factor);
-        let final_score = self.normalize_to_standard_range(raw_score);
+        let raw_score = if resonance_factor.is_finite() {
+            net_score * (0.5 + 0.5 * resonance_factor)
+        } else {
+            net_score * 0.5
+        };
+
+        let adjusted_score = raw_score * volatility_mult;
+        let final_score = self.normalize_to_standard_range(adjusted_score);
 
         if final_score.abs() < self.config.min_signal_threshold {
             return FinalSignal::rejected_with_reason(
@@ -406,9 +425,9 @@ impl AnalysisEngine {
 
         FinalSignal::new_with_reports(ctx.symbol, final_score, results)
     }
-
     fn normalize_to_standard_range(&self, score: f64) -> f64 {
         let normalized = (score * self.config.sensitivity).tanh();
-        (normalized * 100.0 * 10.0).round() / 10.0
+        // 映射到 [-100, 100] 并保留一位小数
+        (normalized * 1000.0).round() / 10.0
     }
 }

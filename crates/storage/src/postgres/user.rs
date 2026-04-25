@@ -1,21 +1,20 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use common::Symbol;
 use std::str::FromStr;
+use tracing::warn; // 可替换为 log::warn
 
 use crate::postgres::Storage;
 
 impl Storage {
-    async fn initialize_user_tables(&self) -> Result<()> {
+    pub async fn initialize_user_tables(&self) -> Result<()> {
         let conn = self.pool.get().await?;
 
-        // 用户表
         conn.execute(
             &format!(
                 r#"
                 CREATE TABLE IF NOT EXISTS {}.users (
                     id BIGSERIAL PRIMARY KEY,
                     telegram_id BIGINT UNIQUE NOT NULL,
-
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
@@ -26,7 +25,6 @@ impl Storage {
         )
         .await?;
 
-        // 用户策略表（含静音字段）
         conn.execute(
             &format!(
                 r#"
@@ -53,6 +51,8 @@ impl Storage {
 
         Ok(())
     }
+
+    /// 确保用户存在，幂等操作
     pub async fn ensure_user(&self, telegram_id: i64) -> Result<()> {
         let conn = self.pool.get().await?;
         let sql = format!(
@@ -68,6 +68,8 @@ impl Storage {
     }
 
     pub async fn subscribe_symbol(&self, telegram_id: i64, symbol: Symbol) -> Result<()> {
+        self.ensure_user(telegram_id).await?;
+
         let conn = self.pool.get().await?;
         let sql = format!(
             r#"
@@ -95,6 +97,42 @@ impl Storage {
         Ok(())
     }
 
+    /// 静音某交易对，要求用户已订阅该交易对，否则返回错误
+    pub async fn mute_symbol(&self, telegram_id: i64, symbol: Symbol) -> Result<()> {
+        self.ensure_user(telegram_id).await?;
+
+        let conn = self.pool.get().await?;
+        let sql = format!(
+            "UPDATE {}.user_strategies SET muted = TRUE, updated_at = NOW() WHERE user_id = $1 AND symbol = $2",
+            self.schema
+        );
+        let affected = conn
+            .execute(&sql, &[&telegram_id, &symbol.as_str()])
+            .await?;
+        if affected == 0 {
+            bail!("cannot mute: no subscription found for symbol {}", symbol);
+        }
+        Ok(())
+    }
+
+    /// 取消静音，同样要求订阅记录存在
+    pub async fn unmute_symbol(&self, telegram_id: i64, symbol: Symbol) -> Result<()> {
+        self.ensure_user(telegram_id).await?;
+
+        let conn = self.pool.get().await?;
+        let sql = format!(
+            "UPDATE {}.user_strategies SET muted = FALSE, updated_at = NOW() WHERE user_id = $1 AND symbol = $2",
+            self.schema
+        );
+        let affected = conn
+            .execute(&sql, &[&telegram_id, &symbol.as_str()])
+            .await?;
+        if affected == 0 {
+            bail!("cannot unmute: no subscription found for symbol {}", symbol);
+        }
+        Ok(())
+    }
+
     pub async fn get_subscribed_symbols(&self, telegram_id: i64) -> Result<Vec<Symbol>> {
         let conn = self.pool.get().await?;
         let sql = format!(
@@ -102,12 +140,23 @@ impl Storage {
             self.schema
         );
         let rows = conn.query(&sql, &[&telegram_id]).await?;
-        rows.into_iter()
-            .map(|row| {
-                let symbol_str: &str = row.get(0);
-                Symbol::from_str(symbol_str).map_err(|e| anyhow::anyhow!(e))
+        let symbols: Vec<Symbol> = rows
+            .into_iter()
+            .filter_map(|row| {
+                let s: &str = row.get(0);
+                match Symbol::from_str(s) {
+                    Ok(sym) => Some(sym),
+                    Err(e) => {
+                        warn!(
+                            "invalid symbol '{}' in database for user {}: {}",
+                            s, telegram_id, e
+                        );
+                        None
+                    }
+                }
             })
-            .collect()
+            .collect();
+        Ok(symbols)
     }
 
     pub async fn get_subscribed_users(&self, symbol: Symbol) -> Result<Vec<i64>> {
@@ -118,33 +167,5 @@ impl Storage {
         );
         let rows = conn.query(&sql, &[&symbol.as_str()]).await?;
         Ok(rows.into_iter().map(|row| row.get(0)).collect())
-    }
-
-    pub async fn mute_symbol(&self, telegram_id: i64, symbol: Symbol) -> Result<()> {
-        let conn = self.pool.get().await?;
-        let sql = format!(
-            r#"
-              INSERT INTO {}.user_strategies (user_id, symbol, is_subscribed, muted)
-              VALUES ($1, $2, TRUE, TRUE)
-              ON CONFLICT (user_id, symbol) DO UPDATE SET
-                  muted = TRUE,
-                  updated_at = NOW()
-              "#,
-            self.schema
-        );
-        conn.execute(&sql, &[&telegram_id, &symbol.as_str()])
-            .await?;
-        Ok(())
-    }
-
-    pub async fn unmute_symbol(&self, telegram_id: i64, symbol: Symbol) -> Result<()> {
-        let conn = self.pool.get().await?;
-        let sql = format!(
-              "UPDATE {}.user_strategies SET muted = FALSE, updated_at = NOW() WHERE user_id = $1 AND symbol = $2",
-              self.schema
-          );
-        conn.execute(&sql, &[&telegram_id, &symbol.as_str()])
-            .await?;
-        Ok(())
     }
 }

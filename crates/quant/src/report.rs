@@ -221,7 +221,7 @@ impl AnalysisAudit {
         let header = self.build_header(ctx);
         let metrics = self.build_metrics();
         let wells = self.build_wells_section();
-        let fakeout = self.build_fakeout_warning();
+        let fakeout = self.build_fakeout_signal();
         let risk = self.build_risk_section();
 
         let mut parts = vec![header, metrics];
@@ -239,7 +239,6 @@ impl AnalysisAudit {
         msg
     }
 
-    // ---------- 私有构建方法 ----------
     fn build_header(&self, ctx: &MarketContext) -> String {
         let signal = &self.signal;
         let session = TradingSession::from_timestamp(ctx.global.timestamp);
@@ -322,7 +321,7 @@ impl AnalysisAudit {
         }
     }
 
-    fn build_fakeout_warning(&self) -> String {
+    fn build_fakeout_signal(&self) -> String {
         let fakeout_score = self
             .signal
             .sub_reports
@@ -331,20 +330,32 @@ impl AnalysisAudit {
             .map(|r| r.score)
             .unwrap_or(0.0);
 
-        if fakeout_score >= -10.0 {
+        // 不够强就不显示，避免噪音
+        if fakeout_score.abs() < 10.0 {
             return String::new();
         }
 
-        let icon = if fakeout_score < -30.0 {
-            "🚨"
+        if fakeout_score > 0.0 {
+            // 向下假突破 → 看涨，用绿色
+            let icon = if fakeout_score > 30.0 { "✅" } else { "🟢" };
+            format!(
+                "\nFakeout: {icon} 支撑假突破 看涨 `{score:.0}`",
+                icon = icon,
+                score = fakeout_score
+            )
         } else {
-            "⚠️"
-        };
-        format!(
-            "\n⚠️ Fakeout: {icon} `{score:.0}`",
-            icon = icon,
-            score = fakeout_score
-        )
+            // 向上假突破 → 看跌，保持红色警告
+            let icon = if fakeout_score < -30.0 {
+                "🚨"
+            } else {
+                "⚠️"
+            };
+            format!(
+                "\nFakeout: {icon} 阻力假突破 看跌 `{score:.0}`",
+                icon = icon,
+                score = fakeout_score
+            )
+        }
     }
     fn build_risk_section(&self) -> String {
         let risk = match &self.risk_assessment {
@@ -359,14 +370,18 @@ impl AnalysisAudit {
         let size_pct = escape_markdown_v2(&ReportFormatter::raw(risk.position_size_pct * 100.0, 1));
         let wrr = escape_markdown_v2(&ReportFormatter::raw(risk.weighted_rr, 2));
 
-        let sl_str = if risk.stop_loss_levels.len() >= 2 {
-            format!(
-                "{}/{}",
-                ReportFormatter::price(risk.stop_loss_levels[0]),
-                ReportFormatter::price(risk.stop_loss_levels[1])
-            )
+        let sl_str = if let Some(first) = risk.stop_loss_levels.first() {
+            if risk.stop_loss_levels.len() >= 2 {
+                format!(
+                    "{}/{}",
+                    ReportFormatter::price(*first),
+                    ReportFormatter::price(risk.stop_loss_levels[1])
+                )
+            } else {
+                ReportFormatter::price(*first)
+            }
         } else {
-            ReportFormatter::price(risk.stop_loss_levels[0])
+            String::new() // 处理空 Vec
         };
         // 止损价格可能包含小数点，也需要转义
         let sl_str = escape_markdown_v2(&sl_str);

@@ -364,10 +364,10 @@ impl FakeoutConfig {
         (2.0 + self.persistence * 3.0) as usize
     }
     pub(crate) fn fakeout_mult_penalty(&self) -> f64 {
-        0.6
+        1.2
     }
     pub(crate) fn minor_fakeout_mult(&self) -> f64 {
-        0.85
+        1.2
     }
     pub(crate) fn breach_atr_mult(&self) -> f64 {
         0.25
@@ -438,6 +438,9 @@ pub struct ResonanceConfig {
     pub bearish_div_short_boost: f64,
     pub bullish_div_long_boost: f64,
     pub mtf_misalign_penalty: f64,
+    pub div_opposite_weaken_mult: f64, // 背离弱势方削弱系数，默认0.6
+    pub aging_decay_period: f64,       // 老化衰减周期，默认30.0
+    pub mtf_unknown_penalty: f64,      // 未知趋势惩罚，默认0.95
 }
 
 impl Default for ResonanceConfig {
@@ -454,6 +457,9 @@ impl Default for ResonanceConfig {
             bearish_div_short_boost: 1.3,
             bullish_div_long_boost: 1.3,
             mtf_misalign_penalty: 0.7,
+            div_opposite_weaken_mult: 0.6,
+            aging_decay_period: 30.0,
+            mtf_unknown_penalty: 0.95,
         }
     }
 }

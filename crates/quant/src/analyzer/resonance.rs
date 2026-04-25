@@ -54,10 +54,12 @@ impl Analyzer for ResonanceAnalyzer {
         let is_breakdown = feat.signals.ma20_breakdown.unwrap_or(false);
         let macd_cross = feat.signals.macd_cross;
 
+        // 无任何触发信号则直接返回中性
         if !is_reclaim && !is_breakdown && macd_cross.is_none() {
             return Ok(AnalysisResult::new(self.kind()).with_score(0.0));
         }
 
+        // 确定方向：优先MA20穿越，其次MACD金叉/死叉
         let direction = if is_reclaim || macd_cross == Some(MacdCross::Golden) {
             1.0
         } else {
@@ -67,28 +69,31 @@ impl Analyzer for ResonanceAnalyzer {
 
         let mut description = Vec::new();
         let mut m_resonance = 1.0;
+        let cfg = &self.config.resonance;
 
+        // ----- 基础得分与触发源 -----
         let base_score = if is_reclaim || is_breakdown {
             description.push("TRIGGER:MA20_RECLAIM".to_string());
-            self.config.resonance.ma20_trigger_score
+            cfg.ma20_trigger_score
         } else {
             description.push("TRIGGER:MACD_CROSS".to_string());
-            self.config.resonance.macd_trigger_score
+            cfg.macd_trigger_score
         };
 
         let slope_bars = feat.structure.ma20_slope_bars.abs();
-        let cfg = &self.config.resonance;
-
         if slope_bars < cfg.early_trend_bars {
             m_resonance *= cfg.early_trend_mult;
             description.push("EARLY_TREND".to_string());
         } else if slope_bars > cfg.aging_trend_bars {
-            let penalty = 1.0
-                - ((slope_bars - cfg.aging_trend_bars) as f64 / 30.0).min(cfg.max_aging_penalty);
+            let aging_period = cfg.aging_decay_period;
+            let raw_penalty = ((slope_bars - cfg.aging_trend_bars) as f64 / aging_period)
+                .min(cfg.max_aging_penalty);
+            let penalty = (1.0 - raw_penalty).max(0.0);
             m_resonance *= penalty;
-            description.push(format!("AGING({:.0}%)", penalty * 100.0));
+            description.push(format!("AGING({:.0}% remaining)", penalty * 100.0));
         }
 
+        // ----- MACD动量确认/背离 -----
         if let Some(macd_mom) = feat.signals.macd_momentum {
             let mom_confirmed = (is_long && macd_mom == MacdMomentum::Increasing)
                 || (!is_long && macd_mom == MacdMomentum::Decreasing);
@@ -104,7 +109,7 @@ impl Analyzer for ResonanceAnalyzer {
         if let Some(div) = &feat.signals.macd_divergence {
             match (div, is_long) {
                 (DivergenceType::Bearish, true) => {
-                    m_resonance *= 0.6; // fixed: bearish divergence weakens long
+                    m_resonance *= cfg.div_opposite_weaken_mult;
                     description.push("BEAR_DIV:LONG_WEAK".to_string());
                 }
                 (DivergenceType::Bearish, false) => {
@@ -116,24 +121,29 @@ impl Analyzer for ResonanceAnalyzer {
                     description.push("BULL_DIV:LONG_OK".to_string());
                 }
                 (DivergenceType::Bullish, false) => {
-                    m_resonance *= 0.6; // fixed: bullish divergence weakens short
+                    m_resonance *= cfg.div_opposite_weaken_mult;
                     description.push("BULL_DIV:SHORT_WEAK".to_string());
                 }
             }
         }
 
+        // ----- 多周期市场结构对齐 -----
         let mtf_aligned = match ctx.get_cached::<TrendStructure>(ContextKey::RegimeStructure) {
             Some(TrendStructure::StrongBullish | TrendStructure::Bullish) => is_long,
             Some(TrendStructure::StrongBearish | TrendStructure::Bearish) => !is_long,
-            _ => true,
+            _ => {
+                m_resonance *= cfg.mtf_unknown_penalty;
+                description.push("MTF_UNKNOWN".to_string());
+                true
+            }
         };
         if !mtf_aligned {
             m_resonance *= cfg.mtf_misalign_penalty;
             description.push("MTF_MISALIGN".to_string());
         }
 
-        let final_score = base_score * direction;
-
+        // ----- 最终得分：将质量因子直接乘入得分 -----
+        let final_score = (base_score * direction * m_resonance).clamp(-100.0, 100.0);
         let extra = ResonanceExtra {
             direction: Some(if is_long { "BUY" } else { "SELL" }.to_string()),
             base_score,
@@ -144,7 +154,7 @@ impl Analyzer for ResonanceAnalyzer {
 
         Ok(AnalysisResult::new(self.kind())
             .with_score(final_score)
-            .with_mult(m_resonance)
+            .with_mult(1.0) // 质量已体现在得分中，权重乘数不再重复
             .because(description.join(" | "))
             .with_extra(extra))
     }

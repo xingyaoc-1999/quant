@@ -50,52 +50,30 @@ impl AnalysisService {
     }
 
     pub async fn analyze(&self, symbol: Symbol) -> Option<AnalysisAudit> {
+        // 1. 获取上下文
         let mut ctx = self.manager.get_market_context(symbol)?;
 
-        // 1. 快速计算原始方向
-        let raw_direction = self.compute_raw_direction(&mut ctx).await;
+        // 2. 只运行一次分析引擎
+        let audit = self.engine.run(&mut ctx);
 
-        // 2. 连续确认过滤
-        let confirmed_direction = self.manager.filter_direction(symbol, raw_direction);
-
-        // 3. 确认后执行完整分析
-        if confirmed_direction.is_some() {
-            let mut ctx = self.manager.get_market_context(symbol)?;
-            let mut audit = self.engine.run(&mut ctx);
-            self.manager.save_cross_cycle_state(symbol, &ctx);
-
-            audit.attach_risk(&ctx, &self.config);
-            let message = audit.to_markdown_v2(&ctx);
-            let _ = self.event_tx.send(AnalysisEvent { symbol, message });
-
-            Some(audit)
-        } else {
-            let mut ctx = self.manager.get_market_context(symbol)?;
-            self.engine.run(&mut ctx);
-            self.manager.save_cross_cycle_state(symbol, &ctx);
-            None
-        }
-    }
-
-    async fn compute_raw_direction(&self, ctx: &mut MarketContext) -> Option<TradeDirection> {
-        let audit = self.engine.run(ctx);
+        // 3. 提取方向判断所需的上下文数据
         let net_score = audit.signal.net_score;
 
-        // 提取环境数据
         let vol_p = ctx
             .get_cached::<f64>(ContextKey::VolPercentile)
             .copied()
             .unwrap_or(50.0);
+
         let regime = ctx
             .get_cached::<TrendStructure>(ContextKey::RegimeStructure)
             .copied()
             .unwrap_or(TrendStructure::Range);
+
         let is_tsunami = ctx
             .get_cached::<bool>(ContextKey::IsMomentumTsunami)
             .copied()
             .unwrap_or(false);
 
-        // 提取 Taker 和 MA 数据（用于预估置信度）
         let taker_ratio = ctx
             .get_role(Role::Entry)
             .ok()
@@ -129,13 +107,31 @@ impl AnalysisService {
             funding_rate,
         );
 
-        dynamic_direction_threshold(
+        // 5. 动态方向阈值判断原始方向
+        let raw_direction = dynamic_direction_threshold(
             net_score,
             vol_p,
             regime,
             estimated_confidence,
             self.config.risk.direction_base_threshold,
-        )
+        );
+
+        // 6. 过滤/确认方向
+        let confirmed_direction = self.manager.filter_direction(symbol, raw_direction);
+
+        // 7. 无论如何都要保存跨周期状态
+        self.manager.save_cross_cycle_state(symbol, &ctx);
+
+        // 8. 根据方向是否确认，决定是否生成报告
+        if confirmed_direction.is_some() {
+            let mut audit = audit; // 重新绑定为可变（原本不可变，但我们需要 attach_risk 修改它）
+            audit.attach_risk(&ctx, &self.config);
+            let message = audit.to_markdown_v2(&ctx);
+            let _ = self.event_tx.send(AnalysisEvent { symbol, message });
+            Some(audit)
+        } else {
+            None
+        }
     }
 
     pub fn spawn_worker(

@@ -1,3 +1,3 @@
-pub mod effiency;
+pub mod efficiency;
 pub mod math;
 pub mod volatility;

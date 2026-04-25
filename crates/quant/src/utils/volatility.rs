@@ -1,12 +1,10 @@
 use crate::config::VolumeConfig;
 
-/// 线性插值辅助函数
 #[inline]
 fn linear_interp(x: f64, x1: f64, x2: f64, y1: f64, y2: f64) -> f64 {
     y1 + (y2 - y1) * (x - x1) / (x2 - x1)
 }
 
-/// 计算波动率因子（用于动态阈值调整）
 #[inline]
 pub fn compute_vol_factor(vol_p: f64, cfg: &VolumeConfig) -> f64 {
     let factor = if vol_p <= cfg.vol_factor_mid {
@@ -28,7 +26,6 @@ pub fn compute_vol_factor(vol_p: f64, cfg: &VolumeConfig) -> f64 {
     factor.clamp(cfg.vol_factor_min, cfg.vol_factor_max)
 }
 
-/// 计算波动率自适应因子（用于分数缩放）
 #[inline]
 pub fn volatility_adaptation(vol_p: f64, cfg: &VolumeConfig) -> f64 {
     let knots = &cfg.vol_adapt_knots;
@@ -36,7 +33,6 @@ pub fn volatility_adaptation(vol_p: f64, cfg: &VolumeConfig) -> f64 {
         return 1.0;
     }
 
-    // 边界处理
     if vol_p <= knots[0].0 {
         return knots[0].1.clamp(cfg.vol_adapt_min, cfg.vol_adapt_max);
     }

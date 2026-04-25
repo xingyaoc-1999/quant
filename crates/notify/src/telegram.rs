@@ -1,3 +1,4 @@
+// app.rs 或 bot.rs
 mod callback;
 mod command;
 use anyhow::Result;
@@ -6,7 +7,9 @@ use common::{
     utils::{retry_with_proxy_rotation_cooled, CooledProxyPool, ShouldRotate},
     Symbol,
 };
+use quant::{analyzer::AnalysisEngine, config::AnalyzerConfig};
 use reqwest::Proxy;
+use service::integrity::context::FeatureContextManager;
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -42,6 +45,17 @@ pub struct BotApp {
     token: String,
     switching: Arc<AtomicBool>,
     storage: Arc<Storage>,
+    engine: Arc<AnalysisEngine>,
+    ctx_manager: Arc<FeatureContextManager>,
+    config: Arc<AnalyzerConfig>,
+    execute_order: Arc<
+        dyn Fn(
+                &quant::risk_manager::RiskAssessment,
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>>
+            + Send
+            + Sync,
+    >,
 }
 
 impl BotApp {
@@ -49,12 +63,27 @@ impl BotApp {
         token: String,
         proxy_pool: Arc<CooledProxyPool>,
         storage: Arc<Storage>,
+        engine: Arc<AnalysisEngine>,
+        ctx_manager: Arc<FeatureContextManager>,
+        config: Arc<AnalyzerConfig>,
+        execute_order: Arc<
+            dyn Fn(
+                    &quant::risk_manager::RiskAssessment,
+                )
+                    -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>>
+                + Send
+                + Sync,
+        >,
     ) -> Result<Self> {
         Ok(Self {
             proxy_pool,
             token,
             switching: Arc::new(AtomicBool::new(false)),
             storage,
+            engine,
+            ctx_manager,
+            config,
+            execute_order,
         })
     }
 
@@ -118,6 +147,15 @@ impl BotApp {
                 }
             });
 
+            // 构建回调依赖
+            let callback_deps = callback::CallbackDeps {
+                storage: Arc::clone(&app.storage),
+                engine: Arc::clone(&app.engine),
+                ctx_manager: Arc::clone(&app.ctx_manager),
+                config: Arc::clone(&app.config),
+                execute_order: Arc::clone(&app.execute_order),
+            };
+
             let storage_for_cmd = Arc::clone(&app.storage);
             let handler = dptree::entry()
                 .branch(
@@ -133,13 +171,18 @@ impl BotApp {
                             }
                         }),
                 )
-                .branch(Update::filter_callback_query().endpoint(
-                    move |bot: Bot, q: CallbackQuery| async move {
-                        let _ = bot;
-                        let _ = q;
-                        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-                    },
-                ));
+                .branch(Update::filter_callback_query().endpoint({
+                    let deps = callback_deps;
+                    move |bot: Bot, q: CallbackQuery| {
+                        let deps = deps.clone();
+                        async move {
+                            if let Err(e) = callback::handle_callback(bot, q, deps).await {
+                                error!("❌ [Callback Error] {:#}", e);
+                            }
+                            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                        }
+                    }
+                }));
 
             let mut dispatcher = Dispatcher::builder(bot.clone(), handler)
                 .enable_ctrlc_handler()

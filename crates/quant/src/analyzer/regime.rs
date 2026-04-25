@@ -112,7 +112,7 @@ impl Analyzer for MarketRegimeAnalyzer {
         };
 
         let mut m_regime = cfg.mult_regime_normal() * session_adj * vol_bias * corr_factor;
-        let mut m_momentum = session_adj;
+        let mut m_momentum = 1.0;
         let mut base_score = 0.0;
 
         let mut res = AnalysisResult::new(self.kind())
@@ -176,10 +176,9 @@ impl Analyzer for MarketRegimeAnalyzer {
                     if ((is_bull && slope > 0.0) || (!is_bull && slope < 0.0))
                         && ma20_slope_bars >= 2
                     {
-                        m_momentum *= 1.0 + slope.abs().min(2.0) * 0.1;
+                        m_momentum = (1.0 + slope.abs().min(2.0) * 0.1) * session_adj;
                     }
                 }
-                m_momentum *= session_adj;
             }
         }
 
@@ -225,6 +224,9 @@ impl Analyzer for MarketRegimeAnalyzer {
         let raw_mult = m_regime + m_momentum + m_game + m_mtf - 3.0;
         let final_mult = raw_mult.clamp(0.2, cfg.max_mult_cap());
 
+        // 将质量因子直接乘入得分，使分数体现信号置信度
+        let final_score = (base_score * final_mult).clamp(-100.0, 100.0);
+
         let extra = RegimeExtra {
             structure,
             is_tsunami,
@@ -239,8 +241,8 @@ impl Analyzer for MarketRegimeAnalyzer {
         };
 
         Ok(res
-            .with_score(base_score)
-            .with_mult(final_mult)
+            .with_score(final_score)
+            .with_mult(1.0) // 质量已融入得分，不再使用权重乘数
             .with_extra(extra))
     }
 }
