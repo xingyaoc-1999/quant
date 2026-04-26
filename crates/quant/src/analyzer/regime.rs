@@ -60,6 +60,11 @@ impl Analyzer for MarketRegimeAnalyzer {
         &self,
         ctx: &mut MarketContext,
     ) -> Result<AnalysisResult<Self::Extra>, AnalysisError> {
+        let last_price = ctx.global.last_price;
+        if !last_price.is_finite() || last_price <= 0.0 {
+            return Ok(AnalysisResult::new(self.kind()).with_score(0.0));
+        }
+
         let session = TradingSession::from_timestamp(ctx.global.timestamp);
         let session_adj = session.factor(&self.config.session);
 
@@ -111,7 +116,7 @@ impl Analyzer for MarketRegimeAnalyzer {
             1.0
         };
 
-        let mut m_regime = cfg.mult_regime_normal() * session_adj * vol_bias * corr_factor;
+        let mut m_regime = cfg.mult_regime_normal() * vol_bias * corr_factor; // 移除 session_adj
         let mut m_momentum = 1.0;
         let mut base_score = 0.0;
 
@@ -124,7 +129,7 @@ impl Analyzer for MarketRegimeAnalyzer {
                 let slope_factor = self.calc_slope_factor(ma20_slope, ma20_slope_bars);
                 base_score = (if is_bull { 70.0 } else { -70.0 }) * slope_factor;
 
-                m_regime = cfg.mult_regime_trend() * session_adj * vol_bias * corr_factor;
+                m_regime = cfg.mult_regime_trend() * vol_bias * corr_factor; 
                 m_momentum = self.evaluate_momentum(&rsi_state, is_bull, vol_p, is_vol_compressed)
                     * session_adj;
 
@@ -137,7 +142,7 @@ impl Analyzer for MarketRegimeAnalyzer {
                 }
             }
             TrendStructure::Range => {
-                m_regime = cfg.mult_regime_range() * session_adj * vol_bias * corr_factor;
+                m_regime = cfg.mult_regime_range() * vol_bias * corr_factor;
                 if let Some(rsi) = &rsi_state {
                     match rsi {
                         RsiState::Overbought | RsiState::Oversold => {
@@ -224,7 +229,6 @@ impl Analyzer for MarketRegimeAnalyzer {
         let raw_mult = m_regime + m_momentum + m_game + m_mtf - 3.0;
         let final_mult = raw_mult.clamp(0.2, cfg.max_mult_cap());
 
-        // 将质量因子直接乘入得分，使分数体现信号置信度
         let final_score = (base_score * final_mult).clamp(-100.0, 100.0);
 
         let extra = RegimeExtra {
@@ -240,10 +244,7 @@ impl Analyzer for MarketRegimeAnalyzer {
             btc_corr_factor: corr_factor,
         };
 
-        Ok(res
-            .with_score(final_score)
-            .with_mult(1.0) // 质量已融入得分，不再使用权重乘数
-            .with_extra(extra))
+        Ok(res.with_score(final_score).with_mult(1.0).with_extra(extra))
     }
 }
 

@@ -58,7 +58,6 @@ impl Analyzer for VolumeStructureAnalyzer {
             ContextKey::IsMomentumTsunami,
             ContextKey::OiPositionState,
             ContextKey::RegimeStructure,
-            ContextKey::MarketStressLevel,
         ]
     }
 
@@ -67,6 +66,10 @@ impl Analyzer for VolumeStructureAnalyzer {
         ctx: &mut MarketContext,
     ) -> Result<AnalysisResult<Self::Extra>, AnalysisError> {
         let last_price = ctx.global.last_price;
+        if !last_price.is_finite() || last_price <= 0.0 {
+            return Ok(AnalysisResult::new(self.kind()).with_score(0.0));
+        }
+
         let timestamp = ctx.global.timestamp;
 
         let role_data = ctx
@@ -81,7 +84,7 @@ impl Analyzer for VolumeStructureAnalyzer {
             .max(f64::EPSILON);
         let oi_delta = role_data.oi_data.as_ref().map(|oi| oi.delta_ratio());
         let taker_ratio = role_data.taker_flow.taker_buy_ratio;
-        // 不再从此处获取旧状态，直接根据当前 rvol 计算新状态
+
         let sigma = ctx
             .get_cached::<f64>(ContextKey::GravitySigma)
             .copied()
@@ -106,15 +109,10 @@ impl Analyzer for VolumeStructureAnalyzer {
         let oi_state = ctx
             .get_cached::<OIPositionState>(ContextKey::OiPositionState)
             .copied();
-        let stress_level = ctx
-            .get_cached::<MarketStressLevel>(ContextKey::MarketStressLevel)
-            .copied()
-            .unwrap_or_default();
 
         let session = TradingSession::from_timestamp(timestamp);
         let session_adj = session.factor(&self.config.session);
         let vol_adapt = volatility_adaptation(vol_p, &self.config.volume);
-        let stress_adj = self.stress_adjustment(stress_level);
 
         let vol_factor = compute_vol_factor(vol_p, &self.config.volume);
         let cfg = &self.config.volume;
@@ -123,7 +121,6 @@ impl Analyzer for VolumeStructureAnalyzer {
         let (efficiency, rvol) =
             calculate_efficiency(p_action, avg_volume, atr, &self.config.volume);
 
-        // ✅ 先根据当前 rvol 计算最新 VolumeState，确保一致性评估使用同步状态
         let current_volume_state = if rvol > thresholds.rvol_break {
             VolumeState::Expand
         } else if rvol < 0.8 {
@@ -140,7 +137,6 @@ impl Analyzer for VolumeStructureAnalyzer {
             WellSide::Support
         };
 
-        // 允许 Magnet 类型进入评估
         let active_well = wells
             .iter()
             .filter(|w| w.is_active && (w.side == target_side || w.side == WellSide::Magnet))
@@ -150,8 +146,6 @@ impl Analyzer for VolumeStructureAnalyzer {
                 dist_a.total_cmp(&dist_b)
             });
 
-        let score;
-        let m_vol;
         let mut res = AnalysisResult::new(self.kind());
 
         let well_signal = active_well
@@ -172,12 +166,12 @@ impl Analyzer for VolumeStructureAnalyzer {
                 )
             });
 
-        if let Some(signal) = well_signal {
-            score = signal.score * consistency * vol_adapt * session_adj * stress_adj;
-            m_vol = signal.multiplier;
+        let (score, m_vol) = if let Some(signal) = well_signal {
+            let adjusted = signal.score * consistency * vol_adapt * session_adj; // 移除 stress_adj，使用合并策略
             if !signal.reason.is_empty() {
                 res = res.because(signal.reason);
             }
+            (adjusted, signal.multiplier)
         } else {
             let (trend_score, trend_mult, reason) = self.evaluate_trend_extension(
                 ctx,
@@ -187,18 +181,16 @@ impl Analyzer for VolumeStructureAnalyzer {
                 cfg,
                 vol_adapt,
                 session_adj,
-                stress_adj,
             );
-            score = trend_score * consistency;
-            m_vol = trend_mult;
+            let adjusted = trend_score * consistency;
             if !reason.is_empty() {
                 res = res.because(reason);
             }
-        }
+            (adjusted, trend_mult)
+        };
 
         ctx.set_cached(ContextKey::LastEfficiency, efficiency);
         ctx.set_cached(ContextKey::LastRVol, rvol);
-        // 写入新状态（已计算）
         ctx.set_cached(ContextKey::VolumeState, current_volume_state);
 
         let extra = VolumeExtra {
@@ -221,7 +213,6 @@ impl Analyzer for VolumeStructureAnalyzer {
             .with_extra(extra))
     }
 }
-
 // ==================== 辅助结构 ====================
 struct DynamicThresholds {
     rvol_break: f64,
@@ -407,7 +398,6 @@ impl VolumeStructureAnalyzer {
         cfg: &crate::config::VolumeConfig,
         vol_adapt: f64,
         session_adj: f64,
-        stress_adj: f64,
     ) -> (f64, f64, String) {
         let regime = ctx
             .get_cached::<TrendStructure>(ContextKey::RegimeStructure)
@@ -441,7 +431,7 @@ impl VolumeStructureAnalyzer {
             } else {
                 "趋势延伸: 脱离引力井，趋势结构维持"
             };
-            score *= vol_adapt * session_adj * stress_adj;
+            score *= vol_adapt * session_adj;
             (score, cfg.trend_extension_mult(), reason.to_string())
         } else {
             let base = if is_up {
@@ -450,7 +440,7 @@ impl VolumeStructureAnalyzer {
                 -cfg.background_score_base()
             };
             if rvol > 1.0 {
-                let score = base * rvol.min(2.0) * vol_adapt * session_adj * stress_adj;
+                let score = base * rvol.min(2.0) * vol_adapt * session_adj;
                 (score, cfg.background_mult(), "背景放量".to_string())
             } else {
                 (0.0, 1.0, String::new())

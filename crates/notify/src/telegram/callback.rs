@@ -1,14 +1,16 @@
 // callback.rs
 use anyhow::Result;
 use common::Symbol;
-use quant::{analyzer::AnalysisEngine, config::AnalyzerConfig, risk_manager::RiskAssessment};
+use quant::analyzer::AnalysisEngine;
+use quant::config::AnalyzerConfig;
+use quant::risk_manager::RiskAssessment;
 use service::integrity::context::FeatureContextManager;
 use std::str::FromStr;
 use std::sync::Arc;
 use storage::postgres::Storage;
 use teloxide::{
     prelude::*,
-    types::{CallbackQuery, ChatId, MessageId},
+    types::{CallbackQuery, ChatId, InlineKeyboardButton, MessageId},
     Bot,
 };
 
@@ -36,10 +38,18 @@ pub async fn handle_callback(
     let data = q.data.as_deref().unwrap_or("");
     let chat_id = q.message.as_ref().map(|m| m.chat().id).unwrap_or(ChatId(0));
     let msg_id = q.message.as_ref().map(|m| m.id()).unwrap_or(MessageId(0));
+    let user_id = q.from.id.0 as i64;
 
     match data {
-        d if d.starts_with("exec_") => handle_exec(&bot, &q, d, chat_id, msg_id, &deps).await?,
-        d if d.starts_with("mute_") => handle_mute(&bot, &q, d, chat_id, msg_id, &deps).await?,
+        d if d.starts_with("exec_") => {
+            handle_exec(&bot, &q, d, chat_id, msg_id, &deps, user_id).await?
+        }
+        d if d.starts_with("close_") => {
+            handle_close(&bot, &q, d, chat_id, msg_id, &deps, user_id).await?
+        }
+        d if d.starts_with("mute_") => {
+            handle_mute(&bot, &q, d, chat_id, msg_id, &deps, user_id).await?
+        }
         _ => {}
     }
     Ok(())
@@ -52,6 +62,7 @@ async fn handle_mute(
     chat_id: ChatId,
     msg_id: MessageId,
     deps: &CallbackDeps,
+    user_id: i64,
 ) -> Result<()> {
     let symbol_str = data.trim_start_matches("mute_");
     let Ok(symbol) = Symbol::from_str(symbol_str) else {
@@ -59,7 +70,7 @@ async fn handle_mute(
         return Ok(());
     };
 
-    match deps.storage.mute_symbol(chat_id.0, symbol).await {
+    match deps.storage.mute_symbol(user_id, symbol).await {
         Ok(()) => {
             bot.answer_callback_query(q.id.clone()).await?;
             bot.edit_message_text(
@@ -84,14 +95,86 @@ async fn handle_mute(
     Ok(())
 }
 
-async fn handle_exec(
-    _bot: &Bot,
-    _q: &CallbackQuery,
-    _data: &str,
-    _chat_id: ChatId,
-    _msg_id: MessageId,
-    _deps: &CallbackDeps,
+async fn handle_close(
+    bot: &Bot,
+    q: &CallbackQuery,
+    data: &str,
+    chat_id: ChatId,
+    msg_id: MessageId,
+    deps: &CallbackDeps,
+    user_id: i64,
 ) -> Result<()> {
-    // TODO: 实现执行逻辑
+    let symbol_str = data.trim_start_matches("close_");
+    let Ok(symbol) = Symbol::from_str(symbol_str) else {
+        bot.answer_callback_query(q.id.clone()).await?;
+        return Ok(());
+    };
+
+    match deps
+        .storage
+        .close_trade(user_id, symbol, "manual_close")
+        .await
+    {
+        Ok(()) => {
+            bot.answer_callback_query(q.id.clone())
+                .text("仓位已关闭")
+                .await?;
+
+            let new_keyboard = teloxide::types::InlineKeyboardMarkup::new(vec![
+                vec![InlineKeyboardButton::callback(
+                    "📈 执行信号",
+                    format!("exec_{}", symbol),
+                )],
+                vec![InlineKeyboardButton::callback(
+                    "🔍 AI 审计",
+                    format!("audit_{}", symbol),
+                )],
+                vec![InlineKeyboardButton::callback(
+                    "🚫 不再提示",
+                    format!("mute_{}", symbol),
+                )],
+            ]);
+
+            bot.edit_message_reply_markup(chat_id, msg_id)
+                .reply_markup(new_keyboard)
+                .await?;
+        }
+        Err(e) => {
+            bot.answer_callback_query(q.id.clone())
+                .text(format!("关闭失败: {}", e))
+                .show_alert(true)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_exec(
+    bot: &Bot,
+    q: &CallbackQuery,
+    data: &str,
+    chat_id: ChatId,
+    msg_id: MessageId,
+    deps: &CallbackDeps,
+    user_id: i64,
+) -> Result<()> {
+    let symbol_str = data.trim_start_matches("exec_");
+    let Ok(symbol) = Symbol::from_str(symbol_str) else {
+        bot.answer_callback_query(q.id.clone()).await?;
+        return Ok(());
+    };
+
+    if deps.storage.has_open_trade(user_id, symbol).await? {
+        bot.answer_callback_query(q.id.clone())
+            .text("您已有未平仓仓位，请先关闭。")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
+
+    bot.answer_callback_query(q.id.clone())
+        .text("执行信号功能将在下个版本中通过实时分析触发，敬请期待。")
+        .show_alert(true)
+        .await?;
     Ok(())
 }

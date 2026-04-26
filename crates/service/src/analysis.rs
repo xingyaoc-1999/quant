@@ -107,7 +107,6 @@ impl AnalysisService {
             funding_rate,
         );
 
-        // 5. 动态方向阈值判断原始方向
         let raw_direction = dynamic_direction_threshold(
             net_score,
             vol_p,
@@ -116,15 +115,12 @@ impl AnalysisService {
             self.config.risk.direction_base_threshold,
         );
 
-        // 6. 过滤/确认方向
         let confirmed_direction = self.manager.filter_direction(symbol, raw_direction);
 
-        // 7. 无论如何都要保存跨周期状态
         self.manager.save_cross_cycle_state(symbol, &ctx);
 
-        // 8. 根据方向是否确认，决定是否生成报告
         if confirmed_direction.is_some() {
-            let mut audit = audit; // 重新绑定为可变（原本不可变，但我们需要 attach_risk 修改它）
+            let mut audit = audit;
             audit.attach_risk(&ctx, &self.config);
             let message = audit.to_markdown_v2(&ctx);
             let _ = self.event_tx.send(AnalysisEvent { symbol, message });

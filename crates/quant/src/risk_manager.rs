@@ -834,10 +834,11 @@ impl RiskManager {
         }
 
         if is_tsunami {
+            // 修复：动态止盈应向外推进目标价位
             let trail_tp = if is_long {
-                last_price - atr_v * 3.0
+                last_price + atr_v * 3.0 // 向上推
             } else {
-                last_price + atr_v * 3.0
+                last_price - atr_v * 3.0 // 向下推
             };
             let new_tp3 = if is_long {
                 trail_tp.max(tp[2])

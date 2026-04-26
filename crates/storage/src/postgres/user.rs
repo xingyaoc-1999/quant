@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use common::Symbol;
 use std::str::FromStr;
-use tracing::warn; // 可替换为 log::warn
+use tracing::warn;
 
 use crate::postgres::Storage;
 
@@ -49,10 +49,38 @@ impl Storage {
         )
         .await?;
 
+        conn.execute(
+            &format!(
+                r#"
+                CREATE TABLE IF NOT EXISTS {}.active_trades (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES {}.users(telegram_id) ON DELETE CASCADE,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    entry_price DOUBLE PRECISION NOT NULL,
+                    position_size DOUBLE PRECISION NOT NULL,
+                    stop_loss DOUBLE PRECISION,
+                    take_profit1 DOUBLE PRECISION,
+                    take_profit2 DOUBLE PRECISION,
+                    take_profit3 DOUBLE PRECISION,
+                    status TEXT NOT NULL DEFAULT 'closed',
+                    opened_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    closed_at TIMESTAMPTZ,
+                    close_reason TEXT,
+                    parent_signal_id TEXT,
+                    metadata JSONB DEFAULT '{{}}'
+                );
+                "#,
+                self.schema, self.schema
+            ),
+            &[],
+        )
+        .await?;
+
         Ok(())
     }
 
-    /// 确保用户存在，幂等操作
     pub async fn ensure_user(&self, telegram_id: i64) -> Result<()> {
         let conn = self.pool.get().await?;
         let sql = format!(
@@ -97,7 +125,6 @@ impl Storage {
         Ok(())
     }
 
-    /// 静音某交易对，要求用户已订阅该交易对，否则返回错误
     pub async fn mute_symbol(&self, telegram_id: i64, symbol: Symbol) -> Result<()> {
         self.ensure_user(telegram_id).await?;
 
@@ -115,7 +142,6 @@ impl Storage {
         Ok(())
     }
 
-    /// 取消静音，同样要求订阅记录存在
     pub async fn unmute_symbol(&self, telegram_id: i64, symbol: Symbol) -> Result<()> {
         self.ensure_user(telegram_id).await?;
 
@@ -167,5 +193,130 @@ impl Storage {
         );
         let rows = conn.query(&sql, &[&symbol.as_str()]).await?;
         Ok(rows.into_iter().map(|row| row.get(0)).collect())
+    }
+
+    pub async fn open_trade(
+        &self,
+        telegram_id: i64,
+        symbol: Symbol,
+        direction: &str,
+        entry_price: f64,
+        position_size: f64,
+        stop_loss: Option<f64>,
+        take_profits: &[f64],
+        parent_signal_id: Option<&str>,
+    ) -> Result<()> {
+        self.ensure_user(telegram_id).await?;
+        let mut conn = self.pool.get().await?;
+
+        let tx = conn.transaction().await?;
+
+        let close_sql = format!(
+            "UPDATE {}.active_trades SET status = 'closed', closed_at = NOW(), close_reason = 'replaced' WHERE user_id = $1 AND symbol = $2 AND status = 'open'",
+            self.schema
+        );
+        tx.execute(&close_sql, &[&telegram_id, &symbol.as_str()])
+            .await?;
+
+        let tp1 = take_profits.get(0).copied();
+        let tp2 = take_profits.get(1).copied();
+        let tp3 = take_profits.get(2).copied();
+
+        let insert_sql = format!(
+            "INSERT INTO {}.active_trades (user_id, symbol, direction, entry_price, position_size, stop_loss, take_profit1, take_profit2, take_profit3, parent_signal_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            self.schema
+        );
+        tx.execute(
+            &insert_sql,
+            &[
+                &telegram_id,
+                &symbol.as_str(),
+                &direction,
+                &entry_price,
+                &position_size,
+                &stop_loss,
+                &tp1,
+                &tp2,
+                &tp3,
+                &parent_signal_id,
+            ],
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn close_trade(&self, telegram_id: i64, symbol: Symbol, reason: &str) -> Result<()> {
+        let conn = self.pool.get().await?;
+        let sql = format!(
+            "UPDATE {}.active_trades SET status = 'closed', closed_at = NOW(), close_reason = $3 WHERE user_id = $1 AND symbol = $2 AND status = 'open'",
+            self.schema
+        );
+        conn.execute(&sql, &[&telegram_id, &symbol.as_str(), &reason])
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_trade_stops(
+        &self,
+        telegram_id: i64,
+        symbol: Symbol,
+        stop_loss: Option<f64>,
+        take_profits: &[f64],
+    ) -> Result<()> {
+        let conn = self.pool.get().await?;
+        let mut updates = vec![];
+        // 使用基于最终参数数组长度的占位符编号
+        // 固定参数: $1 = user_id, $2 = symbol（在 WHERE 子句中）
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![];
+
+        if let Some(sl) = stop_loss.as_ref() {
+            params.push(sl);
+            // 参数序号从 3 开始，因为 $1 和 $2 已用于 user_id 和 symbol
+            updates.push(format!("stop_loss = ${}", params.len() + 2));
+        }
+        if let Some(tp1) = take_profits.get(0) {
+            params.push(tp1);
+            updates.push(format!("take_profit1 = ${}", params.len() + 2));
+        }
+        if let Some(tp2) = take_profits.get(1) {
+            params.push(tp2);
+            updates.push(format!("take_profit2 = ${}", params.len() + 2));
+        }
+        if let Some(tp3) = take_profits.get(2) {
+            params.push(tp3);
+            updates.push(format!("take_profit3 = ${}", params.len() + 2));
+        }
+
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        updates.push("updated_at = NOW()".into());
+        let set_clause = updates.join(", ");
+        let sql = format!(
+            "UPDATE {}.active_trades SET {} WHERE user_id = $1 AND symbol = $2 AND status = 'open'",
+            self.schema, set_clause
+        );
+        let symbol_str = symbol.as_str();
+
+        let mut all_params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            vec![&telegram_id, &symbol_str];
+        all_params.extend(params);
+        conn.execute(&sql, &all_params[..]).await?;
+        Ok(())
+    }
+    pub async fn has_open_trade(&self, telegram_id: i64, symbol: Symbol) -> Result<bool> {
+        let conn = self.pool.get().await?;
+        let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM {}.active_trades WHERE user_id = $1 AND symbol = $2 AND status = 'open')",
+        self.schema
+    );
+        let row = conn
+            .query_one(&sql, &[&telegram_id, &symbol.as_str()])
+            .await?;
+        Ok(row.get(0))
     }
 }

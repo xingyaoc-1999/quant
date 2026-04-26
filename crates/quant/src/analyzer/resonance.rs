@@ -47,6 +47,11 @@ impl Analyzer for ResonanceAnalyzer {
         &self,
         ctx: &mut MarketContext,
     ) -> Result<AnalysisResult<Self::Extra>, AnalysisError> {
+        let last_price = ctx.global.last_price;
+        if !last_price.is_finite() || last_price <= 0.0 {
+            return Ok(AnalysisResult::new(self.kind()).with_score(0.0));
+        }
+
         let entry_data = ctx.get_role(Role::Entry)?;
         let feat = &entry_data.feature_set;
 
@@ -54,12 +59,10 @@ impl Analyzer for ResonanceAnalyzer {
         let is_breakdown = feat.signals.ma20_breakdown.unwrap_or(false);
         let macd_cross = feat.signals.macd_cross;
 
-        // 无任何触发信号则直接返回中性
         if !is_reclaim && !is_breakdown && macd_cross.is_none() {
             return Ok(AnalysisResult::new(self.kind()).with_score(0.0));
         }
 
-        // 确定方向：优先MA20穿越，其次MACD金叉/死叉
         let direction = if is_reclaim || macd_cross == Some(MacdCross::Golden) {
             1.0
         } else {
@@ -71,7 +74,6 @@ impl Analyzer for ResonanceAnalyzer {
         let mut m_resonance = 1.0;
         let cfg = &self.config.resonance;
 
-        // ----- 基础得分与触发源 -----
         let base_score = if is_reclaim || is_breakdown {
             description.push("TRIGGER:MA20_RECLAIM".to_string());
             cfg.ma20_trigger_score
@@ -93,7 +95,6 @@ impl Analyzer for ResonanceAnalyzer {
             description.push(format!("AGING({:.0}% remaining)", penalty * 100.0));
         }
 
-        // ----- MACD动量确认/背离 -----
         if let Some(macd_mom) = feat.signals.macd_momentum {
             let mom_confirmed = (is_long && macd_mom == MacdMomentum::Increasing)
                 || (!is_long && macd_mom == MacdMomentum::Decreasing);
@@ -106,11 +107,20 @@ impl Analyzer for ResonanceAnalyzer {
             }
         }
 
+        // 背离处理：相反背离直接拒绝信号
         if let Some(div) = &feat.signals.macd_divergence {
             match (div, is_long) {
                 (DivergenceType::Bearish, true) => {
-                    m_resonance *= cfg.div_opposite_weaken_mult;
-                    description.push("BEAR_DIV:LONG_WEAK".to_string());
+                    return Ok(AnalysisResult::new(self.kind())
+                        .violate()
+                        .with_score(0.0)
+                        .because("BEAR_DIV: 看跌背离拒绝做多"));
+                }
+                (DivergenceType::Bullish, false) => {
+                    return Ok(AnalysisResult::new(self.kind())
+                        .violate()
+                        .with_score(0.0)
+                        .because("BULL_DIV: 看涨背离拒绝做空"));
                 }
                 (DivergenceType::Bearish, false) => {
                     m_resonance *= cfg.bearish_div_short_boost;
@@ -120,14 +130,9 @@ impl Analyzer for ResonanceAnalyzer {
                     m_resonance *= cfg.bullish_div_long_boost;
                     description.push("BULL_DIV:LONG_OK".to_string());
                 }
-                (DivergenceType::Bullish, false) => {
-                    m_resonance *= cfg.div_opposite_weaken_mult;
-                    description.push("BULL_DIV:SHORT_WEAK".to_string());
-                }
             }
         }
 
-        // ----- 多周期市场结构对齐 -----
         let mtf_aligned = match ctx.get_cached::<TrendStructure>(ContextKey::RegimeStructure) {
             Some(TrendStructure::StrongBullish | TrendStructure::Bullish) => is_long,
             Some(TrendStructure::StrongBearish | TrendStructure::Bearish) => !is_long,
@@ -142,7 +147,6 @@ impl Analyzer for ResonanceAnalyzer {
             description.push("MTF_MISALIGN".to_string());
         }
 
-        // ----- 最终得分：将质量因子直接乘入得分 -----
         let final_score = (base_score * direction * m_resonance).clamp(-100.0, 100.0);
         let extra = ResonanceExtra {
             direction: Some(if is_long { "BUY" } else { "SELL" }.to_string()),
@@ -154,7 +158,7 @@ impl Analyzer for ResonanceAnalyzer {
 
         Ok(AnalysisResult::new(self.kind())
             .with_score(final_score)
-            .with_mult(1.0) // 质量已体现在得分中，权重乘数不再重复
+            .with_mult(1.0)
             .because(description.join(" | "))
             .with_extra(extra))
     }

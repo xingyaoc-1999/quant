@@ -3,13 +3,12 @@ use crate::analyzer::{
     MarketContext, Role,
 };
 use crate::config::{AnalyzerConfig, FakeoutConfig};
-use crate::types::gravity::{PriceGravityWell, WellSide};
+use crate::types::gravity::{PriceGravityWell, WellSide, WellSource};
 use crate::types::market::{PriceAction, RsiState, VolumeState};
 use crate::types::session::TradingSession;
 use std::collections::HashMap;
 
-// 使用 (价格百分比离散值, WellSide) 作为键，避免浮点位微调导致键变化
-type WellKey = (i32, WellSide);
+type WellKey = (WellSource, WellSide);
 type FakeoutState = HashMap<WellKey, (usize, usize)>;
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -61,25 +60,18 @@ impl Analyzer for FakeoutDetector {
         &self,
         ctx: &mut MarketContext,
     ) -> Result<AnalysisResult<Self::Extra>, AnalysisError> {
-        // 1. 提取数据
-        let (
-            price,
-            wells,
-            atr,
-            slope,
-            rsi_state,
-            efficiency,
-            rvol,
-            volume_state,
-            vol_p,
-            last_price,
-        ) = {
+        let last_price = ctx.global.last_price;
+        if !last_price.is_finite() || last_price <= 0.0 {
+            return Ok(AnalysisResult::new(self.kind()).with_score(0.0));
+        }
+
+        // 提取数据
+        let (price, wells, atr, slope, rsi_state, efficiency, rvol, volume_state, vol_p) = {
             let role_data = ctx
                 .get_role(Role::Entry)
                 .or_else(|_| ctx.get_role(Role::Trend))?;
             let fs = &role_data.feature_set;
 
-            let last_price = ctx.global.last_price;
             let atr = ctx
                 .get_cached::<f64>(ContextKey::VolAtrRatio)
                 .copied()
@@ -106,7 +98,6 @@ impl Analyzer for FakeoutDetector {
                 ctx.get_cached::<f64>(ContextKey::VolPercentile)
                     .copied()
                     .unwrap_or(50.0),
-                last_price,
             )
         };
 
@@ -120,7 +111,7 @@ impl Analyzer for FakeoutDetector {
         let session_adj = session.factor(&self.config.session);
         let vol_bias = self.compute_vol_bias(vol_p);
 
-        // 2. 状态提取（排除 Magnet 井）
+        // 状态提取（排除 Magnet 井）
         let mut state = ctx
             .cache
             .remove(&ContextKey::FakeoutState)
@@ -132,7 +123,6 @@ impl Analyzer for FakeoutDetector {
         let mut total_score = 0.0;
         let mut reasons = Vec::with_capacity(4);
 
-        // 3. 只处理支撑/阻力井，过滤掉 Magnet
         for well in wells
             .iter()
             .filter(|w| w.is_active && w.side != WellSide::Magnet)
@@ -150,7 +140,6 @@ impl Analyzer for FakeoutDetector {
                 vol_bias,
                 cfg,
                 &mut state,
-                last_price, // 传入 last_price 用于键计算
             ) {
                 total_score += score;
                 reasons.push(reason);
@@ -219,16 +208,14 @@ impl FakeoutDetector {
         vol_bias: f64,
         cfg: &FakeoutConfig,
         state: &mut FakeoutState,
-        last_price: f64, // 新增参数
     ) -> Option<(f64, String)> {
-        // 新键计算：将井价相对当前价格取万分之一离散值，避免浮点微调导致键变化
-        let discrete_pct = if last_price > f64::EPSILON {
-            ((well.level / last_price) * 10000.0).round() as i32
+        // 新键：使用 WellSource + WellSide，不再依赖当前价格
+        let well_key = if let Some(source) = well.sources.first() {
+            (*source, well.side)
         } else {
-            // 极端情况回退（理论上不会出现）
-            well.level.to_bits() as i32
+            // fallback，理论不会发生
+            (WellSource::Ma20, well.side)
         };
-        let well_key = (discrete_pct, well.side);
 
         let check_up = well.side == WellSide::Resistance;
         let check_down = well.side == WellSide::Support;
@@ -315,7 +302,6 @@ impl FakeoutDetector {
         Some((score, reason))
     }
 
-    // 其余函数保持不变...
     fn calculate_total_adjustment(
         &self,
         up: bool,

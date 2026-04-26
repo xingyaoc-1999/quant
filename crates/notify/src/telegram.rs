@@ -1,4 +1,4 @@
-// app.rs 或 bot.rs
+// bot.rs (full)
 mod callback;
 mod command;
 use anyhow::Result;
@@ -147,7 +147,7 @@ impl BotApp {
                 }
             });
 
-            // 构建回调依赖
+            // Build callback dependencies
             let callback_deps = callback::CallbackDeps {
                 storage: Arc::clone(&app.storage),
                 engine: Arc::clone(&app.engine),
@@ -224,48 +224,58 @@ impl BotApp {
                             .to_string();
                         let final_text = format!("{}\n\n🕒 Last update: `{}`", text, timestamp);
 
-                        let keyboard = InlineKeyboardMarkup::new(vec![
-                            vec![
-                                InlineKeyboardButton::callback(
-                                    "📈 执行信号",
-                                    format!("exec_{}", symbol),
-                                ),
-                                InlineKeyboardButton::callback(
-                                    "🔍 AI 审计",
-                                    format!("audit_{}", symbol),
-                                ),
-                            ],
-                            vec![
-                                InlineKeyboardButton::callback(
-                                    "🚫 不再提示",
-                                    format!("mute_{}", symbol),
-                                ),
-                            ],
-                        ]);
-
                         for telegram_id in subscribers {
                             let chat_id = ChatId(telegram_id);
                             let bot = bot.clone();
                             let text = final_text.clone();
-                            let kb = keyboard.clone();
-                            let storage = Arc::clone(&last_message_ids);
-                            let sym = symbol.clone();
+                            let msg_cache = Arc::clone(&last_message_ids);
+                            let storage = Arc::clone(&app.storage);
+                            let sym = symbol;
 
                             tokio::spawn(async move {
+                                let has_open = storage
+                                    .has_open_trade(telegram_id, sym)
+                                    .await
+                                    .unwrap_or(false);
+
+                                let action_btn = if has_open {
+                                    InlineKeyboardButton::callback(
+                                        "🔒 关闭仓位",
+                                        format!("close_{}", sym),
+                                    )
+                                } else {
+                                    InlineKeyboardButton::callback(
+                                        "📈 执行信号",
+                                        format!("exec_{}", sym),
+                                    )
+                                };
+
+                                let keyboard = InlineKeyboardMarkup::new(vec![
+                                    vec![action_btn],
+                                    vec![InlineKeyboardButton::callback(
+                                        "🔍 AI 审计",
+                                        format!("audit_{}", sym),
+                                    )],
+                                    vec![InlineKeyboardButton::callback(
+                                        "🚫 不再提示",
+                                        format!("mute_{}", sym),
+                                    )],
+                                ]);
+
                                 let key = (sym, chat_id);
-                                let old_id = storage.lock().await.get(&key).copied();
+                                let old_id = msg_cache.lock().await.get(&key).copied();
 
                                 if let Some(msg_id) = old_id {
                                     match bot.edit_message_text(chat_id, msg_id, &text)
                                         .parse_mode(ParseMode::MarkdownV2)
-                                        .reply_markup(kb.clone())
+                                        .reply_markup(keyboard.clone())
                                         .await
                                     {
                                         Ok(_) => return,
                                         Err(RequestError::Api(teloxide::ApiError::MessageNotModified)) => return,
                                         Err(RequestError::Api(teloxide::ApiError::MessageToEditNotFound)) => {
                                             info!("Message for [{}] not found, resending.", key.0);
-                                            storage.lock().await.remove(&key);
+                                            msg_cache.lock().await.remove(&key);
                                         }
                                         Err(e) => {
                                             error!("Edit failed for [{}]: {:?}", key.0, e);
@@ -276,11 +286,11 @@ impl BotApp {
 
                                 match bot.send_message(chat_id, &text)
                                     .parse_mode(ParseMode::MarkdownV2)
-                                    .reply_markup(kb)
+                                    .reply_markup(keyboard)
                                     .await
                                 {
                                     Ok(msg) => {
-                                        storage.lock().await.insert(key, msg.id);
+                                        msg_cache.lock().await.insert(key, msg.id);
                                         info!("Sent new message for [{}].", key.0);
                                     }
                                     Err(e) => error!("Send failed for [{}]: {:?}", key.0, e),
