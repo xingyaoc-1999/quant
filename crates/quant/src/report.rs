@@ -10,7 +10,6 @@ use crate::{
     },
     utils::math::dynamic_direction_threshold,
 };
-use chrono::Utc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -30,22 +29,18 @@ impl ReportFormatter {
         format!("{:.1$}", val, prec)
     }
 
-    /// 转义后的价格字符串
     fn price_esc(val: f64) -> String {
         escape_markdown_v2(&Self::price(val))
     }
 
-    /// 普通数值格式化（指定精度）
     fn raw(val: f64, prec: usize) -> String {
         format!("{:.1$}", val, prec)
     }
 
-    /// 转义后的普通数值
     fn raw_esc(val: f64, prec: usize) -> String {
         escape_markdown_v2(&Self::raw(val, prec))
     }
 
-    /// 置信乘数转星级 (0.4~1.6 → ★☆☆☆☆)
     fn confidence_stars(mult: f64) -> String {
         let stars = ((mult - 0.4) / 0.3).clamp(0.0, 4.0).round() as usize + 1;
         "★".repeat(stars) + &"☆".repeat(5 - stars)

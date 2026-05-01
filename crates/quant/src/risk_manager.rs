@@ -82,7 +82,7 @@ impl RiskManager {
 
         let entry_strategy = self.select_entry_strategy(regime, vol_p, is_tsunami);
 
-        let (mut entry_levels, mut entry_allocations, used_offset_pct) = self
+        let (entry_levels, entry_allocations, used_offset_pct) = self
             .calculate_entry_levels_with_strategy(
                 wells,
                 last_price,
@@ -90,12 +90,10 @@ impl RiskManager {
                 is_long,
                 is_tsunami,
                 &entry_strategy,
-                vol_p,
-                regime,
                 &mut tags,
             );
 
-        let (mut sl, mut tp, mut alloc) = self.calculate_trade_structure(
+        let (sl, tp, alloc) = self.calculate_trade_structure(
             wells,
             last_price,
             atr_v,
@@ -105,23 +103,18 @@ impl RiskManager {
             &mut tags,
         );
 
-        // ----- 排序已移至各生成函数内部，此处不再重复排序 -----
-
         let (wrr, rr_levels) = self.calculate_weighted_rr(last_price, &sl, &tp, &alloc);
         if wrr < self.config.risk.min_weighted_rr {
             return None;
         }
 
-        let (trailing, dynamic) = (false, false);
-        let dynamic_tp = if !is_tsunami
+        // 明确定义：trailing stop 暂时未启用
+        let trailing = false;
+        let dynamic_tp = !is_tsunami
             && matches!(
                 regime,
                 TrendStructure::StrongBullish | TrendStructure::StrongBearish
-            ) {
-            true
-        } else {
-            false
-        };
+            );
         if dynamic_tp {
             tags.push("DYNAMIC_TP".into());
         }
@@ -205,6 +198,7 @@ impl RiskManager {
         }
     }
 
+    /// 对外暴露的置信度预估算（不含 tags）
     #[allow(clippy::too_many_arguments)]
     pub fn estimate_confidence(
         &self,
@@ -218,8 +212,8 @@ impl RiskManager {
         is_tsunami: bool,
         funding_rate: Option<f64>,
     ) -> f64 {
-        let mut tags = Vec::new();
-        let lrs = self.compute_base_likelihoods(
+        // 使用内部版似然计算，不产生标签开销
+        let lrs = self.compute_base_likelihoods_quiet(
             is_long_hint,
             &regime,
             taker_ratio,
@@ -229,13 +223,69 @@ impl RiskManager {
             net_score,
             is_tsunami,
             funding_rate,
-            &mut tags,
         );
         let posterior = self.bayesian_update(self.config.risk.confidence_prior, &lrs);
         (posterior * 2.4 - 0.4).clamp(self.config.risk.mult_min, self.config.risk.mult_max)
     }
 
+    // ---------- 似然比计算（内部干净版，无标签） ----------
+    fn compute_base_likelihoods_quiet(
+        &self,
+        is_long: bool,
+        regime: &TrendStructure,
+        taker_ratio: f64,
+        vol_p: f64,
+        ma_dist: Option<f64>,
+        atr_r: f64,
+        net_score: f64,
+        is_tsunami: bool,
+        funding_rate: Option<f64>,
+    ) -> [f64; 8] {
+        let mut dummy = Vec::new(); // 忽略标签
+        self.compute_base_likelihoods_inner(
+            is_long,
+            regime,
+            taker_ratio,
+            vol_p,
+            ma_dist,
+            atr_r,
+            net_score,
+            is_tsunami,
+            funding_rate,
+            &mut dummy,
+        )
+    }
+
+    // ---------- 带标签的似然计算主实现 ----------
     fn compute_base_likelihoods(
+        &self,
+        is_long: bool,
+        regime: &TrendStructure,
+        taker_ratio: f64,
+        vol_p: f64,
+        ma_dist: Option<f64>,
+        atr_r: f64,
+        net_score: f64,
+        is_tsunami: bool,
+        funding_rate: Option<f64>,
+        tags: &mut Vec<String>,
+    ) -> [f64; 8] {
+        self.compute_base_likelihoods_inner(
+            is_long,
+            regime,
+            taker_ratio,
+            vol_p,
+            ma_dist,
+            atr_r,
+            net_score,
+            is_tsunami,
+            funding_rate,
+            tags,
+        )
+    }
+
+    // 统一实现
+    fn compute_base_likelihoods_inner(
         &self,
         is_long: bool,
         regime: &TrendStructure,
@@ -367,9 +417,7 @@ impl RiskManager {
             tags,
         );
         let mut lrs = [1.0; 9];
-        for (i, &val) in base.iter().enumerate() {
-            lrs[i] = val;
-        }
+        lrs[..8].copy_from_slice(&base);
         let min_rr = self.config.risk.rr_min_acceptable;
         lrs[8] = if rr >= min_rr * 1.2 {
             1.4
@@ -400,8 +448,6 @@ impl RiskManager {
         is_long: bool,
         is_tsunami: bool,
         strategy: &EntryStrategy,
-        vol_p: f64,
-        regime: TrendStructure,
         tags: &mut Vec<String>,
     ) -> (Vec<f64>, Vec<f64>, Option<f64>) {
         match strategy {
@@ -721,7 +767,7 @@ impl RiskManager {
             self.dynamic_allocation(&targets, last_price, tags)
         };
 
-        // ----- 核心修复：三元组排序，保证 sl/tp/alloc 永远配对 -----
+        // 三元组排序：保持 sl/tp/alloc 配对
         sort_trade_levels(&mut tp_levels, &mut sl_levels, &mut allocation, is_long);
 
         (sl_levels, tp_levels.to_vec(), allocation)
@@ -898,13 +944,14 @@ impl RiskManager {
     }
 }
 
+// ==================== 排序辅助函数 ====================
+
 fn sort_trade_levels(tp: &mut [f64; 3], sl: &mut Vec<f64>, alloc: &mut [f64; 3], is_long: bool) {
     if sl.len() < 3 {
         return;
     }
-    let mut orders: Vec<_> = (0..3).map(|i| (tp[i], sl[i], alloc[i])).collect();
+    let mut orders: Vec<(f64, f64, f64)> = (0..3).map(|i| (tp[i], sl[i], alloc[i])).collect();
 
-    // 做多：tp升序（由近到远）；做空：tp降序
     if is_long {
         orders.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     } else {
@@ -918,17 +965,19 @@ fn sort_trade_levels(tp: &mut [f64; 3], sl: &mut Vec<f64>, alloc: &mut [f64; 3],
     }
 }
 
-/// 对 (entry_price, entry_allocation) 二元组按方向排序
 fn sort_entry_levels(levels: &mut [f64; 3], allocs: &mut [f64; 3], is_long: bool) {
-    let mut entries: Vec<_> = levels.iter().zip(allocs.iter()).collect();
-    // 做多入场：降序（最近的防御/挂单在前）；做空：升序
+    let mut pairs: Vec<(f64, f64)> = levels
+        .iter()
+        .zip(allocs.iter())
+        .map(|(&l, &a)| (l, a))
+        .collect();
     if is_long {
-        entries.sort_by(|a, b| b.0.partial_cmp(a.0).unwrap_or(std::cmp::Ordering::Equal));
+        pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     } else {
-        entries.sort_by(|a, b| a.0.partial_cmp(b.0).unwrap_or(std::cmp::Ordering::Equal));
+        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     }
-    for i in 0..3 {
-        levels[i] = *entries[i].0;
-        allocs[i] = *entries[i].1;
+    for (i, (l, a)) in pairs.into_iter().enumerate() {
+        levels[i] = l;
+        allocs[i] = a;
     }
 }
