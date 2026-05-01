@@ -346,7 +346,6 @@ impl Storage {
             .iter()
             .map(|row| {
                 let s: String = row.get(0);
-                // 将 Result<Symbol, String> 转为 Result<Symbol, anyhow::Error>
                 Symbol::from_str(&s).map_err(|e| anyhow::anyhow!(e))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -408,7 +407,6 @@ WITH NO DATA;
             schema, view_name
         );
 
-        // Perform initial full refresh
         let refresh_sql = format!(
             "CALL refresh_continuous_aggregate('{}.{}', NULL, NULL);",
             schema, view_name

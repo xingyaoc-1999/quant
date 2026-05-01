@@ -142,6 +142,17 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn is_muted(&self, telegram_id: i64, symbol: Symbol) -> Result<bool> {
+        let conn = self.pool.get().await?;
+        let sql = format!(
+            "SELECT muted FROM {}.user_strategies WHERE user_id = $1 AND symbol = $2",
+            self.schema
+        );
+        let row = conn
+            .query_opt(&sql, &[&telegram_id, &symbol.as_str()])
+            .await?;
+        Ok(row.map(|r| r.get(0)).unwrap_or(false))
+    }
     pub async fn unmute_symbol(&self, telegram_id: i64, symbol: Symbol) -> Result<()> {
         self.ensure_user(telegram_id).await?;
 

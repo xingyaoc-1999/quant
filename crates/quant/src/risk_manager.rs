@@ -4,8 +4,6 @@ use crate::types::market::{TradeDirection, TrendStructure};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-// ==================== Risk Assessment Output ====================
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RiskAssessment {
     pub direction: TradeDirection,
@@ -18,6 +16,8 @@ pub struct RiskAssessment {
     pub confidence_mult: f64,
     pub audit_tags: Vec<String>,
     pub allocation: [f64; 3],
+    pub entry_strategy: EntryStrategy,
+    pub stop_entry_offset_pct: Option<f64>,
     pub is_tsunami: bool,
     pub estimated_loss_pct: f64,
     pub margin_loss_pct: f64,
@@ -82,19 +82,20 @@ impl RiskManager {
 
         let entry_strategy = self.select_entry_strategy(regime, vol_p, is_tsunami);
 
-        let (entry_levels, entry_allocations) = self.calculate_entry_levels_with_strategy(
-            wells,
-            last_price,
-            atr_v,
-            is_long,
-            is_tsunami,
-            &entry_strategy,
-            vol_p,
-            regime,
-            &mut tags,
-        );
+        let (mut entry_levels, mut entry_allocations, used_offset_pct) = self
+            .calculate_entry_levels_with_strategy(
+                wells,
+                last_price,
+                atr_v,
+                is_long,
+                is_tsunami,
+                &entry_strategy,
+                vol_p,
+                regime,
+                &mut tags,
+            );
 
-        let (mut sl, mut tp, alloc) = self.calculate_trade_structure(
+        let (mut sl, mut tp, mut alloc) = self.calculate_trade_structure(
             wells,
             last_price,
             atr_v,
@@ -104,14 +105,26 @@ impl RiskManager {
             &mut tags,
         );
 
+        // ----- 排序已移至各生成函数内部，此处不再重复排序 -----
+
         let (wrr, rr_levels) = self.calculate_weighted_rr(last_price, &sl, &tp, &alloc);
         if wrr < self.config.risk.min_weighted_rr {
             return None;
         }
 
-        let (trailing, dynamic) = self.apply_dynamic_adjustments(
-            &mut sl, &mut tp, last_price, atr_v, is_long, is_tsunami, &regime, &mut tags,
-        );
+        let (trailing, dynamic) = (false, false);
+        let dynamic_tp = if !is_tsunami
+            && matches!(
+                regime,
+                TrendStructure::StrongBullish | TrendStructure::StrongBearish
+            ) {
+            true
+        } else {
+            false
+        };
+        if dynamic_tp {
+            tags.push("DYNAMIC_TP".into());
+        }
 
         let likelihoods = self.compute_likelihoods(
             is_long,
@@ -143,7 +156,7 @@ impl RiskManager {
             max_loss_pct,
             leverage,
             &mut tags,
-        )?; // 若无法满足风险限制则返回 None（拒绝交易）
+        )?;
 
         Some(RiskAssessment {
             direction: dir,
@@ -156,12 +169,14 @@ impl RiskManager {
             confidence_mult: conf_mult,
             audit_tags: tags,
             allocation: alloc,
+            entry_strategy,
+            stop_entry_offset_pct: used_offset_pct,
             is_tsunami,
             estimated_loss_pct: total_loss,
             margin_loss_pct: margin_loss,
             max_loss_violated: violated,
             trailing_stop_activated: trailing,
-            dynamic_tp_activated: dynamic,
+            dynamic_tp_activated: dynamic_tp,
             entry_levels,
             entry_allocations,
         })
@@ -185,7 +200,7 @@ impl RiskManager {
                 EntryStrategy::Stop
             }
             TrendStructure::Range => EntryStrategy::Limit,
-            _ if vol_p > 70.0 => EntryStrategy::Hybrid,
+            _ if vol_p > 70.0 => EntryStrategy::Stop,
             _ => self.config.risk.entry_strategy.clone(),
         }
     }
@@ -233,8 +248,15 @@ impl RiskManager {
         funding_rate: Option<f64>,
         tags: &mut Vec<String>,
     ) -> [f64; 8] {
+        const IDX_TREND: usize = 0;
+        const IDX_TAKER: usize = 1;
+        const IDX_FUNDING: usize = 2;
+        const IDX_MA_EXTEND: usize = 3;
+        const IDX_VOL: usize = 4;
+        const IDX_NET_SCORE: usize = 5;
+        const IDX_TSUNAMI: usize = 6;
+
         let mut lrs = [1.0; 8];
-        let mut idx = 0;
         let cfg = &self.config.risk;
 
         let trend_ok = match regime {
@@ -244,24 +266,22 @@ impl RiskManager {
         };
         if trend_ok {
             tags.push("TREND_OK".into());
-            lrs[idx] = cfg.lr_trend_strong;
+            lrs[IDX_TREND] = cfg.lr_trend_strong;
         } else {
             tags.push("TREND_WEAK".into());
-            lrs[idx] = cfg.lr_trend_weak;
+            lrs[IDX_TREND] = cfg.lr_trend_weak;
         }
-        idx += 1;
 
         let threshold = 0.52 - ((vol_p - 50.0) / 200.0).clamp(-0.05, 0.05);
         let taker_ok =
             (is_long && taker_ratio > threshold) || (!is_long && taker_ratio < 1.0 - threshold);
         if taker_ok {
             tags.push("TAKER_FLOW_OK".into());
-            lrs[idx] = cfg.lr_taker_aligned;
+            lrs[IDX_TAKER] = cfg.lr_taker_aligned;
         } else {
             tags.push("TAKER_MISMATCH".into());
-            lrs[idx] = cfg.lr_taker_mismatch;
+            lrs[IDX_TAKER] = cfg.lr_taker_mismatch;
         }
-        idx += 1;
 
         if cfg.enable_funding_rate {
             if let Some(rate) = funding_rate {
@@ -269,10 +289,15 @@ impl RiskManager {
                     || (!is_long && rate < -cfg.funding_rate_threshold)
                 {
                     tags.push(format!("FUNDING_CROWDED:{:.4}", rate));
-                    lrs[idx] = cfg.funding_rate_penalty;
-                    idx += 1;
+                    lrs[IDX_FUNDING] = cfg.funding_rate_penalty;
+                } else {
+                    lrs[IDX_FUNDING] = 1.0;
                 }
+            } else {
+                lrs[IDX_FUNDING] = 1.0;
             }
+        } else {
+            lrs[IDX_FUNDING] = 1.0;
         }
 
         if let Some(dist) = ma_dist {
@@ -280,34 +305,36 @@ impl RiskManager {
             let exceed = (dist.abs() / limit.max(f64::EPSILON)).min(2.0);
             if exceed > 0.5 {
                 tags.push(format!("MA_OVEREXTEND:{:.1}%", exceed * 100.0));
-                lrs[idx] = if exceed < 1.0 {
+                lrs[IDX_MA_EXTEND] = if exceed < 1.0 {
                     0.85
                 } else if exceed < 1.5 {
                     0.7
                 } else {
                     0.55
                 };
-                idx += 1;
+            } else {
+                lrs[IDX_MA_EXTEND] = 1.0;
             }
+        } else {
+            lrs[IDX_MA_EXTEND] = 1.0;
         }
 
         if vol_p > 70.0 {
             tags.push("HIGH_VOL".into());
-            lrs[idx] = 1.25;
+            lrs[IDX_VOL] = 1.25;
         } else if vol_p < 20.0 {
             tags.push("LOW_VOL".into());
-            lrs[idx] = 0.8;
+            lrs[IDX_VOL] = 0.8;
         } else {
-            lrs[idx] = 1.0;
+            lrs[IDX_VOL] = 1.0;
         }
-        idx += 1;
 
-        lrs[idx] = 1.0 + (net_score / 100.0).clamp(-1.0, 1.0) * 0.6;
-        idx += 1;
+        lrs[IDX_NET_SCORE] = 1.0 + (net_score / 100.0).clamp(-1.0, 1.0) * 0.6;
 
         if is_tsunami {
-            lrs[idx] = cfg.lr_tsunami;
-            idx += 1;
+            lrs[IDX_TSUNAMI] = cfg.lr_tsunami;
+        } else {
+            lrs[IDX_TSUNAMI] = 1.0;
         }
 
         lrs
@@ -364,7 +391,7 @@ impl RiskManager {
         posterior.clamp(0.05, 0.95)
     }
 
-    // ---------- 混合入场策略（已包含动态权重） ----------
+    // ---------- 入场策略计算 ----------
     fn calculate_entry_levels_with_strategy(
         &self,
         wells: &[PriceGravityWell],
@@ -376,79 +403,17 @@ impl RiskManager {
         vol_p: f64,
         regime: TrendStructure,
         tags: &mut Vec<String>,
-    ) -> (Vec<f64>, Vec<f64>) {
+    ) -> (Vec<f64>, Vec<f64>, Option<f64>) {
         match strategy {
             EntryStrategy::Limit => {
                 let (levels, allocs) = self
                     .calculate_limit_entries(wells, last_price, atr_v, is_long, is_tsunami, tags);
-                (levels.to_vec(), allocs.to_vec())
+                (levels.to_vec(), allocs.to_vec(), None)
             }
             EntryStrategy::Stop => {
-                let (levels, allocs) = self
+                let (levels, allocs, used_offset) = self
                     .calculate_stop_entries(wells, last_price, atr_v, is_long, is_tsunami, tags);
-                (levels.to_vec(), allocs.to_vec())
-            }
-            EntryStrategy::Hybrid => {
-                let (limit_levels, limit_allocs) = self
-                    .calculate_limit_entries(wells, last_price, atr_v, is_long, is_tsunami, tags);
-                let (stop_levels, stop_allocs) = self
-                    .calculate_stop_entries(wells, last_price, atr_v, is_long, is_tsunami, tags);
-
-                // 动态计算限价单权重
-                let limit_weight = if is_tsunami {
-                    0.1
-                } else {
-                    match regime {
-                        TrendStructure::Range => 1.0,
-                        TrendStructure::StrongBullish | TrendStructure::StrongBearish => {
-                            0.2 + (vol_p / 100.0).clamp(0.0, 0.4)
-                        }
-                        _ => 0.4 + (vol_p / 100.0).clamp(0.0, 0.3),
-                    }
-                };
-                let stop_weight = 1.0 - limit_weight;
-
-                let mut hybrid_levels = [0.0; 3];
-                let mut hybrid_allocs = [0.0; 3];
-
-                for i in 0..3 {
-                    let l_w = limit_allocs[i] * limit_weight;
-                    let s_w = stop_allocs[i] * stop_weight;
-                    let total_w = l_w + s_w;
-                    if total_w > f64::EPSILON {
-                        hybrid_levels[i] = (limit_levels[i] * l_w + stop_levels[i] * s_w) / total_w;
-                        hybrid_allocs[i] = total_w;
-                    } else {
-                        hybrid_levels[i] = (limit_levels[i] + stop_levels[i]) * 0.5;
-                        hybrid_allocs[i] = 0.0;
-                    }
-                }
-
-                let sum_a: f64 = hybrid_allocs.iter().sum();
-                if sum_a > f64::EPSILON {
-                    for a in &mut hybrid_allocs {
-                        *a /= sum_a;
-                    }
-                } else {
-                    hybrid_allocs = [1.0 / 3.0; 3];
-                }
-
-                // 按方向排序
-                let mut paired: Vec<(f64, f64)> = (0..3)
-                    .map(|i| (hybrid_levels[i], hybrid_allocs[i]))
-                    .collect();
-                if is_long {
-                    paired
-                        .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                } else {
-                    paired
-                        .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                }
-                let sorted_levels: Vec<f64> = paired.iter().map(|(l, _)| *l).collect();
-                let sorted_allocs: Vec<f64> = paired.iter().map(|(_, a)| *a).collect();
-
-                tags.push(format!("ENTRY_HYBRID_LW_{:.2}", limit_weight));
-                (sorted_levels, sorted_allocs)
+                (levels.to_vec(), allocs.to_vec(), Some(used_offset))
             }
         }
     }
@@ -495,54 +460,52 @@ impl RiskManager {
             allocs[1] = cfg.default_entry_allocations[1];
             levels[2] = last_price - dir_sign * step * 2.0;
             allocs[2] = cfg.default_entry_allocations[2];
-        } else {
-            // 弱防御保护：若仅有一个防御井且强度过低，回退到保守分配
-            if count == 1 {
-                let solo_w = defense_wells[0];
-                if solo_w.strength < cfg.min_reliable_defense_strength {
-                    tags.push("ENTRY_LIMIT_WEAK_DEFENSE".into());
-                    let step = atr_v * cfg.entry_atr_step_mult;
-                    levels[0] = solo_w.level;
-                    allocs[0] = 0.3;
-                    levels[1] = last_price - dir_sign * step;
-                    allocs[1] = cfg.default_entry_allocations[1];
-                    levels[2] = last_price - dir_sign * step * 2.0;
-                    allocs[2] = cfg.default_entry_allocations[2];
-                    if is_tsunami {
-                        levels[0] = last_price;
-                        tags.push("ENTRY_TSUNAMI_ADJUST".into());
-                    }
-                    return (levels, allocs);
-                }
-            }
-
-            let total_strength: f64 = defense_wells[..count]
-                .iter()
-                .map(|w| w.strength.clamp(0.2, 3.0))
-                .sum();
-            for i in 0..count {
-                let w = defense_wells[i];
-                levels[i] = w.level;
-                allocs[i] = w.strength.clamp(0.2, 3.0) / total_strength;
-            }
-            if count < 3 {
-                let last_level = defense_wells[count - 1].level;
+        } else if count == 1 {
+            let solo_w = defense_wells[0];
+            if solo_w.strength < cfg.min_reliable_defense_strength {
+                tags.push("ENTRY_LIMIT_WEAK_DEFENSE".into());
                 let step = atr_v * cfg.entry_atr_step_mult;
-                for i in count..3 {
-                    levels[i] = last_level - dir_sign * step * (i - count + 1) as f64;
+                levels[0] = solo_w.level;
+                allocs[0] = 0.3;
+                levels[1] = last_price - dir_sign * step;
+                allocs[1] = cfg.default_entry_allocations[1];
+                levels[2] = last_price - dir_sign * step * 2.0;
+                allocs[2] = cfg.default_entry_allocations[2];
+                if is_tsunami {
+                    levels[0] = last_price;
+                    tags.push("ENTRY_TSUNAMI_ADJUST".into());
                 }
-                let remain = 0.2 * (3 - count) as f64;
-                let well_total = 1.0 - remain;
-                for i in 0..count {
-                    allocs[i] *= well_total;
-                }
-                for i in count..3 {
-                    allocs[i] = remain / (3 - count) as f64;
-                }
-                tags.push(format!("ENTRY_LIMIT_PARTIAL:{}", count));
-            } else {
-                tags.push("ENTRY_LIMIT_FULL".into());
+                sort_entry_levels(&mut levels, &mut allocs, is_long);
+                return (levels, allocs);
             }
+        }
+
+        let total_strength: f64 = defense_wells[..count]
+            .iter()
+            .map(|w| w.strength.clamp(0.2, 3.0))
+            .sum();
+        for i in 0..count {
+            let w = defense_wells[i];
+            levels[i] = w.level;
+            allocs[i] = w.strength.clamp(0.2, 3.0) / total_strength;
+        }
+        if count < 3 {
+            let last_level = defense_wells[count - 1].level;
+            let step = atr_v * cfg.entry_atr_step_mult;
+            for i in count..3 {
+                levels[i] = last_level - dir_sign * step * (i - count + 1) as f64;
+            }
+            let remain = 0.2 * (3 - count) as f64;
+            let well_total = 1.0 - remain;
+            for i in 0..count {
+                allocs[i] *= well_total;
+            }
+            for i in count..3 {
+                allocs[i] = remain / (3 - count) as f64;
+            }
+            tags.push(format!("ENTRY_LIMIT_PARTIAL:{}", count));
+        } else {
+            tags.push("ENTRY_LIMIT_FULL".into());
         }
 
         if is_tsunami && count > 0 {
@@ -550,6 +513,7 @@ impl RiskManager {
             tags.push("ENTRY_TSUNAMI_ADJUST".into());
         }
 
+        sort_entry_levels(&mut levels, &mut allocs, is_long);
         (levels, allocs)
     }
 
@@ -561,9 +525,11 @@ impl RiskManager {
         is_long: bool,
         is_tsunami: bool,
         tags: &mut Vec<String>,
-    ) -> ([f64; 3], [f64; 3]) {
+    ) -> ([f64; 3], [f64; 3], f64) {
         let dir_sign = if is_long { 1.0 } else { -1.0 };
-        let offset = last_price * self.config.risk.stop_entry_offset_pct;
+        let cfg = &self.config.risk;
+        let base_offset_pct = cfg.stop_entry_offset_pct;
+        let atr_pct = atr_v / last_price;
 
         let mut targets: Vec<_> = wells
             .iter()
@@ -585,32 +551,44 @@ impl RiskManager {
         let count = targets.len().min(3);
         let mut levels = [0.0; 3];
         let mut allocs = [0.0; 3];
+        let mut used_offset_pct = base_offset_pct;
 
         if count == 0 {
             tags.push("ENTRY_STOP_NO_TARGET".into());
             let step = atr_v * 0.5;
-            levels[0] = last_price + dir_sign * offset;
+            let dynamic_offset_pct = base_offset_pct + atr_pct * 0.5;
+            used_offset_pct = dynamic_offset_pct;
+            let offset_abs = last_price * dynamic_offset_pct;
+            levels[0] = last_price + dir_sign * offset_abs;
             allocs[0] = 0.5;
-            levels[1] = last_price + dir_sign * (step + offset);
+            levels[1] = last_price + dir_sign * (step + offset_abs);
             allocs[1] = 0.3;
-            levels[2] = last_price + dir_sign * (step * 2.0 + offset);
+            levels[2] = last_price + dir_sign * (step * 2.0 + offset_abs);
             allocs[2] = 0.2;
         } else {
-            for i in 0..count {
-                levels[i] = targets[i].level + dir_sign * offset;
-            }
             let total_strength: f64 = targets[..count]
                 .iter()
                 .map(|w| w.strength.clamp(0.2, 3.0))
                 .sum();
             for i in 0..count {
-                allocs[i] = targets[i].strength.clamp(0.2, 3.0) / total_strength;
+                let w = targets[i];
+                let strength_factor = 1.0 / (w.strength.clamp(0.5, 3.0).sqrt());
+                let dynamic_offset_pct = (base_offset_pct + atr_pct * 0.3) * strength_factor;
+                if i == 0 {
+                    used_offset_pct = dynamic_offset_pct;
+                }
+                let offset_abs = last_price * dynamic_offset_pct;
+                levels[i] = w.level + dir_sign * offset_abs;
+                allocs[i] = w.strength.clamp(0.2, 3.0) / total_strength;
             }
             if count < 3 {
                 let last_level = levels[count - 1];
                 let step = atr_v * 0.5;
                 for i in count..3 {
-                    levels[i] = last_level + dir_sign * step * (i - count + 1) as f64;
+                    let dynamic_offset_pct = base_offset_pct + atr_pct * 0.5;
+                    let offset_abs = last_price * dynamic_offset_pct;
+                    levels[i] =
+                        last_level + dir_sign * (step * (i - count + 1) as f64 + offset_abs);
                     allocs[i] = 0.1;
                 }
                 let sum: f64 = allocs.iter().sum();
@@ -620,15 +598,19 @@ impl RiskManager {
                     }
                 }
             }
-            tags.push("ENTRY_STOP".into());
+            tags.push(format!("ENTRY_STOP_DYN_OFFSET:{:.4}", used_offset_pct));
         }
 
         if is_tsunami && count > 0 {
-            levels[0] = last_price + dir_sign * offset;
+            let dynamic_offset_pct = base_offset_pct + atr_pct * 0.5;
+            used_offset_pct = dynamic_offset_pct;
+            let offset_abs = last_price * dynamic_offset_pct;
+            levels[0] = last_price + dir_sign * offset_abs;
             tags.push("ENTRY_TSUNAMI_ADJUST".into());
         }
 
-        (levels, allocs)
+        sort_entry_levels(&mut levels, &mut allocs, is_long);
+        (levels, allocs, used_offset_pct)
     }
 
     fn calculate_trade_structure(
@@ -636,7 +618,7 @@ impl RiskManager {
         wells: &[PriceGravityWell],
         last_price: f64,
         atr_v: f64,
-        average_atr: f64, // 平均 ATR（绝对值）
+        average_atr: f64,
         is_long: bool,
         is_tsunami: bool,
         tags: &mut Vec<String>,
@@ -681,9 +663,14 @@ impl RiskManager {
             .map(|w| w.level)
             .unwrap_or_else(|| last_price * (1.0 - dir_sign * 0.015));
         let min_sl_dist = last_price * self.min_stop_dist_pct;
-        let sl_levels: Vec<f64> = cfg
-            .atr_sl_buffers
+
+        let mut sl_buffers: Vec<f64> = cfg.atr_sl_buffers.to_vec();
+        while sl_buffers.len() < 3 {
+            sl_buffers.push(1.0);
+        }
+        let mut sl_levels: Vec<f64> = sl_buffers
             .iter()
+            .take(3)
             .map(|&buf| {
                 let raw = base_def - dir_sign * atr_v * buf;
                 if is_long {
@@ -705,11 +692,9 @@ impl RiskManager {
             .map(|w| w.level)
             .unwrap_or_else(|| last_price * (1.0 + dir_sign * 0.035));
 
-        // 海啸止盈优化：使用平均 ATR 并考虑远方引力井
         let tp3 = if is_tsunami {
-            let base_atr = average_atr.max(atr_v); // 避免波动骤降导致目标过近
+            let base_atr = average_atr.max(atr_v);
             let atr_target = last_price + dir_sign * base_atr * cfg.tsunami_tp3_atr_mult;
-            // 若存在第三个目标井，取更远的价位
             let well_target = targets.get(2).map(|w| w.level);
             match well_target {
                 Some(wt) => {
@@ -728,14 +713,18 @@ impl RiskManager {
                 .unwrap_or_else(|| last_price + dir_sign * atr_v * 3.0)
         };
 
-        let allocation = if is_tsunami {
+        let mut tp_levels = [tp1, tp2, tp3];
+        let mut allocation = if is_tsunami {
             tags.push("TSUNAMI_ALLOC".into());
             cfg.tsunami_allocation
         } else {
             self.dynamic_allocation(&targets, last_price, tags)
         };
 
-        (sl_levels, vec![tp1, tp2, tp3], allocation)
+        // ----- 核心修复：三元组排序，保证 sl/tp/alloc 永远配对 -----
+        sort_trade_levels(&mut tp_levels, &mut sl_levels, &mut allocation, is_long);
+
+        (sl_levels, tp_levels.to_vec(), allocation)
     }
 
     fn dynamic_allocation(
@@ -784,87 +773,6 @@ impl RiskManager {
         }
     }
 
-    fn apply_dynamic_adjustments(
-        &self,
-        sl: &mut Vec<f64>,
-        tp: &mut Vec<f64>,
-        last_price: f64,
-        atr_v: f64,
-        is_long: bool,
-        is_tsunami: bool,
-        regime: &TrendStructure,
-        tags: &mut Vec<String>,
-    ) -> (bool, bool) {
-        let mut trailing = false;
-        let mut dynamic = false;
-        let cfg = &self.config.risk;
-
-        let trail_sl = if is_long {
-            last_price - atr_v * cfg.trailing_atr_mult
-        } else {
-            last_price + atr_v * cfg.trailing_atr_mult
-        };
-        let new_sl = if is_long {
-            trail_sl.max(sl[0])
-        } else {
-            trail_sl.min(sl[0])
-        };
-        if (is_long && new_sl > sl[0]) || (!is_long && new_sl < sl[0]) {
-            sl[0] = new_sl;
-            trailing = true;
-            tags.push(format!("TRAILING_SL:ATR_{:.1}x", cfg.trailing_atr_mult));
-        }
-
-        if (is_long && last_price > tp[0]) || (!is_long && last_price < tp[0]) {
-            let tp1_sl = if is_long {
-                last_price - atr_v
-            } else {
-                last_price + atr_v
-            };
-            let tp1_new = if is_long {
-                tp1_sl.max(sl[0])
-            } else {
-                tp1_sl.min(sl[0])
-            };
-            if (is_long && tp1_new > sl[0]) || (!is_long && tp1_new < sl[0]) {
-                sl[0] = tp1_new;
-                trailing = true;
-                tags.push("TRAILING_SL:TP1_BREACH".into());
-            }
-        }
-
-        if is_tsunami {
-            // 修复：动态止盈应向外推进目标价位
-            let trail_tp = if is_long {
-                last_price + atr_v * 3.0 // 向上推
-            } else {
-                last_price - atr_v * 3.0 // 向下推
-            };
-            let new_tp3 = if is_long {
-                trail_tp.max(tp[2])
-            } else {
-                trail_tp.min(tp[2])
-            };
-            if (is_long && new_tp3 > tp[2]) || (!is_long && new_tp3 < tp[2]) {
-                tp[2] = new_tp3;
-                dynamic = true;
-                tags.push("TSUNAMI_TRAILING_TP3".into());
-            }
-        }
-
-        if !is_tsunami
-            && matches!(
-                regime,
-                TrendStructure::StrongBullish | TrendStructure::StrongBearish
-            )
-        {
-            dynamic = true;
-            tags.push("DYNAMIC_TP".into());
-        }
-
-        (trailing, dynamic)
-    }
-
     fn calculate_weighted_rr(
         &self,
         price: f64,
@@ -872,12 +780,16 @@ impl RiskManager {
         tp: &[f64],
         alloc: &[f64; 3],
     ) -> (f64, [f64; 3]) {
+        if sl.len() < 3 || tp.len() < 3 {
+            return (0.0, [0.0, 0.0, 0.0]);
+        }
         let min_dist = price * self.min_stop_dist_pct;
         let risks: Vec<f64> = sl
             .iter()
+            .take(3)
             .map(|&s| ((price - s).abs()).max(min_dist))
             .collect();
-        let rewards: Vec<f64> = tp.iter().map(|&t| (t - price).abs()).collect();
+        let rewards: Vec<f64> = tp.iter().take(3).map(|&t| (t - price).abs()).collect();
         let rr_levels = [
             rewards[0] / risks[0],
             rewards[1] / risks[1],
@@ -922,8 +834,6 @@ impl RiskManager {
             .unwrap_or(1.0)
     }
 
-    /// 计算最终仓位并检查风险上限。
-    /// 若无法满足最大亏损限制（即最小仓位仍导致超标），返回 `None` 以拒绝交易。
     fn calculate_final_position(
         &self,
         def_strength: f64,
@@ -974,7 +884,6 @@ impl RiskManager {
         let final_size = size.clamp(cfg.min_position_size, cfg.max_position_size);
         let final_total_loss = final_size * sl_pct * leverage;
 
-        // 最终检查：即使达到最小仓位，亏损仍超标 → 拒绝交易
         if let Some(max_l) = max_loss_pct {
             if final_total_loss > max_l {
                 tags.push(format!(
@@ -986,5 +895,40 @@ impl RiskManager {
         }
 
         Some((final_size, final_total_loss, margin_loss, violated))
+    }
+}
+
+fn sort_trade_levels(tp: &mut [f64; 3], sl: &mut Vec<f64>, alloc: &mut [f64; 3], is_long: bool) {
+    if sl.len() < 3 {
+        return;
+    }
+    let mut orders: Vec<_> = (0..3).map(|i| (tp[i], sl[i], alloc[i])).collect();
+
+    // 做多：tp升序（由近到远）；做空：tp降序
+    if is_long {
+        orders.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    } else {
+        orders.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    for i in 0..3 {
+        tp[i] = orders[i].0;
+        sl[i] = orders[i].1;
+        alloc[i] = orders[i].2;
+    }
+}
+
+/// 对 (entry_price, entry_allocation) 二元组按方向排序
+fn sort_entry_levels(levels: &mut [f64; 3], allocs: &mut [f64; 3], is_long: bool) {
+    let mut entries: Vec<_> = levels.iter().zip(allocs.iter()).collect();
+    // 做多入场：降序（最近的防御/挂单在前）；做空：升序
+    if is_long {
+        entries.sort_by(|a, b| b.0.partial_cmp(a.0).unwrap_or(std::cmp::Ordering::Equal));
+    } else {
+        entries.sort_by(|a, b| a.0.partial_cmp(b.0).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    for i in 0..3 {
+        levels[i] = *entries[i].0;
+        allocs[i] = *entries[i].1;
     }
 }

@@ -116,7 +116,6 @@ impl<Extra: Default> AnalysisResult<Extra> {
     }
 }
 
-// ==================== 类型擦除结果 ====================
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ErasedAnalysisResult {
     pub kind: AnalyzerKind,
@@ -127,7 +126,6 @@ pub struct ErasedAnalysisResult {
     pub rationale: Vec<String>,
 }
 
-// ==================== Analyzer Trait ====================
 pub trait Analyzer: Send + Sync {
     type Extra: Serialize + Clone + Send + Sync + Default + 'static;
 
@@ -360,7 +358,6 @@ impl AnalysisEngine {
         let mut pos_power = 0.0;
         let mut neg_power = 0.0;
 
-        // 提取波动环境乘数（默认 1.0）
         let volatility_mult = results
             .iter()
             .find(|r| r.kind == AnalyzerKind::Volatility)
@@ -369,7 +366,7 @@ impl AnalysisEngine {
 
         for res in &results {
             if res.score == 0.0 {
-                continue; // 仍然跳过无方向的分析器
+                continue;
             }
             let base_weight = self.config.weights.get(&res.kind).copied().unwrap_or(1.0);
             let final_weight = base_weight * res.weight_multiplier;
@@ -391,7 +388,6 @@ impl AnalysisEngine {
             0.0
         };
 
-        // 共振因子计算（不变）
         let total_power = pos_power + neg_power;
         let resonance_factor = if total_power > 0.0 {
             (pos_power - neg_power).abs() / total_power

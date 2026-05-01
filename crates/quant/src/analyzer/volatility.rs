@@ -6,7 +6,6 @@ use crate::config::AnalyzerConfig;
 use crate::types::market::{MarketStressLevel, TrendStructure, VolatilityConclusion};
 use std::f64;
 
-// ==================== VolatilityExtra ====================
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct VolatilityExtra {
     pub vol_percentile: f64,
@@ -17,7 +16,6 @@ pub struct VolatilityExtra {
     pub conclusion: VolatilityConclusion,
 }
 
-// ==================== 辅助结构体 ====================
 struct VolatilityInput {
     vol_p: f64,
     atr_ratio: f64,

@@ -1,3 +1,4 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 // ==================== Top-Level Config ====================
@@ -234,6 +235,9 @@ impl VolumeConfig {
     pub(crate) fn eff_low_base(&self) -> f64 {
         0.8 - self.efficiency_threshold * 0.6
     }
+    pub(crate) fn rvol_shrink_threshold(&self) -> f64 {
+        0.8 - self.volume_sensitivity * 0.2
+    }
     pub(crate) fn trend_extension_base_score(&self) -> f64 {
         25.0 + self.trend_extension_aggressiveness * 30.0
     }
@@ -465,12 +469,11 @@ impl Default for ResonanceConfig {
 }
 
 // ==================== RiskConfig ====================
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub enum EntryStrategy {
+    #[default]
     Limit,
     Stop,
-    #[default]
-    Hybrid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -538,7 +541,7 @@ impl Default for RiskConfig {
             default_entry_allocations: [0.5, 0.3, 0.2],
             direction_base_threshold: 10.0,
             min_weighted_rr: 1.2,
-            entry_strategy: EntryStrategy::Hybrid,
+            entry_strategy: EntryStrategy::default(),
             stop_entry_offset_pct: 0.001,
             tsunami_tp3_atr_mult: 5.0,
             min_reliable_defense_strength: 0.3,

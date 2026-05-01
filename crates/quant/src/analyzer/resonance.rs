@@ -74,8 +74,11 @@ impl Analyzer for ResonanceAnalyzer {
         let mut m_resonance = 1.0;
         let cfg = &self.config.resonance;
 
-        let base_score = if is_reclaim || is_breakdown {
+        let base_score = if is_reclaim {
             description.push("TRIGGER:MA20_RECLAIM".to_string());
+            cfg.ma20_trigger_score
+        } else if is_breakdown {
+            description.push("TRIGGER:MA20_BREAKDOWN".to_string());
             cfg.ma20_trigger_score
         } else {
             description.push("TRIGGER:MACD_CROSS".to_string());

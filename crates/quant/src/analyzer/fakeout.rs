@@ -8,7 +8,7 @@ use crate::types::market::{PriceAction, RsiState, VolumeState};
 use crate::types::session::TradingSession;
 use std::collections::HashMap;
 
-type WellKey = (WellSource, WellSide);
+type WellKey = (WellSource, WellSide, u64);
 type FakeoutState = HashMap<WellKey, (usize, usize)>;
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -210,12 +210,8 @@ impl FakeoutDetector {
         state: &mut FakeoutState,
     ) -> Option<(f64, String)> {
         // 新键：使用 WellSource + WellSide，不再依赖当前价格
-        let well_key = if let Some(source) = well.sources.first() {
-            (*source, well.side)
-        } else {
-            // fallback，理论不会发生
-            (WellSource::Ma20, well.side)
-        };
+        let source = self.primary_well_source(well);
+        let well_key = (source, well.side, well.level.to_bits());
 
         let check_up = well.side == WellSide::Resistance;
         let check_down = well.side == WellSide::Support;
@@ -300,6 +296,24 @@ impl FakeoutDetector {
         *cooldown = cfg.fakeout_cooldown_bars();
 
         Some((score, reason))
+    }
+
+    fn primary_well_source(&self, well: &PriceGravityWell) -> WellSource {
+        if well.sources.contains(&WellSource::EntryResistance) {
+            WellSource::EntryResistance
+        } else if well.sources.contains(&WellSource::EntrySupport) {
+            WellSource::EntrySupport
+        } else if well.sources.contains(&WellSource::TrendResistance) {
+            WellSource::TrendResistance
+        } else if well.sources.contains(&WellSource::TrendSupport) {
+            WellSource::TrendSupport
+        } else if well.sources.contains(&WellSource::FilterResistance) {
+            WellSource::FilterResistance
+        } else if well.sources.contains(&WellSource::FilterSupport) {
+            WellSource::FilterSupport
+        } else {
+            WellSource::Ma20
+        }
     }
 
     fn calculate_total_adjustment(

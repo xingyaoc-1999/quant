@@ -1,11 +1,11 @@
 use crate::{
     analyzer::{ContextKey, FinalSignal, MarketContext},
-    config::AnalyzerConfig,
+    config::{AnalyzerConfig, EntryStrategy},
     risk_manager::{RiskAssessment, RiskManager},
     types::{
         futures::Role,
         gravity::{PriceGravityWell, WellSide},
-        market::{TradeDirection, TrendStructure},
+        market::TrendStructure,
         session::TradingSession,
     },
     utils::math::dynamic_direction_threshold,
@@ -13,13 +13,10 @@ use crate::{
 use chrono::Utc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
 
-// ==================== 报告格式化辅助器 ====================
 struct ReportFormatter;
 
 impl ReportFormatter {
-    /// 根据价格绝对值动态选择小数位数
     fn price(val: f64) -> String {
         let prec = if val.abs() < 1.0 {
             4
@@ -83,7 +80,7 @@ impl AnalysisAudit {
         let entry = ctx.get_role(Role::Entry).ok();
 
         let snapshot = MarketSnapshot {
-            timestamp: Utc::now().timestamp_millis(),
+            timestamp: ctx.global.timestamp,
             price: ctx.global.last_price,
             trend_price_change: trend
                 .map(|r| {
@@ -172,7 +169,6 @@ impl AnalysisAudit {
 
         let funding_rate = Some(ctx.global.funding_rate);
 
-        // ---------- 获取平均 ATR（绝对值） ----------
         let average_atr = {
             let trend_role = ctx.get_role(Role::Trend).ok();
             let filter_role = ctx.get_role(Role::Filter).ok();
@@ -227,6 +223,7 @@ impl AnalysisAudit {
         self.risk_assessment = Some(risk);
         self.risk_assessment.as_ref()
     }
+
     pub fn to_markdown_v2(&self, ctx: &MarketContext) -> String {
         let header = self.build_header(ctx);
         let metrics = self.build_metrics();
@@ -234,11 +231,10 @@ impl AnalysisAudit {
         let fakeout = self.build_fakeout_signal();
         let risk = self.build_risk_section();
 
-        let mut parts = vec![header, metrics];
+        let mut msg = format!("{}\n{}", header, metrics);
         if !wells.is_empty() {
-            parts.push(wells);
+            msg.push_str(&format!("\n{}", wells));
         }
-        let mut msg = parts.join("\n");
         if !fakeout.is_empty() {
             msg.push_str(&fakeout);
         }
@@ -269,7 +265,7 @@ impl AnalysisAudit {
         let tsunami_tag = if tsunami { " 🌊 *TSUNAMI*" } else { "" };
 
         format!(
-            "*{symbol}*  {dir}  `{session}`{tsunami}",
+            "*{symbol}* {dir} `{session}` {tsunami}`",
             symbol = escape_markdown_v2(signal.symbol.as_str()),
             dir = dir_icon,
             session = session_str,
@@ -282,24 +278,17 @@ impl AnalysisAudit {
         let snapshot = &self.snapshot;
 
         let status_icon = if signal.is_rejected { "❌" } else { "✅" };
-        let oi_str = format!(
-            "{:+}",
-            ReportFormatter::raw(snapshot.entry_oi_change * 100.0, 2)
-        );
+        let oi_str = format!("{:+.1}", snapshot.entry_oi_change * 100.0);
 
-        let mut lines = Vec::new();
-        lines.push("─────────".to_string());
-        lines.push(format!(
-            "🎯 Score: `{score}` {status}  💧 OI Δ: `{oi}%`",
+        format!(
+            "─────────\n\
+             🎯 Score: `{score}` {status} \\| 💧 OI Δ: `{oi}%`\n\
+             💵 Price: `${price}`",
             score = ReportFormatter::raw(signal.net_score, 0),
             status = status_icon,
-            oi = oi_str,
-        ));
-        lines.push(format!(
-            "💵 Price: `${}`",
-            ReportFormatter::price(snapshot.price)
-        ));
-        lines.join("\n")
+            oi = escape_markdown_v2(&oi_str),
+            price = ReportFormatter::price(snapshot.price)
+        )
     }
 
     fn build_wells_section(&self) -> String {
@@ -322,7 +311,7 @@ impl AnalysisAudit {
                 )
             })
             .collect::<Vec<_>>()
-            .join("  ");
+            .join(" \\| ");
 
         if wells_str.is_empty() {
             String::new()
@@ -340,45 +329,62 @@ impl AnalysisAudit {
             .map(|r| r.score)
             .unwrap_or(0.0);
 
-        // 不够强就不显示，避免噪音
         if fakeout_score.abs() < 10.0 {
             return String::new();
         }
 
         if fakeout_score > 0.0 {
-            // 向下假突破 → 看涨，用绿色
             let icon = if fakeout_score > 30.0 { "✅" } else { "🟢" };
             format!(
-                "\nFakeout: {icon} 支撑假突破 看涨 `{score:.0}`",
+                "\n🛡️ Fakeout: {icon} 支撑假突破 看涨 `{score:.0}`",
                 icon = icon,
                 score = fakeout_score
             )
         } else {
-            // 向上假突破 → 看跌，保持红色警告
             let icon = if fakeout_score < -30.0 {
                 "🚨"
             } else {
                 "⚠️"
             };
             format!(
-                "\nFakeout: {icon} 阻力假突破 看跌 `{score:.0}`",
+                "\n🛡️ Fakeout: {icon} 阻力假突破 看跌 `{score:.0}`",
                 icon = icon,
                 score = fakeout_score
             )
         }
     }
+
     fn build_risk_section(&self) -> String {
         let risk = match &self.risk_assessment {
             Some(r) => r,
             None => return String::new(),
         };
 
-        // 方向字符串需要转义
         let dir_str = escape_markdown_v2(risk.direction.as_str());
+
+        let (strategy_label, strategy_note) = match risk.entry_strategy {
+            EntryStrategy::Limit => ("限价挂单", String::new()),
+            EntryStrategy::Stop => {
+                let trigger_price = risk
+                    .entry_levels
+                    .first()
+                    .map(|p| ReportFormatter::price_esc(*p))
+                    .unwrap_or_default();
+                let offset_pct = risk.stop_entry_offset_pct.unwrap_or(0.0);
+                (
+                    "止损触发",
+                    format!(
+                        " / 触发价: `${}` (偏移+{:.2}%)",
+                        trigger_price,
+                        offset_pct * 100.0
+                    ),
+                )
+            }
+        };
+
         let conf_stars = ReportFormatter::confidence_stars(risk.confidence_mult);
-        // 注意：size_pct 和 wrr 可能包含小数点，必须转义
-        let size_pct = escape_markdown_v2(&ReportFormatter::raw(risk.position_size_pct * 100.0, 1));
-        let wrr = escape_markdown_v2(&ReportFormatter::raw(risk.weighted_rr, 2));
+        let size_pct = escape_markdown_v2(&format!("{:.1}", risk.position_size_pct * 100.0));
+        let wrr = escape_markdown_v2(&format!("{:.2}", risk.weighted_rr));
 
         let sl_str = if let Some(first) = risk.stop_loss_levels.first() {
             if risk.stop_loss_levels.len() >= 2 {
@@ -391,17 +397,9 @@ impl AnalysisAudit {
                 ReportFormatter::price(*first)
             }
         } else {
-            String::new() // 处理空 Vec
+            String::new()
         };
-        // 止损价格可能包含小数点，也需要转义
         let sl_str = escape_markdown_v2(&sl_str);
-
-        // 预转义固定特殊符号
-        let sep = escape_markdown_v2("|");
-        let lparen = escape_markdown_v2("(");
-        let rparen = escape_markdown_v2(")");
-        let lbrace = escape_markdown_v2("{");
-        let rbrace = escape_markdown_v2("}");
 
         let entry_lines: Vec<String> = risk
             .entry_levels
@@ -411,61 +409,41 @@ impl AnalysisAudit {
             .map(|(i, (&level, &alloc))| {
                 let level_str = ReportFormatter::price_esc(level);
                 let alloc_str = escape_markdown_v2(&format!("{:.0}", alloc * 100.0));
-                format!(
-                    "  ▸ ENTRY{}: `${}`  {}{}%{}",
-                    i + 1,
-                    level_str,
-                    lbrace,
-                    alloc_str,
-                    rbrace,
-                )
+                format!("▸ ENTRY{}: `${}` \\({}%\\)", i + 1, level_str, alloc_str)
             })
             .collect();
 
-        let tp_line = |idx: usize| -> String {
-            let tp = ReportFormatter::price_esc(risk.take_profit_levels[idx]);
-            let rr = escape_markdown_v2(&ReportFormatter::raw(risk.rr_levels[idx], 1));
-            let alloc = escape_markdown_v2(&ReportFormatter::raw(risk.allocation[idx] * 100.0, 0));
-            format!(
-                "TP{}: `${}`  {}RR:{} {} {}%{}",
-                idx + 1,
-                tp,
-                lparen,
-                rr,
-                sep,
-                alloc,
-                rparen
-            )
-        };
+        let tp_lines: Vec<String> = (0..3)
+            .map(|idx| {
+                let tp = ReportFormatter::price_esc(risk.take_profit_levels[idx]);
+                let rr = escape_markdown_v2(&format!("{:.1}", risk.rr_levels[idx]));
+                let alloc = escape_markdown_v2(&format!("{:.0}", risk.allocation[idx] * 100.0));
+                format!("▸ TP{}: `${}` \\(RR:{} \\| {}%\\)", idx + 1, tp, rr, alloc)
+            })
+            .collect();
 
         let mut msg = String::new();
         msg.push_str("\n\n──────────\n");
         msg.push_str("*📊 风险管理*\n");
         msg.push_str(&format!(
-            "🧭 方向: `{}`   {}   💰 仓位: `{}%`",
-            dir_str, sep, size_pct
+            "🧭 方向: `{}` \\| 💰 仓位: `{}%` \\| 🧱 入场方式: `{}`{}\n",
+            dir_str, size_pct, strategy_label, strategy_note
         ));
-        msg.push_str(&format!("\n🛑 止损: `{}`", sl_str));
-        msg.push_str("\n\n*🚪 入场计划*\n");
+        msg.push_str(&format!("🛑 止损: `${}`\n\n", sl_str));
+        msg.push_str("*🚪 入场计划*\n");
         msg.push_str(&entry_lines.join("\n"));
         msg.push_str("\n\n*🎯 止盈目标*\n");
+        msg.push_str(&tp_lines.join("\n"));
         msg.push_str(&format!(
-            "  {}\n  {}\n  {}\n",
-            tp_line(0),
-            tp_line(1),
-            tp_line(2)
+            "\n\n⚖️ 加权盈亏比: `{}` \\| ⭐ 置信度: `{}`",
+            wrr, conf_stars
         ));
-        msg.push_str(&format!(
-            "\n⚖️ 加权盈亏比: `{}`   {}   ⭐ 置信度: `{}`",
-            wrr, sep, conf_stars
-        ));
-        // 亏损百分比数值需要转义
+
         let total_loss_str = escape_markdown_v2(&format!("{:.2}", risk.estimated_loss_pct * 100.0));
         let margin_loss_str = escape_markdown_v2(&format!("{:.2}", risk.margin_loss_pct * 100.0));
-        msg.push_str(&format!("\n\n💸 总资金亏损: `{}%`", total_loss_str));
         msg.push_str(&format!(
-            "\n📉 保证金亏损 \\(10x\\): `{}%`",
-            margin_loss_str
+            "\n💸 总资金亏损: `{}%` \\| 📉 保证金亏损: `{}%`",
+            total_loss_str, margin_loss_str
         ));
 
         msg

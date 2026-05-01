@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use agent::{
     agent::{
@@ -15,8 +15,8 @@ use common::{
     Symbol,
 };
 use notify::telegram::BotApp;
+use quant::risk_manager::RiskAssessment;
 use quant::{analyzer::ConfigurableAnalyzer, config::SignalStabilityConfig};
-
 use quant::{
     analyzer::{
         AnalysisEngine, AnalyzerWrapper, Config, FakeoutDetector, GravityAnalyzer,
@@ -28,11 +28,11 @@ use quant::{
 use ractor::{cast, Actor};
 use rig::tool::ToolSet;
 use service::{
-    analysis::AnalysisService,
+    analysis::{AnalysisEvent, AnalysisService},
     integrity::{context::FeatureContextManager, DataIntegrityManager},
 };
 use storage::postgres::Storage;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -67,10 +67,16 @@ async fn main() -> Result<()> {
     ];
 
     let engine = Arc::new(AnalysisEngine::new(Config::default(), analyzers));
+    let config_arc = Arc::new(analyzer_config.clone());
+
+    let assessment_cache: Arc<TokioMutex<HashMap<Symbol, RiskAssessment>>> =
+        Arc::new(TokioMutex::new(HashMap::new()));
+
     let analysis_service = Arc::new(AnalysisService::new(
         engine.clone(),
         ctx_manager.clone(),
         analyzer_config.clone(),
+        assessment_cache.clone(),
     ));
 
     let integrity = Arc::new(DataIntegrityManager::new(
@@ -84,16 +90,37 @@ async fn main() -> Result<()> {
     integrity.start();
     info!("Data integrity manager started");
 
-    // 修改通道类型：只需发送 (String, Symbol)
-    let (tg_tx, tg_rx) = mpsc::channel::<(String, Symbol)>(256);
-    // 命令通道保持不变（如果需要）
-    let (cmd_tx, mut cmd_rx) = mpsc::channel(100);
+    let (tg_tx, tg_rx) = mpsc::channel::<AnalysisEvent>(256);
 
-    // 创建 BotApp（简化版仅需 proxy_pool 和 token）
+    let execute_order: Arc<
+        dyn Fn(
+                &RiskAssessment,
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>>
+            + Send
+            + Sync,
+    > = Arc::new(|assessment: &RiskAssessment| {
+        let assessment = assessment.clone();
+        Box::pin(async move {
+            info!(
+                "Executing order: {:?} entry={} size={:.2}%",
+                assessment.direction,
+                assessment.entry_levels.first().unwrap_or(&0.0),
+                assessment.position_size_pct * 100.0
+            );
+            Ok("mock_order_id_123".to_string())
+        })
+    });
+
     let bot = BotApp::new(
         config.telegram.token.clone(),
         proxy_pool.clone(),
         storage.clone(),
+        engine.clone(),
+        ctx_manager.clone(),
+        config_arc.clone(),
+        execute_order,
+        assessment_cache.clone(),
     )
     .await?;
 
@@ -110,7 +137,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         info!("Analysis notification worker started");
         while let Ok(event) = analysis_rx.recv().await {
-            let _ = tg_sender.send((event.message, event.symbol)).await;
+            let _ = tg_sender.send(event).await;
         }
         info!("Analysis notification worker stopped");
     });
@@ -125,25 +152,25 @@ async fn main() -> Result<()> {
     let score_tool = ScoreQueryTool::new(ctx_manager.clone(), engine.clone());
     let tool_set = ToolSet::builder().static_tool(score_tool).build();
 
-    let agent_args = TechnicalAgentArgs {
-        model,
-        tx_out: tg_tx.clone(),
-        tool_set,
-    };
-    let (agent_actor, _handle) = Actor::spawn(
-        Some("TechnicalAgent".to_string()),
-        TechnicalAgent,
-        agent_args,
-    )
-    .await?;
-    info!("AI Agent started");
+    // let agent_args = TechnicalAgentArgs {
+    //     model,
+    //     tx_out: tg_tx.clone(),
+    //     tool_set,
+    // };
+    // let (agent_actor, _handle) = Actor::spawn(
+    //     Some("TechnicalAgent".to_string()),
+    //     TechnicalAgent,
+    //     agent_args,
+    // )
+    // .await?;
+    // info!("AI Agent started");
 
-    tokio::spawn(async move {
-        while let Some((cmd, chat_id)) = cmd_rx.recv().await {
-            info!("Received command: {} from {}", cmd, chat_id);
-            let _ = cast!(agent_actor, TechnicalAgentMessage::Task(cmd, chat_id));
-        }
-    });
+    // tokio::spawn(async move {
+    //     while let Some((cmd, chat_id)) = cmd_rx.recv().await {
+    //         info!("Received command: {} from {}", cmd, chat_id);
+    //         let _ = cast!(agent_actor, TechnicalAgentMessage::Task(cmd, chat_id));
+    //     }
+    // });
 
     info!("System ready, waiting for Ctrl+C...");
     tokio::signal::ctrl_c().await?;

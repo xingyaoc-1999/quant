@@ -8,7 +8,6 @@ use crate::types::market::TrendStructure;
 use std::collections::BTreeSet;
 use std::f64::consts::LN_2;
 
-// ==================== GravityExtra ====================
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct GravityExtra {
     pub wells: Vec<PriceGravityWell>,
@@ -20,7 +19,6 @@ pub struct GravityExtra {
     pub active_well_count: usize,
 }
 
-// ==================== WellSourceInput ====================
 struct WellSourceInput {
     dist_opt: Option<f64>,
     source: WellSource,
@@ -224,12 +222,16 @@ impl Analyzer for GravityAnalyzer {
         );
 
         let total_res = Self::composite_strength(
-            wells.iter().filter(|w| w.side == WellSide::Resistance && w.is_active),
+            wells
+                .iter()
+                .filter(|w| w.side == WellSide::Resistance && w.is_active),
             cfg.secondary_well_weight(),
             cfg.max_strength_cap(),
         );
         let total_sup = Self::composite_strength(
-            wells.iter().filter(|w| w.side == WellSide::Support && w.is_active),
+            wells
+                .iter()
+                .filter(|w| w.side == WellSide::Support && w.is_active),
             cfg.secondary_well_weight(),
             cfg.max_strength_cap(),
         );
@@ -442,9 +444,16 @@ impl GravityAnalyzer {
         inherit_gate: f64,
     ) {
         for well in wells.iter_mut() {
-            if let Some(prev) = prev_wells.iter().find(|p| {
-                p.side == well.side && (p.level - well.level).abs() / last_price < inherit_gate
-            }) {
+            let mut best_match = None;
+            let mut best_distance = f64::INFINITY;
+            for prev in prev_wells.iter().filter(|p| p.side == well.side) {
+                let dist = (prev.level - well.level).abs() / last_price;
+                if dist < inherit_gate && dist < best_distance {
+                    best_distance = dist;
+                    best_match = Some(prev);
+                }
+            }
+            if let Some(prev) = best_match {
                 well.magnet_activated = prev.magnet_activated;
                 well.last_tested_above = prev.last_tested_above;
                 well.last_tested_below = prev.last_tested_below;

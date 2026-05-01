@@ -1,17 +1,15 @@
 use common::Symbol;
 use quant::{
-    analyzer::{AnalysisEngine, ContextKey, MarketContext},
+    analyzer::{AnalysisEngine, ContextKey},
     config::AnalyzerConfig,
     report::AnalysisAudit,
-    risk_manager::RiskManager,
-    types::{
-        futures::Role,
-        market::{TradeDirection, TrendStructure},
-    },
+    risk_manager::{RiskAssessment, RiskManager},
+    types::{futures::Role, market::TrendStructure},
     utils::math::dynamic_direction_threshold,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tracing::info;
 
 use crate::{integrity::context::FeatureContextManager, types::MarketEvent};
@@ -20,6 +18,8 @@ use crate::{integrity::context::FeatureContextManager, types::MarketEvent};
 pub struct AnalysisEvent {
     pub symbol: Symbol,
     pub message: String,
+    pub assessment: Option<RiskAssessment>,
+    pub timestamp: i64,
 }
 
 #[derive(Clone)]
@@ -28,6 +28,7 @@ pub struct AnalysisService {
     engine: Arc<AnalysisEngine>,
     config: AnalyzerConfig,
     manager: Arc<FeatureContextManager>,
+    assessment_cache: Arc<TokioMutex<HashMap<Symbol, RiskAssessment>>>,
 }
 
 impl AnalysisService {
@@ -35,6 +36,7 @@ impl AnalysisService {
         engine: Arc<AnalysisEngine>,
         manager: Arc<FeatureContextManager>,
         config: AnalyzerConfig,
+        assessment_cache: Arc<TokioMutex<HashMap<Symbol, RiskAssessment>>>,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(256);
         Self {
@@ -42,6 +44,7 @@ impl AnalysisService {
             engine,
             config,
             manager,
+            assessment_cache,
         }
     }
 
@@ -50,13 +53,10 @@ impl AnalysisService {
     }
 
     pub async fn analyze(&self, symbol: Symbol) -> Option<AnalysisAudit> {
-        // 1. 获取上下文
         let mut ctx = self.manager.get_market_context(symbol)?;
 
-        // 2. 只运行一次分析引擎
         let audit = self.engine.run(&mut ctx);
 
-        // 3. 提取方向判断所需的上下文数据
         let net_score = audit.signal.net_score;
 
         let vol_p = ctx
@@ -122,8 +122,22 @@ impl AnalysisService {
         if confirmed_direction.is_some() {
             let mut audit = audit;
             audit.attach_risk(&ctx, &self.config);
+            let assessment = audit.risk_assessment.clone();
+
+            if let Some(ref assess) = assessment {
+                self.assessment_cache
+                    .lock()
+                    .await
+                    .insert(symbol, assess.clone());
+            }
+
             let message = audit.to_markdown_v2(&ctx);
-            let _ = self.event_tx.send(AnalysisEvent { symbol, message });
+            let _ = self.event_tx.send(AnalysisEvent {
+                symbol,
+                message,
+                assessment,
+                timestamp: ctx.global.timestamp,
+            });
             Some(audit)
         } else {
             None

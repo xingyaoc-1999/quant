@@ -432,16 +432,20 @@ impl FeatureCalculator {
         }
     }
     fn calculate_correlation_stable(&self) -> Option<f64> {
-        let n = self.recent_closes.len();
-        if n < self.config.struct_window || n != self.recent_global_closes.len() {
+        let len_x = self.recent_closes.len();
+        let len_y = self.recent_global_closes.len();
+        let n = len_x.min(len_y);
+        if n < self.config.struct_window {
             return None;
         }
 
-        let (sum_x, sum_y, sum_x_sq, sum_y_sq, sum_xy) = self
-            .recent_closes
-            .iter()
-            .zip(&self.recent_global_closes)
-            .fold((0.0, 0.0, 0.0, 0.0, 0.0), |acc, (&x, &y)| {
+        let x_start = len_x - n;
+        let y_start = len_y - n;
+
+        let (sum_x, sum_y, sum_x_sq, sum_y_sq, sum_xy) =
+            (0..n).fold((0.0, 0.0, 0.0, 0.0, 0.0), |acc, i| {
+                let x = self.recent_closes[x_start + i];
+                let y = self.recent_global_closes[y_start + i];
                 (
                     acc.0 + x,
                     acc.1 + y,

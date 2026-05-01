@@ -123,7 +123,7 @@ impl Analyzer for VolumeStructureAnalyzer {
 
         let current_volume_state = if rvol > thresholds.rvol_break {
             VolumeState::Expand
-        } else if rvol < 0.8 {
+        } else if rvol < cfg.rvol_shrink_threshold() {
             VolumeState::Shrink
         } else {
             VolumeState::Normal
