@@ -110,7 +110,6 @@ impl Analyzer for ResonanceAnalyzer {
             }
         }
 
-        // 背离处理：相反背离直接拒绝信号
         if let Some(div) = &feat.signals.macd_divergence {
             match (div, is_long) {
                 (DivergenceType::Bearish, true) => {

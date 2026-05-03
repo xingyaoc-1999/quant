@@ -26,7 +26,6 @@ struct WellSourceInput {
     last_ts: i64,
 }
 
-// ==================== GravityAnalyzer ====================
 pub struct GravityAnalyzer {
     config: AnalyzerConfig,
 }
@@ -283,7 +282,7 @@ impl GravityAnalyzer {
         now: i64,
         last_price: f64,
         confluence_gate: f64,
-        dampened: &mut std::collections::HashSet<usize>, // 用于跨调用去重削弱
+        dampened: &mut std::collections::HashSet<usize>,
     ) {
         let dist_raw = match input.dist_opt {
             Some(d) => d,
@@ -386,7 +385,7 @@ impl GravityAnalyzer {
         cross_merge_factor: f64,
         cross_dampen: f64,
         active_threshold: f64,
-        dampened: &mut std::collections::HashSet<usize>, // 记录本次分析中已削弱过的井索引
+        dampened: &mut std::collections::HashSet<usize>,
     ) {
         let mut merged = false;
         let mut pending_dampens = Vec::new();
@@ -404,14 +403,12 @@ impl GravityAnalyzer {
             }
 
             if existing.side != side && diff < confluence_gate * cross_merge_factor {
-                // 检查是否已经削弱过该井，避免重复
                 if !dampened.contains(&i) {
                     pending_dampens.push(i);
                 }
             }
         }
 
-        // 统一削弱，每个井只削弱一次
         for idx in pending_dampens {
             wells[idx].strength *= cross_dampen;
             dampened.insert(idx);

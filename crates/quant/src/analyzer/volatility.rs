@@ -24,7 +24,6 @@ struct VolatilityInput {
     vol_median_atr: f64,
 }
 
-// ==================== VolatilityEnvironmentAnalyzer ====================
 pub struct VolatilityEnvironmentAnalyzer {
     config: AnalyzerConfig,
 }

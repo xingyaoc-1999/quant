@@ -549,7 +549,6 @@ impl Default for RiskConfig {
     }
 }
 
-// ==================== SignalStabilityConfig ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalStabilityConfig {
     pub confirm_bars: usize,
@@ -559,8 +558,8 @@ pub struct SignalStabilityConfig {
 impl Default for SignalStabilityConfig {
     fn default() -> Self {
         Self {
-            confirm_bars: 1,
-            latch_bars: 2,
+            confirm_bars: 2,
+            latch_bars: 3,
         }
     }
 }

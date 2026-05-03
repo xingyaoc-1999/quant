@@ -182,7 +182,28 @@ impl FeatureContextManager {
             signal_config,
         }
     }
+    pub fn get_status_info(&self) -> Vec<(Symbol, i64, usize, bool, Option<TradeDirection>)> {
+        self.signal_states
+            .iter()
+            .filter_map(|entry| {
+                let sym = *entry.key();
+                let state = entry.value();
 
+                let last_ts = self
+                    .symbol_contexts
+                    .get(&sym)
+                    .and_then(|ctx| ctx.latest_snap.read().ok().map(|snap| snap.timestamp))
+                    .unwrap_or(0);
+                Some((
+                    sym,
+                    last_ts,
+                    state.consecutive_count,
+                    state.latch_remaining > 0,
+                    state.last_direction,
+                ))
+            })
+            .collect()
+    }
     #[inline]
     fn get_global_btc(&self) -> Option<f64> {
         let val = f64::from_bits(self.global_btc_price.load(Ordering::Relaxed));

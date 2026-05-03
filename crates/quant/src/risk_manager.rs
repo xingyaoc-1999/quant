@@ -8,14 +8,14 @@ use serde::{Deserialize, Serialize};
 pub struct RiskAssessment {
     pub direction: TradeDirection,
     pub position_size_pct: f64,
-    pub stop_loss_levels: Vec<f64>,
-    pub take_profit_levels: Vec<f64>,
+    pub stop_loss_levels: Vec<f64>,   // 长度 2
+    pub take_profit_levels: Vec<f64>, // 长度 2
     pub weighted_rr: f64,
-    pub rr_levels: [f64; 3],
+    pub rr_levels: [f64; 2], // 2 个独立 RR
     pub confidence: f64,
     pub confidence_mult: f64,
     pub audit_tags: Vec<String>,
-    pub allocation: [f64; 3],
+    pub allocation: [f64; 2], // 止盈/止损仓位分配（两个）
     pub entry_strategy: EntryStrategy,
     pub stop_entry_offset_pct: Option<f64>,
     pub is_tsunami: bool,
@@ -24,8 +24,8 @@ pub struct RiskAssessment {
     pub max_loss_violated: bool,
     pub trailing_stop_activated: bool,
     pub dynamic_tp_activated: bool,
-    pub entry_levels: Vec<f64>,
-    pub entry_allocations: Vec<f64>,
+    pub entry_levels: Vec<f64>,      // 入场级别仍可 3 个
+    pub entry_allocations: Vec<f64>, // 入场分配仍可 3 个
 }
 
 // ==================== Risk Manager ====================
@@ -108,7 +108,6 @@ impl RiskManager {
             return None;
         }
 
-        // 明确定义：trailing stop 暂时未启用
         let trailing = false;
         let dynamic_tp = !is_tsunami
             && matches!(
@@ -139,6 +138,7 @@ impl RiskManager {
 
         let def_strength = self.get_defense_strength(wells, last_price, is_long);
 
+        // 仓位计算仍使用第一个止损 sl[0]
         let (size, total_loss, margin_loss, violated) = self.calculate_final_position(
             def_strength,
             last_price,
@@ -198,8 +198,6 @@ impl RiskManager {
         }
     }
 
-    /// 对外暴露的置信度预估算（不含 tags）
-    #[allow(clippy::too_many_arguments)]
     pub fn estimate_confidence(
         &self,
         is_long_hint: bool,
@@ -212,7 +210,6 @@ impl RiskManager {
         is_tsunami: bool,
         funding_rate: Option<f64>,
     ) -> f64 {
-        // 使用内部版似然计算，不产生标签开销
         let lrs = self.compute_base_likelihoods_quiet(
             is_long_hint,
             &regime,
@@ -228,7 +225,6 @@ impl RiskManager {
         (posterior * 2.4 - 0.4).clamp(self.config.risk.mult_min, self.config.risk.mult_max)
     }
 
-    // ---------- 似然比计算（内部干净版，无标签） ----------
     fn compute_base_likelihoods_quiet(
         &self,
         is_long: bool,
@@ -241,7 +237,7 @@ impl RiskManager {
         is_tsunami: bool,
         funding_rate: Option<f64>,
     ) -> [f64; 8] {
-        let mut dummy = Vec::new(); // 忽略标签
+        let mut dummy = Vec::new();
         self.compute_base_likelihoods_inner(
             is_long,
             regime,
@@ -256,7 +252,6 @@ impl RiskManager {
         )
     }
 
-    // ---------- 带标签的似然计算主实现 ----------
     fn compute_base_likelihoods(
         &self,
         is_long: bool,
@@ -284,7 +279,6 @@ impl RiskManager {
         )
     }
 
-    // 统一实现
     fn compute_base_likelihoods_inner(
         &self,
         is_long: bool,
@@ -439,7 +433,7 @@ impl RiskManager {
         posterior.clamp(0.05, 0.95)
     }
 
-    // ---------- 入场策略计算 ----------
+    // ---------- 入场策略计算（保留 3 级入场，未改动） ----------
     fn calculate_entry_levels_with_strategy(
         &self,
         wells: &[PriceGravityWell],
@@ -659,6 +653,7 @@ impl RiskManager {
         (levels, allocs, used_offset_pct)
     }
 
+    // ---------- 新交易结构（2级） ----------
     fn calculate_trade_structure(
         &self,
         wells: &[PriceGravityWell],
@@ -668,7 +663,7 @@ impl RiskManager {
         is_long: bool,
         is_tsunami: bool,
         tags: &mut Vec<String>,
-    ) -> (Vec<f64>, Vec<f64>, [f64; 3]) {
+    ) -> (Vec<f64>, Vec<f64>, [f64; 2]) {
         let dir_sign = if is_long { 1.0 } else { -1.0 };
         let cfg = &self.config.risk;
 
@@ -710,13 +705,14 @@ impl RiskManager {
             .unwrap_or_else(|| last_price * (1.0 - dir_sign * 0.015));
         let min_sl_dist = last_price * self.min_stop_dist_pct;
 
-        let mut sl_buffers: Vec<f64> = cfg.atr_sl_buffers.to_vec();
-        while sl_buffers.len() < 3 {
+        // 只取前 2 个 ATR 缓冲
+        let mut sl_buffers: Vec<f64> = cfg.atr_sl_buffers.iter().take(2).copied().collect();
+        while sl_buffers.len() < 2 {
             sl_buffers.push(1.0);
         }
+
         let mut sl_levels: Vec<f64> = sl_buffers
             .iter()
-            .take(3)
             .map(|&buf| {
                 let raw = base_def - dir_sign * atr_v * buf;
                 if is_long {
@@ -729,19 +725,16 @@ impl RiskManager {
             })
             .collect();
 
+        // 止盈目标 1
         let tp1 = targets
             .first()
             .map(|w| w.level)
             .unwrap_or_else(|| last_price * (1.0 + dir_sign * 0.015));
-        let tp2 = targets
-            .get(1)
-            .map(|w| w.level)
-            .unwrap_or_else(|| last_price * (1.0 + dir_sign * 0.035));
-
-        let tp3 = if is_tsunami {
+        // 止盈目标 2
+        let tp2 = if is_tsunami {
             let base_atr = average_atr.max(atr_v);
             let atr_target = last_price + dir_sign * base_atr * cfg.tsunami_tp3_atr_mult;
-            let well_target = targets.get(2).map(|w| w.level);
+            let well_target = targets.get(1).map(|w| w.level);
             match well_target {
                 Some(wt) => {
                     if is_long {
@@ -754,21 +747,21 @@ impl RiskManager {
             }
         } else {
             targets
-                .get(2)
+                .get(1)
                 .map(|w| w.level)
                 .unwrap_or_else(|| last_price + dir_sign * atr_v * 3.0)
         };
 
-        let mut tp_levels = [tp1, tp2, tp3];
+        let mut tp_levels = [tp1, tp2];
         let mut allocation = if is_tsunami {
-            tags.push("TSUNAMI_ALLOC".into());
-            cfg.tsunami_allocation
+            let ta = &cfg.tsunami_allocation;
+            // 假设 tsunami_allocation 至少有两个元素
+            [ta[0], ta[1]]
         } else {
             self.dynamic_allocation(&targets, last_price, tags)
         };
 
-        // 三元组排序：保持 sl/tp/alloc 配对
-        sort_trade_levels(&mut tp_levels, &mut sl_levels, &mut allocation, is_long);
+        sort_trade_levels_2(&mut tp_levels, &mut sl_levels, &mut allocation, is_long);
 
         (sl_levels, tp_levels.to_vec(), allocation)
     }
@@ -778,44 +771,30 @@ impl RiskManager {
         targets: &[&PriceGravityWell],
         last_price: f64,
         tags: &mut Vec<String>,
-    ) -> [f64; 3] {
-        let n = targets.len().min(3);
+    ) -> [f64; 2] {
+        let n = targets.len().min(2);
         if n == 0 {
             tags.push("ALLOC_NO_TARGETS".into());
-            return [1.0 / 3.0; 3];
+            return [0.5, 0.5];
         }
 
-        let mut attractions = [0.0; 3];
-        for (i, w) in targets.iter().take(3).enumerate() {
+        let mut attractions = [0.0; 2];
+        for (i, w) in targets.iter().take(2).enumerate() {
             let dist_pct = ((w.level - last_price).abs() / last_price).max(0.001);
             attractions[i] = w.strength.clamp(0.2, 3.0) / dist_pct;
         }
 
         if n == 1 {
             tags.push("ALLOC_SINGLE".into());
-            return [1.0, 0.0, 0.0];
+            return [1.0, 0.0];
         }
 
-        if n == 2 {
-            attractions[1] += attractions[2];
-            attractions[2] = 0.0;
-            tags.push("ALLOC_MERGED:2".into());
-        }
-
-        let squared: [f64; 3] = [
-            attractions[0].powi(2),
-            attractions[1].powi(2),
-            attractions[2].powi(2),
-        ];
+        let squared = [attractions[0].powi(2), attractions[1].powi(2)];
         let sum_sq: f64 = squared.iter().sum();
         if sum_sq > f64::EPSILON {
-            [
-                squared[0] / sum_sq,
-                squared[1] / sum_sq,
-                squared[2] / sum_sq,
-            ]
+            [squared[0] / sum_sq, squared[1] / sum_sq]
         } else {
-            [1.0 / 3.0; 3]
+            [0.5, 0.5]
         }
     }
 
@@ -824,33 +803,21 @@ impl RiskManager {
         price: f64,
         sl: &[f64],
         tp: &[f64],
-        alloc: &[f64; 3],
-    ) -> (f64, [f64; 3]) {
-        if sl.len() < 3 || tp.len() < 3 {
-            return (0.0, [0.0, 0.0, 0.0]);
+        alloc: &[f64; 2],
+    ) -> (f64, [f64; 2]) {
+        if sl.len() < 2 || tp.len() < 2 {
+            return (0.0, [0.0; 2]);
         }
         let min_dist = price * self.min_stop_dist_pct;
         let risks: Vec<f64> = sl
             .iter()
-            .take(3)
+            .take(2)
             .map(|&s| ((price - s).abs()).max(min_dist))
             .collect();
-        let rewards: Vec<f64> = tp.iter().take(3).map(|&t| (t - price).abs()).collect();
-        let rr_levels = [
-            rewards[0] / risks[0],
-            rewards[1] / risks[1],
-            rewards[2] / risks[2],
-        ];
-        let w_risk = risks
-            .iter()
-            .enumerate()
-            .map(|(i, r)| r * alloc[i])
-            .sum::<f64>();
-        let w_reward = rewards
-            .iter()
-            .enumerate()
-            .map(|(i, r)| r * alloc[i])
-            .sum::<f64>();
+        let rewards: Vec<f64> = tp.iter().take(2).map(|&t| (t - price).abs()).collect();
+        let rr_levels = [rewards[0] / risks[0], rewards[1] / risks[1]];
+        let w_risk: f64 = risks.iter().enumerate().map(|(i, r)| r * alloc[i]).sum();
+        let w_reward: f64 = rewards.iter().enumerate().map(|(i, r)| r * alloc[i]).sum();
         let wrr = if w_risk > f64::EPSILON {
             w_reward / w_risk
         } else {
@@ -946,19 +913,17 @@ impl RiskManager {
 
 // ==================== 排序辅助函数 ====================
 
-fn sort_trade_levels(tp: &mut [f64; 3], sl: &mut Vec<f64>, alloc: &mut [f64; 3], is_long: bool) {
-    if sl.len() < 3 {
+fn sort_trade_levels_2(tp: &mut [f64; 2], sl: &mut Vec<f64>, alloc: &mut [f64; 2], is_long: bool) {
+    if sl.len() < 2 {
         return;
     }
-    let mut orders: Vec<(f64, f64, f64)> = (0..3).map(|i| (tp[i], sl[i], alloc[i])).collect();
-
+    let mut orders: Vec<(f64, f64, f64)> = (0..2).map(|i| (tp[i], sl[i], alloc[i])).collect();
     if is_long {
         orders.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     } else {
         orders.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     }
-
-    for i in 0..3 {
+    for i in 0..2 {
         tp[i] = orders[i].0;
         sl[i] = orders[i].1;
         alloc[i] = orders[i].2;

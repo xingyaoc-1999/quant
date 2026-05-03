@@ -5,12 +5,25 @@ use crate::analyzer::{
 use crate::config::AnalyzerConfig;
 use crate::types::futures::OIPositionState;
 use crate::types::gravity::{PriceGravityWell, WellSide};
-use crate::types::market::{MarketStressLevel, TrendStructure, VolumeState};
+use crate::types::market::{TrendStructure, VolumeState};
 use crate::types::session::TradingSession;
 use crate::utils::efficiency::{calculate_efficiency, consistency_penalty};
 use crate::utils::volatility::{compute_vol_factor, volatility_adaptation};
 
-// ==================== VolumeExtra ====================
+// ==================== 常量 ====================
+/// 低效率判断默认阈值（配置中无对应项时临时使用）
+const DEFAULT_EFF_LOW_THRESHOLD: f64 = 0.2;
+
+/// 磁铁井信号分数常数（可未来移至配置）
+const MAGNET_SCORE_NORMAL: f64 = 55.0;
+const MAGNET_MULT_NORMAL: f64 = 1.7;
+const MAGNET_SCORE_PROBE: f64 = 15.0;
+const MAGNET_MULT_PROBE: f64 = 1.2;
+
+/// 趋势延伸分数常数
+const TREND_EFF_NORMAL_RVOL: f64 = 1.2;
+
+// ==================== 数据结构 ====================
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct VolumeExtra {
     pub efficiency: f64,
@@ -25,7 +38,6 @@ pub struct VolumeExtra {
     pub session_adj: f64,
 }
 
-// ==================== VolumeStructureAnalyzer ====================
 pub struct VolumeStructureAnalyzer {
     config: AnalyzerConfig,
 }
@@ -130,8 +142,13 @@ impl Analyzer for VolumeStructureAnalyzer {
         };
         let consistency = consistency_penalty(rvol, Some(current_volume_state));
 
-        let is_up = p_action.close > p_action.open;
-        let target_side = if is_up {
+        // 方向因子：阳线为 +1，阴线为 -1
+        let direction = if p_action.close > p_action.open {
+            1.0
+        } else {
+            -1.0
+        };
+        let target_side = if direction > 0.0 {
             WellSide::Resistance
         } else {
             WellSide::Support
@@ -148,32 +165,32 @@ impl Analyzer for VolumeStructureAnalyzer {
 
         let mut res = AnalysisResult::new(self.kind());
 
+        // 信号上下文
+        let signal_ctx = SignalContext {
+            is_up: direction > 0.0,
+            last_price,
+            rvol,
+            efficiency,
+            thresholds: &thresholds,
+            oi_state,
+            is_tsunami,
+            taker_ratio,
+            oi_delta,
+            cfg,
+        };
+
         let well_signal = active_well
             .filter(|well| (well.level - last_price).abs() / last_price < sigma * 1.5)
-            .and_then(|well| {
-                self.evaluate_well_signal(
-                    well,
-                    is_up,
-                    last_price,
-                    rvol,
-                    efficiency,
-                    &thresholds,
-                    oi_state,
-                    is_tsunami,
-                    taker_ratio,
-                    oi_delta,
-                    cfg,
-                )
-            });
+            .and_then(|well| self.evaluate_well_signal(well, &signal_ctx));
 
-        let (score, m_vol) = if let Some(signal) = well_signal {
-            let adjusted = signal.score * consistency * vol_adapt * session_adj; // 移除 stress_adj，使用合并策略
+        let (score, mult) = if let Some(signal) = well_signal {
+            let adjusted = signal.score * consistency * vol_adapt * session_adj;
             if !signal.reason.is_empty() {
                 res = res.because(signal.reason);
             }
             (adjusted, signal.multiplier)
         } else {
-            let (trend_score, trend_mult, reason) = self.evaluate_trend_extension(
+            let trend_ext = self.evaluate_trend_extension(
                 ctx,
                 p_action,
                 efficiency,
@@ -182,11 +199,11 @@ impl Analyzer for VolumeStructureAnalyzer {
                 vol_adapt,
                 session_adj,
             );
-            let adjusted = trend_score * consistency;
-            if !reason.is_empty() {
-                res = res.because(reason);
+            let adjusted = trend_ext.score * consistency;
+            if !trend_ext.reason.is_empty() {
+                res = res.because(trend_ext.reason);
             }
-            (adjusted, trend_mult)
+            (adjusted, trend_ext.multiplier)
         };
 
         ctx.set_cached(ContextKey::LastEfficiency, efficiency);
@@ -209,10 +226,11 @@ impl Analyzer for VolumeStructureAnalyzer {
 
         Ok(res
             .with_score(final_score)
-            .with_mult(m_vol)
+            .with_mult(mult)
             .with_extra(extra))
     }
 }
+
 // ==================== 辅助结构 ====================
 struct DynamicThresholds {
     rvol_break: f64,
@@ -245,6 +263,20 @@ impl DynamicThresholds {
     }
 }
 
+/// 井信号评估所需的上下文参数
+struct SignalContext<'a> {
+    is_up: bool,
+    last_price: f64,
+    rvol: f64,
+    efficiency: f64,
+    thresholds: &'a DynamicThresholds,
+    oi_state: Option<OIPositionState>,
+    is_tsunami: bool,
+    taker_ratio: Option<f64>,
+    oi_delta: Option<f64>,
+    cfg: &'a crate::config::VolumeConfig,
+}
+
 struct WellSignal {
     score: f64,
     multiplier: f64,
@@ -261,40 +293,49 @@ impl WellSignal {
     }
 }
 
-// ==================== 核心评估逻辑 ====================
-impl VolumeStructureAnalyzer {
-    fn stress_adjustment(&self, level: MarketStressLevel) -> f64 {
-        match level {
-            MarketStressLevel::Dead => 0.5,
-            MarketStressLevel::MeatGrinder => 0.7,
-            MarketStressLevel::Acceleration => 0.9,
-            _ => 1.0,
+struct TrendExtension {
+    score: f64,
+    multiplier: f64,
+    reason: String,
+}
+
+impl TrendExtension {
+    fn new(score: f64, multiplier: f64, reason: impl Into<String>) -> Self {
+        Self {
+            score,
+            multiplier,
+            reason: reason.into(),
         }
     }
+}
 
+// ==================== 核心评估逻辑 ====================
+impl VolumeStructureAnalyzer {
     fn evaluate_well_signal(
         &self,
         well: &PriceGravityWell,
-        is_up: bool,
-        last_price: f64,
-        rvol: f64,
-        efficiency: f64,
-        thresh: &DynamicThresholds,
-        oi_state: Option<OIPositionState>,
-        is_tsunami: bool,
-        taker_ratio: Option<f64>,
-        oi_delta: Option<f64>,
-        cfg: &crate::config::VolumeConfig,
+        ctx: &SignalContext,
     ) -> Option<WellSignal> {
-        let oi_surge = oi_delta.is_some_and(|d| d > cfg.absorption_oi_delta_min());
-        let taker_bullish = taker_ratio.is_some_and(|tr| tr > cfg.absorption_taker_buy_min());
-        let taker_bearish = taker_ratio.is_some_and(|tr| tr < cfg.absorption_taker_sell_max());
+        let oi_surge = ctx
+            .oi_delta
+            .is_some_and(|d| d > ctx.cfg.absorption_oi_delta_min());
+        let taker_bullish = ctx
+            .taker_ratio
+            .is_some_and(|tr| tr > ctx.cfg.absorption_taker_buy_min());
+        let taker_bearish = ctx
+            .taker_ratio
+            .is_some_and(|tr| tr < ctx.cfg.absorption_taker_sell_max());
 
         if well.side == WellSide::Magnet {
-            return self.evaluate_magnet_signal(well, last_price, rvol, efficiency, thresh);
+            return self.evaluate_magnet_signal(well, ctx);
         }
 
-        let signal = match (well.side, rvol, efficiency) {
+        let thresh = ctx.thresholds;
+        let rvol = ctx.rvol;
+        let eff = ctx.efficiency;
+        let is_up = ctx.is_up;
+
+        let signal = match (well.side, rvol, eff) {
             (side, r, e) if r > thresh.rvol_break && e > thresh.eff_high => {
                 let (score, reason) = match side {
                     WellSide::Resistance => (
@@ -311,7 +352,8 @@ impl VolumeStructureAnalyzer {
             }
             (side, r, e) if r > thresh.rvol_extreme && e < thresh.eff_low => match side {
                 WellSide::Resistance => {
-                    if matches!(oi_state, Some(OIPositionState::LongBuildUp)) && is_tsunami {
+                    if matches!(ctx.oi_state, Some(OIPositionState::LongBuildUp)) && ctx.is_tsunami
+                    {
                         WellSignal::new(25.0, 1.3, "强力吸收: 阻力位多头持续接盘")
                     } else if !is_up && oi_surge && !taker_bearish {
                         WellSignal::new(65.0, 1.6, "虚假派发: 增仓但无主动卖盘，疑似多头爆仓")
@@ -320,7 +362,8 @@ impl VolumeStructureAnalyzer {
                     }
                 }
                 WellSide::Support => {
-                    if matches!(oi_state, Some(OIPositionState::ShortBuildUp)) && is_tsunami {
+                    if matches!(ctx.oi_state, Some(OIPositionState::ShortBuildUp)) && ctx.is_tsunami
+                    {
                         WellSignal::new(-25.0, 1.3, "压制性抛售: 支撑位空头强行挤压")
                     } else if is_up && oi_surge && !taker_bullish {
                         WellSignal::new(-65.0, 1.6, "虚假吸筹: 增仓但无主动买盘，疑似空头爆仓")
@@ -328,7 +371,7 @@ impl VolumeStructureAnalyzer {
                         WellSignal::new(85.0, 2.0, "吸筹承接: 支撑位放量止跌")
                     }
                 }
-                WellSide::Magnet => unreachable!(),
+                _ => unreachable!(),
             },
             (WellSide::Resistance, _, e) if e < thresh.eff_low && taker_bullish && oi_surge => {
                 WellSignal::new(-55.0, 1.6, "阻力被动吸收: 强力买盘被挂单截杀")
@@ -345,32 +388,33 @@ impl VolumeStructureAnalyzer {
     fn evaluate_magnet_signal(
         &self,
         well: &PriceGravityWell,
-        last_price: f64,
-        rvol: f64,
-        efficiency: f64,
-        thresh: &DynamicThresholds,
+        ctx: &SignalContext,
     ) -> Option<WellSignal> {
+        let thresh = ctx.thresholds;
+        let rvol = ctx.rvol;
+        let eff = ctx.efficiency;
+
         let (base_score, multiplier, reason) =
-            if rvol > thresh.magnet_rvol_break && efficiency > thresh.magnet_eff_high {
-                let action = if last_price < well.level {
+            if rvol > thresh.magnet_rvol_break && eff > thresh.magnet_eff_high {
+                let action = if ctx.last_price < well.level {
                     "磁力推进"
                 } else {
                     "磁力下压"
                 };
                 (
-                    55.0,
-                    1.7,
+                    MAGNET_SCORE_NORMAL,
+                    MAGNET_MULT_NORMAL,
                     format!("{}: 价格逼近清算区 {}", action, well.source_string()),
                 )
-            } else if rvol < thresh.magnet_rvol_shrink && efficiency < thresh.magnet_eff_low {
-                let action = if last_price < well.level {
+            } else if rvol < thresh.magnet_rvol_shrink && eff < thresh.magnet_eff_low {
+                let action = if ctx.last_price < well.level {
                     "站稳"
                 } else {
                     "跌破"
                 };
                 (
-                    15.0,
-                    1.2,
+                    MAGNET_SCORE_PROBE,
+                    MAGNET_MULT_PROBE,
                     format!(
                         "磁力试探: 量能不足，关注是否{} {}",
                         action,
@@ -381,7 +425,7 @@ impl VolumeStructureAnalyzer {
                 return None;
             };
 
-        let final_score = if last_price < well.level {
+        let final_score = if ctx.last_price < well.level {
             base_score
         } else {
             -base_score
@@ -398,14 +442,17 @@ impl VolumeStructureAnalyzer {
         cfg: &crate::config::VolumeConfig,
         vol_adapt: f64,
         session_adj: f64,
-    ) -> (f64, f64, String) {
+    ) -> TrendExtension {
         let regime = ctx
             .get_cached::<TrendStructure>(ContextKey::RegimeStructure)
             .copied();
-        let is_up = p_action.close > p_action.open;
-
+        let direction = if p_action.close > p_action.open {
+            1.0
+        } else {
+            -1.0
+        };
         let is_strong_trend = matches!(
-            (regime, is_up),
+            (regime, direction > 0.0),
             (
                 Some(TrendStructure::StrongBullish | TrendStructure::Bullish),
                 true
@@ -416,34 +463,27 @@ impl VolumeStructureAnalyzer {
         );
 
         if is_strong_trend {
-            let base = if is_up {
-                cfg.trend_extension_base_score()
-            } else {
-                -cfg.trend_extension_base_score()
-            };
-            let mut score = base;
-            let reason = if efficiency > cfg.trend_efficiency_threshold() && rvol > 1.2 {
-                score *= cfg.trend_extension_eff_boost();
-                "趋势延伸(高效): 脱离引力井，量价健康持续"
-            } else if efficiency < 0.2 {
-                score *= cfg.trend_weak_eff_penalty();
-                "趋势延伸(低效): 脱离引力井但动能减弱，谨慎"
-            } else {
-                "趋势延伸: 脱离引力井，趋势结构维持"
-            };
+            let base_score = cfg.trend_extension_base_score() * direction;
+            let mut score = base_score;
+            let reason =
+                if efficiency > cfg.trend_efficiency_threshold() && rvol > TREND_EFF_NORMAL_RVOL {
+                    score *= cfg.trend_extension_eff_boost();
+                    "趋势延伸(高效): 脱离引力井，量价健康持续"
+                } else if efficiency < DEFAULT_EFF_LOW_THRESHOLD {
+                    score *= cfg.trend_weak_eff_penalty();
+                    "趋势延伸(低效): 脱离引力井但动能减弱，谨慎"
+                } else {
+                    "趋势延伸: 脱离引力井，趋势结构维持"
+                };
             score *= vol_adapt * session_adj;
-            (score, cfg.trend_extension_mult(), reason.to_string())
+            TrendExtension::new(score, cfg.trend_extension_mult(), reason)
         } else {
-            let base = if is_up {
-                cfg.background_score_base()
-            } else {
-                -cfg.background_score_base()
-            };
+            let base_score = cfg.background_score_base() * direction;
             if rvol > 1.0 {
-                let score = base * rvol.min(2.0) * vol_adapt * session_adj;
-                (score, cfg.background_mult(), "背景放量".to_string())
+                let score = base_score * rvol.min(2.0) * vol_adapt * session_adj;
+                TrendExtension::new(score, cfg.background_mult(), "背景放量")
             } else {
-                (0.0, 1.0, String::new())
+                TrendExtension::new(0.0, 1.0, "")
             }
         }
     }

@@ -260,7 +260,7 @@ impl AnalysisAudit {
         let tsunami_tag = if tsunami { " 🌊 *TSUNAMI*" } else { "" };
 
         format!(
-            "*{symbol}* {dir} `{session}` {tsunami}`",
+            "*{symbol}* {dir} `{session}`{tsunami}",
             symbol = escape_markdown_v2(signal.symbol.as_str()),
             dir = dir_icon,
             session = session_str,
@@ -365,15 +365,7 @@ impl AnalysisAudit {
                     .first()
                     .map(|p| ReportFormatter::price_esc(*p))
                     .unwrap_or_default();
-                let offset_pct = risk.stop_entry_offset_pct.unwrap_or(0.0);
-                (
-                    "止损触发",
-                    format!(
-                        " / 触发价: `${}` (偏移+{:.2}%)",
-                        trigger_price,
-                        offset_pct * 100.0
-                    ),
-                )
+                ("止损触发", format!(" / 触发价: `${}`", trigger_price))
             }
         };
 
@@ -381,21 +373,29 @@ impl AnalysisAudit {
         let size_pct = escape_markdown_v2(&format!("{:.1}", risk.position_size_pct * 100.0));
         let wrr = escape_markdown_v2(&format!("{:.2}", risk.weighted_rr));
 
-        let sl_str = if let Some(first) = risk.stop_loss_levels.first() {
-            if risk.stop_loss_levels.len() >= 2 {
-                format!(
-                    "{}/{}",
-                    ReportFormatter::price(*first),
-                    ReportFormatter::price(risk.stop_loss_levels[1])
-                )
-            } else {
-                ReportFormatter::price(*first)
-            }
+        // 两个止损价格
+        let sl_str = if risk.stop_loss_levels.len() >= 2 {
+            format!(
+                "{}/{}",
+                ReportFormatter::price(risk.stop_loss_levels[0]),
+                ReportFormatter::price(risk.stop_loss_levels[1])
+            )
+        } else if let Some(first) = risk.stop_loss_levels.first() {
+            ReportFormatter::price(*first)
         } else {
             String::new()
         };
         let sl_str = escape_markdown_v2(&sl_str);
 
+        // 止损仓位百分比，不显示总和
+        let sl_alloc1 = risk.allocation.first().copied().unwrap_or(0.0) * 100.0;
+        let sl_alloc2 = risk.allocation.get(1).copied().unwrap_or(0.0) * 100.0;
+        let sl_alloc_str = escape_markdown_v2(&format!(
+            "止损仓位: SL1 {:.0}% / SL2 {:.0}%",
+            sl_alloc1, sl_alloc2
+        ));
+
+        // 入场计划（仍为3个级别）
         let entry_lines: Vec<String> = risk
             .entry_levels
             .iter()
@@ -408,7 +408,8 @@ impl AnalysisAudit {
             })
             .collect();
 
-        let tp_lines: Vec<String> = (0..3)
+        // 止盈目标（2个）
+        let tp_lines: Vec<String> = (0..2)
             .map(|idx| {
                 let tp = ReportFormatter::price_esc(risk.take_profit_levels[idx]);
                 let rr = escape_markdown_v2(&format!("{:.1}", risk.rr_levels[idx]));
@@ -418,13 +419,16 @@ impl AnalysisAudit {
             .collect();
 
         let mut msg = String::new();
-        msg.push_str("\n\n──────────\n");
+        msg.push_str("\n──────────\n");
         msg.push_str("*📊 风险管理*\n");
         msg.push_str(&format!(
             "🧭 方向: `{}` \\| 💰 仓位: `{}%` \\| 🧱 入场方式: `{}`{}\n",
             dir_str, size_pct, strategy_label, strategy_note
         ));
-        msg.push_str(&format!("🛑 止损: `${}`\n\n", sl_str));
+
+        msg.push_str(&format!("🛑 止损: `${}`\n", sl_str));
+        msg.push_str(&format!("📌 {}\n\n", sl_alloc_str));
+
         msg.push_str("*🚪 入场计划*\n");
         msg.push_str(&entry_lines.join("\n"));
         msg.push_str("\n\n*🎯 止盈目标*\n");

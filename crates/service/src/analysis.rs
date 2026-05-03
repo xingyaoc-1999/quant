@@ -132,6 +132,7 @@ impl AnalysisService {
             }
 
             let message = audit.to_markdown_v2(&ctx);
+
             let _ = self.event_tx.send(AnalysisEvent {
                 symbol,
                 message,
