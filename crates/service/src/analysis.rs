@@ -115,6 +115,13 @@ impl AnalysisService {
             self.config.risk.direction_base_threshold,
         );
 
+        info!(
+            "[ANALYZE] {} | net_score={:.2} | raw_direction={:?}",
+            symbol.as_str(),
+            net_score,
+            raw_direction,
+        );
+
         let confirmed_direction = self.manager.filter_direction(symbol, raw_direction);
 
         self.manager.save_cross_cycle_state(symbol, &ctx);
@@ -144,7 +151,6 @@ impl AnalysisService {
             None
         }
     }
-
     pub fn spawn_worker(
         self: Arc<Self>,
         mut event_rx: mpsc::Receiver<MarketEvent>,

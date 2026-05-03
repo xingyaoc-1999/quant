@@ -24,9 +24,10 @@ use tracing::info;
 
 #[derive(Default, Clone)]
 pub struct SignalConfirmState {
-    last_direction: Option<TradeDirection>,
-    consecutive_count: usize,
-    latch_remaining: usize,
+    pub last_direction: Option<TradeDirection>,
+    pub current_direction: Option<TradeDirection>,
+    pub consecutive_count: usize,
+    pub latch_remaining: usize,
 }
 
 pub struct RoleProcessor {
@@ -182,7 +183,17 @@ impl FeatureContextManager {
             signal_config,
         }
     }
-    pub fn get_status_info(&self) -> Vec<(Symbol, i64, usize, bool, Option<TradeDirection>)> {
+    pub fn get_status_info(
+        &self,
+    ) -> Vec<(
+        Symbol,
+        i64,
+        usize,
+        bool,
+        Option<TradeDirection>,
+        Option<TradeDirection>,
+        usize,
+    )> {
         self.signal_states
             .iter()
             .filter_map(|entry| {
@@ -194,12 +205,15 @@ impl FeatureContextManager {
                     .get(&sym)
                     .and_then(|ctx| ctx.latest_snap.read().ok().map(|snap| snap.timestamp))
                     .unwrap_or(0);
+
                 Some((
                     sym,
                     last_ts,
                     state.consecutive_count,
                     state.latch_remaining > 0,
                     state.last_direction,
+                    state.current_direction,
+                    state.latch_remaining,
                 ))
             })
             .collect()
@@ -412,33 +426,21 @@ impl FeatureContextManager {
         }
     }
 
-    pub fn update_symbol_config(
-        &self,
-        symbol: Symbol,
-        config: HashMap<Role, Interval>,
-    ) -> Vec<(Role, Interval)> {
-        let mut updated_roles = Vec::new();
-        if let Some(ctx) = self.symbol_contexts.get(&symbol) {
-            let mut roles_guard = ctx.roles.write().expect("Lock poisoned");
-            for (role, new_interval) in config {
-                let entry = roles_guard
-                    .entry(role)
-                    .or_insert_with(|| RoleProcessor::new(new_interval));
-                if entry.interval != new_interval {
-                    updated_roles.push((role, new_interval));
-                    *entry = RoleProcessor::new(new_interval);
-                }
-            }
-        }
-        updated_roles
-    }
-
     pub fn filter_direction(
         &self,
         symbol: Symbol,
         raw_direction: Option<TradeDirection>,
     ) -> Option<TradeDirection> {
         let mut state = self.signal_states.entry(symbol).or_default();
+        info!(
+            "[FILTER] {} | raw={:?} | last={:?} | count={} | latch_remain={}",
+            symbol.as_str(),
+            raw_direction,
+            state.last_direction,
+            state.consecutive_count,
+            state.latch_remaining,
+        );
+        state.current_direction = raw_direction;
 
         if state.latch_remaining > 0 {
             state.latch_remaining -= 1;
@@ -449,28 +451,19 @@ impl FeatureContextManager {
             (Some(prev), Some(curr)) if prev == curr => {
                 state.consecutive_count += 1;
             }
-            (Some(_), Some(curr)) => {
+            (_, Some(curr)) => {
                 state.consecutive_count = 1;
                 state.last_direction = Some(curr);
             }
-            (None, Some(curr)) => {
-                state.consecutive_count = 1;
-                state.last_direction = Some(curr);
-            }
-            (Some(prev), None) => {
-                state.consecutive_count = 0;
-            }
-            (None, None) => {
-                state.consecutive_count = 0;
-            }
+            (_, None) => {}
         }
 
         if state.consecutive_count >= self.signal_config.confirm_bars {
             state.latch_remaining = self.signal_config.latch_bars;
             state.consecutive_count = 0;
-            return state.last_direction;
+            state.last_direction
+        } else {
+            None
         }
-
-        None
     }
 }

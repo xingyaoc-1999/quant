@@ -7,7 +7,7 @@ use std::sync::Arc;
 use storage::postgres::Storage;
 use teloxide::{
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup},
+    types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
     utils::command::BotCommands,
 };
 
@@ -20,8 +20,7 @@ pub enum MyCommand {
     Help,
     #[command(description = "订阅交易对")]
     Subscribe(String),
-    #[command(description = "查看当前订阅")]
-    MySubs,
+
     #[command(description = "系统状态")]
     Status,
 }
@@ -109,51 +108,85 @@ impl MyCommand {
                 }
             }
 
-            Self::MySubs => match storage.get_subscribed_symbols(telegram_id).await {
-                Ok(symbols) => {
-                    if symbols.is_empty() {
-                        bot.send_message(chat_id, "📭 你当前没有订阅任何交易对。")
-                            .await?;
-                    } else {
-                        let list = symbols
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        bot.send_message(chat_id, format!("📋 当前订阅: {}", list))
-                            .await?;
-                    }
-                }
-                Err(e) => {
-                    bot.send_message(chat_id, format!("❌ 查询失败: {}", e))
-                        .await?;
-                }
-            },
             Self::Status => {
-                let now = Utc::now().timestamp_millis();
-                let status = ctx_manager.get_status_info();
+                let subscribed = storage
+                    .get_subscribed_symbols(telegram_id)
+                    .await
+                    .unwrap_or_default();
 
-                if status.is_empty() {
-                    bot.send_message(chat_id, "📭 暂未监控任何交易对。").await?;
+                if subscribed.is_empty() {
+                    bot.send_message(chat_id, "📭 你当前没有订阅任何交易对。")
+                        .await?;
+                    return Ok(());
+                }
+
+                let now = Utc::now().timestamp_millis();
+                let all_status = ctx_manager.get_status_info();
+
+                let user_status: Vec<_> = all_status
+                    .into_iter()
+                    .filter(|(sym, ..)| subscribed.contains(sym))
+                    .collect();
+
+                if user_status.is_empty() {
+                    bot.send_message(chat_id, "📭 你所订阅的交易对暂无实时状态。")
+                        .await?;
                 } else {
-                    let mut msg = String::from("📊 **实时系统状态**\n\n");
-                    for (symbol, last_ts, count, latch, dir) in &status {
+                    let mut msg = String::from("*📊 实时系统状态*\n\n");
+
+                    for (symbol, last_ts, count, latch, last_dir, current_dir, latch_remain) in
+                        &user_status
+                    {
                         let seconds_ago = (now - *last_ts as i64) / 1000;
-                        let direction_str = match dir {
+
+                        let last_str = match last_dir {
                             Some(d) => format!("{:?}", d),
-                            None => "None".into(),
+                            None => "—".into(),
                         };
+                        let current_str = match current_dir {
+                            Some(d) => format!("{:?}", d),
+                            None => "—".into(),
+                        };
+
+                        let latch_status = if *latch {
+                            format!("🔒 锁存中 (剩余 {} 根)", latch_remain)
+                        } else {
+                            "🔓 未锁存".into()
+                        };
+
+                        let price_str = ctx_manager
+                            .symbol_contexts
+                            .get(symbol)
+                            .and_then(|ctx| ctx.latest_snap.read().ok().map(|s| s.last_price))
+                            .map(|p| format!("${:.2}", p))
+                            .unwrap_or_else(|| "—".into());
+
                         msg.push_str(&format!(
-                            "`{}`\n  ⏱ {}秒前 | 方向: {} | 计数: {}/{} | 锁存: {}\n",
-                            symbol.as_str(),
-                            seconds_ago,
-                            direction_str,
-                            count,
-                            ctx_manager.signal_config.confirm_bars,
-                            latch,
+                            "`{symbol}`  ⏱ {age}s ago  💵 {price}\n\
+                 \x20\x20📌 历史方向: `{hist}`  当前方向: `{curr}`\n\
+                 \x20\x20📈 计数: `{count}/{need}`  {latch}\n\n",
+                            symbol = symbol.as_str(),
+                            age = seconds_ago,
+                            price = price_str,
+                            hist = last_str,
+                            curr = current_str,
+                            count = count,
+                            need = ctx_manager.signal_config.confirm_bars,
+                            latch = latch_status,
                         ));
                     }
-                    bot.send_message(chat_id, &msg).await?;
+
+                    msg.push_str("──────────\n");
+                    msg.push_str(&format!(
+                        "⚙️ 确认需连续 `{}` 根 | 锁存 `{}` 根\n",
+                        ctx_manager.signal_config.confirm_bars,
+                        ctx_manager.signal_config.latch_bars,
+                    ));
+                    msg.push_str(&format!("📡 总监控交易对: {}", user_status.len(),));
+
+                    bot.send_message(chat_id, &msg)
+                        .parse_mode(ParseMode::MarkdownV2)
+                        .await?;
                 }
             }
         }
