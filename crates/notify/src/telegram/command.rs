@@ -8,7 +8,7 @@ use storage::postgres::Storage;
 use teloxide::{
     prelude::*,
     types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
-    utils::command::BotCommands,
+    utils::{command::BotCommands, markdown::escape},
 };
 
 #[derive(BotCommands, Clone)]
@@ -121,7 +121,7 @@ impl MyCommand {
                 }
 
                 let now = Utc::now().timestamp_millis();
-                let all_status = ctx_manager.get_status_info();
+                let all_status = ctx_manager.get_status_info(); // 返回 (Symbol, i64, usize, bool, Option<TradeDirection>, Option<TradeDirection>, usize)
 
                 let user_status: Vec<_> = all_status
                     .into_iter()
@@ -161,28 +161,37 @@ impl MyCommand {
                             .map(|p| format!("${:.2}", p))
                             .unwrap_or_else(|| "—".into());
 
+                        let symbol_esc: String = escape(symbol.as_str());
+                        let price_esc = escape(&price_str);
+                        let last_esc = escape(&last_str);
+                        let current_esc = escape(&current_str);
+                        let latch_esc = escape(&latch_status);
+
                         msg.push_str(&format!(
                             "`{symbol}`  ⏱ {age}s ago  💵 {price}\n\
                  \x20\x20📌 历史方向: `{hist}`  当前方向: `{curr}`\n\
                  \x20\x20📈 计数: `{count}/{need}`  {latch}\n\n",
-                            symbol = symbol.as_str(),
+                            symbol = symbol_esc,
                             age = seconds_ago,
-                            price = price_str,
-                            hist = last_str,
-                            curr = current_str,
+                            price = price_esc,
+                            hist = last_esc,
+                            curr = current_esc,
                             count = count,
                             need = ctx_manager.signal_config.confirm_bars,
-                            latch = latch_status,
+                            latch = latch_esc,
                         ));
                     }
 
-                    msg.push_str("──────────\n");
+                    msg.push_str("───────\n");
                     msg.push_str(&format!(
-                        "⚙️ 确认需连续 `{}` 根 | 锁存 `{}` 根\n",
+                        "⚙️ 确认需连续 `{}` 根 \\| 锁存 `{}` 根\n",
                         ctx_manager.signal_config.confirm_bars,
                         ctx_manager.signal_config.latch_bars,
                     ));
-                    msg.push_str(&format!("📡 总监控交易对: {}", user_status.len(),));
+                    msg.push_str(&format!(
+                        "📡 总监控交易对: {}",
+                        ctx_manager.symbol_contexts.len(), // 系统实际监控总数
+                    ));
 
                     bot.send_message(chat_id, &msg)
                         .parse_mode(ParseMode::MarkdownV2)

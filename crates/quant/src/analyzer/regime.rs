@@ -31,7 +31,6 @@ impl ConfigurableAnalyzer for MarketRegimeAnalyzer {
     fn with_config(config: AnalyzerConfig) -> Self {
         Self { config }
     }
-
     fn config(&self) -> &AnalyzerConfig {
         &self.config
     }
@@ -43,7 +42,6 @@ impl Analyzer for MarketRegimeAnalyzer {
     fn name(&self) -> &'static str {
         "market_regime_v3"
     }
-
     fn kind(&self) -> AnalyzerKind {
         AnalyzerKind::MarketRegime
     }
@@ -64,10 +62,8 @@ impl Analyzer for MarketRegimeAnalyzer {
         if !last_price.is_finite() || last_price <= 0.0 {
             return Ok(AnalysisResult::new(self.kind()).with_score(0.0));
         }
-
         let session = TradingSession::from_timestamp(ctx.global.timestamp);
         let session_adj = session.factor(&self.config.session);
-
         let vol_p = ctx
             .get_cached::<f64>(ContextKey::VolPercentile)
             .copied()
@@ -84,7 +80,6 @@ impl Analyzer for MarketRegimeAnalyzer {
         let trend_role = ctx.get_role(Role::Trend)?;
         let t_feat = &trend_role.feature_set;
         let struct_feat = &t_feat.structure;
-
         let structure = struct_feat
             .trend_structure
             .clone()
@@ -107,7 +102,6 @@ impl Analyzer for MarketRegimeAnalyzer {
         };
 
         let cfg = &self.config.regime;
-
         let vol_bias = if vol_p > 80.0 {
             0.8
         } else if vol_p < 20.0 {
@@ -116,10 +110,9 @@ impl Analyzer for MarketRegimeAnalyzer {
             1.0
         };
 
-        let mut m_regime = cfg.mult_regime_normal() * vol_bias * corr_factor; // 移除 session_adj
+        let mut m_regime = cfg.mult_regime_normal() * vol_bias * corr_factor;
         let mut m_momentum = 1.0;
         let mut base_score = 0.0;
-
         let mut res = AnalysisResult::new(self.kind())
             .because(format!("结构: {:?} | 波动分位: {:.1}%", structure, vol_p));
 
@@ -128,11 +121,9 @@ impl Analyzer for MarketRegimeAnalyzer {
                 let is_bull = matches!(structure, TrendStructure::StrongBullish);
                 let slope_factor = self.calc_slope_factor(ma20_slope, ma20_slope_bars);
                 base_score = (if is_bull { 70.0 } else { -70.0 }) * slope_factor;
-
-                m_regime = cfg.mult_regime_trend() * vol_bias * corr_factor; 
+                m_regime = cfg.mult_regime_trend() * vol_bias * corr_factor;
                 m_momentum = self.evaluate_momentum(&rsi_state, is_bull, vol_p, is_vol_compressed)
                     * session_adj;
-
                 if let Some(slope) = ma20_slope {
                     if (is_bull && slope > 0.0) || (!is_bull && slope < 0.0) {
                         let boost = self.calc_slope_boost(slope, ma20_slope_bars);
@@ -176,7 +167,6 @@ impl Analyzer for MarketRegimeAnalyzer {
                     1.0
                 };
                 base_score = (if is_bull { 30.0 } else { -30.0 }) * slope_factor;
-
                 if let Some(slope) = ma20_slope {
                     if ((is_bull && slope > 0.0) || (!is_bull && slope < 0.0))
                         && ma20_slope_bars >= 2
@@ -197,7 +187,10 @@ impl Analyzer for MarketRegimeAnalyzer {
             structure,
             TrendStructure::StrongBearish | TrendStructure::Bearish
         );
-        let tsunami_oi_threshold = cfg.tsunami_base_oi_delta();
+
+        // 动态海啸OI阈值
+        let base_tsunami_oi = cfg.tsunami_base_oi_delta();
+        let tsunami_oi_threshold = dynamic_tsunami_oi_threshold(vol_p, base_tsunami_oi);
 
         let (is_tsunami, oi_state) = match oi_delta {
             Some(delta) => {
@@ -225,10 +218,8 @@ impl Analyzer for MarketRegimeAnalyzer {
 
         let m_game = self.calc_game_mult(taker_ratio, structure);
         let m_mtf = if mtf_aligned { 1.0 } else { 0.6 };
-
         let raw_mult = m_regime + m_momentum + m_game + m_mtf - 3.0;
         let final_mult = raw_mult.clamp(0.2, cfg.max_mult_cap());
-
         let final_score = (base_score * final_mult).clamp(-100.0, 100.0);
 
         let extra = RegimeExtra {
@@ -243,7 +234,6 @@ impl Analyzer for MarketRegimeAnalyzer {
             session: format!("{:?}", session),
             btc_corr_factor: corr_factor,
         };
-
         Ok(res.with_score(final_score).with_mult(1.0).with_extra(extra))
     }
 }
@@ -269,8 +259,7 @@ impl MarketRegimeAnalyzer {
         } else {
             1.0
         };
-        let boost = 1.0 + slope_strength * cfg.slope_momentum_boost() * bars_factor;
-        boost.min(1.5)
+        (1.0 + slope_strength * cfg.slope_momentum_boost() * bars_factor).min(1.5)
     }
 
     fn evaluate_momentum(
@@ -353,4 +342,15 @@ impl MarketRegimeAnalyzer {
             None => 1.0,
         }
     }
+}
+
+fn dynamic_tsunami_oi_threshold(vol_p: f64, base: f64) -> f64 {
+    let factor = if vol_p > 70.0 {
+        1.3
+    } else if vol_p < 25.0 {
+        0.8
+    } else {
+        1.0
+    };
+    base * factor
 }

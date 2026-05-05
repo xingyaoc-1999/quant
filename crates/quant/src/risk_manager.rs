@@ -8,14 +8,14 @@ use serde::{Deserialize, Serialize};
 pub struct RiskAssessment {
     pub direction: TradeDirection,
     pub position_size_pct: f64,
-    pub stop_loss_levels: Vec<f64>,   // 长度 2
-    pub take_profit_levels: Vec<f64>, // 长度 2
+    pub stop_loss_levels: Vec<f64>,
+    pub take_profit_levels: Vec<f64>,
     pub weighted_rr: f64,
-    pub rr_levels: [f64; 2], // 2 个独立 RR
+    pub rr_levels: [f64; 2],
     pub confidence: f64,
     pub confidence_mult: f64,
     pub audit_tags: Vec<String>,
-    pub allocation: [f64; 2], // 止盈/止损仓位分配（两个）
+    pub allocation: [f64; 2],
     pub entry_strategy: EntryStrategy,
     pub stop_entry_offset_pct: Option<f64>,
     pub is_tsunami: bool,
@@ -24,11 +24,9 @@ pub struct RiskAssessment {
     pub max_loss_violated: bool,
     pub trailing_stop_activated: bool,
     pub dynamic_tp_activated: bool,
-    pub entry_levels: Vec<f64>,      // 入场级别仍可 3 个
-    pub entry_allocations: Vec<f64>, // 入场分配仍可 3 个
+    pub entry_levels: Vec<f64>,
+    pub entry_allocations: Vec<f64>,
 }
-
-// ==================== Risk Manager ====================
 
 pub struct RiskManager {
     config: AnalyzerConfig,
@@ -64,14 +62,11 @@ impl RiskManager {
         let dir = direction?;
         let is_long = dir == TradeDirection::Long;
 
-        // 资金费率极端情况拒绝
         if let Some(rate) = funding_rate {
             let cfg = &self.config.risk;
             if cfg.enable_funding_rate {
-                if is_long && rate > 0.1 {
-                    return None;
-                }
-                if !is_long && rate < -0.1 {
+                let threshold = dynamic_funding_threshold(vol_p, cfg.funding_rate_threshold);
+                if (is_long && rate > threshold) || (!is_long && rate < -threshold) {
                     return None;
                 }
             }
@@ -100,11 +95,13 @@ impl RiskManager {
             average_atr,
             is_long,
             is_tsunami,
+            vol_p,
             &mut tags,
         );
 
         let (wrr, rr_levels) = self.calculate_weighted_rr(last_price, &sl, &tp, &alloc);
-        if wrr < self.config.risk.min_weighted_rr {
+        let min_wrr = dynamic_min_weighted_rr(vol_p, regime, self.config.risk.min_weighted_rr);
+        if wrr < min_wrr {
             return None;
         }
 
@@ -131,23 +128,36 @@ impl RiskManager {
             funding_rate,
             &mut tags,
         );
-        let posterior = self.bayesian_update(self.config.risk.confidence_prior, &likelihoods);
-        let conf_mult =
-            (posterior * 2.4 - 0.4).clamp(self.config.risk.mult_min, self.config.risk.mult_max);
+        let prior = dynamic_confidence_prior(vol_p, regime, self.config.risk.confidence_prior);
+        let posterior = self.bayesian_update(prior, &likelihoods);
+        let (mult_min, mult_max) = dynamic_confidence_range(vol_p, regime);
+        let conf_mult = (posterior * 2.4 - 0.4).clamp(mult_min, mult_max);
         tags.push(format!("CONF_MULT:{:.2}", conf_mult));
 
         let def_strength = self.get_defense_strength(wells, last_price, is_long);
 
-        // 仓位计算仍使用第一个止损 sl[0]
+        let nearest_sl = sl
+            .iter()
+            .min_by(|a, b| {
+                (last_price - *a)
+                    .abs()
+                    .partial_cmp(&(last_price - *b).abs())
+                    .unwrap()
+            })
+            .copied()?;
+
+        let dynamic_max_loss = dynamic_max_loss_pct(vol_p, max_loss_pct);
+
         let (size, total_loss, margin_loss, violated) = self.calculate_final_position(
             def_strength,
             last_price,
-            sl[0],
+            nearest_sl,
             conf_mult,
             vol_p,
             is_tsunami,
-            max_loss_pct,
+            dynamic_max_loss,
             leverage,
+            regime,
             &mut tags,
         )?;
 
@@ -174,10 +184,6 @@ impl RiskManager {
             entry_allocations,
         })
     }
-
-    // ------------------------------------------------------------
-    // 辅助函数
-    // ------------------------------------------------------------
 
     fn select_entry_strategy(
         &self,
@@ -221,8 +227,10 @@ impl RiskManager {
             is_tsunami,
             funding_rate,
         );
-        let posterior = self.bayesian_update(self.config.risk.confidence_prior, &lrs);
-        (posterior * 2.4 - 0.4).clamp(self.config.risk.mult_min, self.config.risk.mult_max)
+        let prior = dynamic_confidence_prior(vol_p, regime, self.config.risk.confidence_prior);
+        let posterior = self.bayesian_update(prior, &lrs);
+        let (mult_min, mult_max) = dynamic_confidence_range(vol_p, regime);
+        (posterior * 2.4 - 0.4).clamp(mult_min, mult_max)
     }
 
     fn compute_base_likelihoods_quiet(
@@ -303,11 +311,15 @@ impl RiskManager {
         let mut lrs = [1.0; 8];
         let cfg = &self.config.risk;
 
-        let trend_ok = match regime {
-            TrendStructure::StrongBullish | TrendStructure::Bullish => is_long,
-            TrendStructure::StrongBearish | TrendStructure::Bearish => !is_long,
-            _ => false,
-        };
+        let trend_ok = matches!(
+            regime,
+            TrendStructure::StrongBullish | TrendStructure::Bullish
+                if is_long
+        ) || matches!(
+            regime,
+            TrendStructure::StrongBearish | TrendStructure::Bearish
+                if !is_long
+        );
         if trend_ok {
             tags.push("TREND_OK".into());
             lrs[IDX_TREND] = cfg.lr_trend_strong;
@@ -412,7 +424,7 @@ impl RiskManager {
         );
         let mut lrs = [1.0; 9];
         lrs[..8].copy_from_slice(&base);
-        let min_rr = self.config.risk.rr_min_acceptable;
+        let min_rr = dynamic_min_weighted_rr(vol_p, *regime, self.config.risk.min_weighted_rr);
         lrs[8] = if rr >= min_rr * 1.2 {
             1.4
         } else if rr >= min_rr {
@@ -433,7 +445,6 @@ impl RiskManager {
         posterior.clamp(0.05, 0.95)
     }
 
-    // ---------- 入场策略计算（保留 3 级入场，未改动） ----------
     fn calculate_entry_levels_with_strategy(
         &self,
         wells: &[PriceGravityWell],
@@ -500,6 +511,8 @@ impl RiskManager {
             allocs[1] = cfg.default_entry_allocations[1];
             levels[2] = last_price - dir_sign * step * 2.0;
             allocs[2] = cfg.default_entry_allocations[2];
+            sort_entry_levels(&mut levels, &mut allocs, is_long);
+            return (levels, allocs);
         } else if count == 1 {
             let solo_w = defense_wells[0];
             if solo_w.strength < cfg.min_reliable_defense_strength {
@@ -605,37 +618,38 @@ impl RiskManager {
             allocs[1] = 0.3;
             levels[2] = last_price + dir_sign * (step * 2.0 + offset_abs);
             allocs[2] = 0.2;
-        } else {
-            let total_strength: f64 = targets[..count]
-                .iter()
-                .map(|w| w.strength.clamp(0.2, 3.0))
-                .sum();
-            for i in 0..count {
-                let w = targets[i];
-                let strength_factor = 1.0 / (w.strength.clamp(0.5, 3.0).sqrt());
-                let dynamic_offset_pct = (base_offset_pct + atr_pct * 0.3) * strength_factor;
-                if i == 0 {
-                    used_offset_pct = dynamic_offset_pct;
-                }
-                let offset_abs = last_price * dynamic_offset_pct;
-                levels[i] = w.level + dir_sign * offset_abs;
-                allocs[i] = w.strength.clamp(0.2, 3.0) / total_strength;
+            sort_entry_levels(&mut levels, &mut allocs, is_long);
+            return (levels, allocs, used_offset_pct);
+        }
+
+        let total_strength: f64 = targets[..count]
+            .iter()
+            .map(|w| w.strength.clamp(0.2, 3.0))
+            .sum();
+        for i in 0..count {
+            let w = targets[i];
+            let strength_factor = 1.0 / (w.strength.clamp(0.5, 3.0).sqrt());
+            let dynamic_offset_pct = (base_offset_pct + atr_pct * 0.3) * strength_factor;
+            if i == 0 {
+                used_offset_pct = dynamic_offset_pct;
             }
-            if count < 3 {
-                let last_level = levels[count - 1];
-                let step = atr_v * 0.5;
-                for i in count..3 {
-                    let dynamic_offset_pct = base_offset_pct + atr_pct * 0.5;
-                    let offset_abs = last_price * dynamic_offset_pct;
-                    levels[i] =
-                        last_level + dir_sign * (step * (i - count + 1) as f64 + offset_abs);
-                    allocs[i] = 0.1;
-                }
-                let sum: f64 = allocs.iter().sum();
-                if sum > 0.0 {
-                    for a in &mut allocs {
-                        *a /= sum;
-                    }
+            let offset_abs = last_price * dynamic_offset_pct;
+            levels[i] = w.level + dir_sign * offset_abs;
+            allocs[i] = w.strength.clamp(0.2, 3.0) / total_strength;
+        }
+        if count < 3 {
+            let last_level = levels[count - 1];
+            let step = atr_v * 0.5;
+            for i in count..3 {
+                let dynamic_offset_pct = base_offset_pct + atr_pct * 0.5;
+                let offset_abs = last_price * dynamic_offset_pct;
+                levels[i] = last_level + dir_sign * (step * (i - count + 1) as f64 + offset_abs);
+                allocs[i] = 0.1;
+            }
+            let sum: f64 = allocs.iter().sum();
+            if sum > 0.0 {
+                for a in &mut allocs {
+                    *a /= sum;
                 }
             }
             tags.push(format!("ENTRY_STOP_DYN_OFFSET:{:.4}", used_offset_pct));
@@ -653,7 +667,6 @@ impl RiskManager {
         (levels, allocs, used_offset_pct)
     }
 
-    // ---------- 新交易结构（2级） ----------
     fn calculate_trade_structure(
         &self,
         wells: &[PriceGravityWell],
@@ -662,6 +675,7 @@ impl RiskManager {
         average_atr: f64,
         is_long: bool,
         is_tsunami: bool,
+        vol_p: f64,
         tags: &mut Vec<String>,
     ) -> (Vec<f64>, Vec<f64>, [f64; 2]) {
         let dir_sign = if is_long { 1.0 } else { -1.0 };
@@ -705,11 +719,12 @@ impl RiskManager {
             .unwrap_or_else(|| last_price * (1.0 - dir_sign * 0.015));
         let min_sl_dist = last_price * self.min_stop_dist_pct;
 
-        // 只取前 2 个 ATR 缓冲
         let mut sl_buffers: Vec<f64> = cfg.atr_sl_buffers.iter().take(2).copied().collect();
         while sl_buffers.len() < 2 {
             sl_buffers.push(1.0);
         }
+        let sl_scale = dynamic_atr_sl_scale(vol_p);
+        sl_buffers.iter_mut().for_each(|b| *b *= sl_scale);
 
         let mut sl_levels: Vec<f64> = sl_buffers
             .iter()
@@ -725,12 +740,11 @@ impl RiskManager {
             })
             .collect();
 
-        // 止盈目标 1
         let tp1 = targets
             .first()
             .map(|w| w.level)
             .unwrap_or_else(|| last_price * (1.0 + dir_sign * 0.015));
-        // 止盈目标 2
+
         let tp2 = if is_tsunami {
             let base_atr = average_atr.max(atr_v);
             let atr_target = last_price + dir_sign * base_atr * cfg.tsunami_tp3_atr_mult;
@@ -755,13 +769,21 @@ impl RiskManager {
         let mut tp_levels = [tp1, tp2];
         let mut allocation = if is_tsunami {
             let ta = &cfg.tsunami_allocation;
-            // 假设 tsunami_allocation 至少有两个元素
-            [ta[0], ta[1]]
+            if ta.len() >= 2 {
+                [ta[0], ta[1]]
+            } else {
+                [0.6, 0.4]
+            }
         } else {
             self.dynamic_allocation(&targets, last_price, tags)
         };
 
-        sort_trade_levels_2(&mut tp_levels, &mut sl_levels, &mut allocation, is_long);
+        sort_trade_levels_by_sl_distance(
+            &mut tp_levels,
+            &mut sl_levels,
+            &mut allocation,
+            last_price,
+        );
 
         (sl_levels, tp_levels.to_vec(), allocation)
     }
@@ -857,18 +879,15 @@ impl RiskManager {
         is_tsunami: bool,
         max_loss_pct: Option<f64>,
         leverage: f64,
+        regime: TrendStructure,
         tags: &mut Vec<String>,
     ) -> Option<(f64, f64, f64, bool)> {
         let cfg = &self.config.risk;
         let base =
             (def_strength / cfg.max_strength_cap).clamp(cfg.min_base_size, cfg.base_size_max);
-        let vol_adj = match vol_p {
-            v if v > 80.0 => 0.7,
-            v if v > 60.0 => 0.85,
-            v if v < 20.0 => 1.15,
-            _ => 1.0,
-        };
-        let mut size = base * vol_adj * conf_mult;
+        let vol_adj = dynamic_vol_position_adj(vol_p);
+        let regime_adj = dynamic_regime_position_adj(regime);
+        let mut size = base * vol_adj * regime_adj * conf_mult;
         if is_tsunami {
             size *= 1.2;
             tags.push("TSUNAMI_MODE".into());
@@ -911,22 +930,29 @@ impl RiskManager {
     }
 }
 
-// ==================== 排序辅助函数 ====================
-
-fn sort_trade_levels_2(tp: &mut [f64; 2], sl: &mut Vec<f64>, alloc: &mut [f64; 2], is_long: bool) {
+fn sort_trade_levels_by_sl_distance(
+    tp: &mut [f64; 2],
+    sl: &mut Vec<f64>,
+    alloc: &mut [f64; 2],
+    last_price: f64,
+) {
     if sl.len() < 2 {
         return;
     }
-    let mut orders: Vec<(f64, f64, f64)> = (0..2).map(|i| (tp[i], sl[i], alloc[i])).collect();
-    if is_long {
-        orders.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    } else {
-        orders.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    }
+    let mut combined: Vec<(f64, f64, f64)> = (0..2).map(|i| (tp[i], sl[i], alloc[i])).collect();
+
+    combined.sort_by(|a, b| {
+        let dist_a = (last_price - a.1).abs();
+        let dist_b = (last_price - b.1).abs();
+        dist_a
+            .partial_cmp(&dist_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     for i in 0..2 {
-        tp[i] = orders[i].0;
-        sl[i] = orders[i].1;
-        alloc[i] = orders[i].2;
+        tp[i] = combined[i].0;
+        sl[i] = combined[i].1;
+        alloc[i] = combined[i].2;
     }
 }
 
@@ -945,4 +971,113 @@ fn sort_entry_levels(levels: &mut [f64; 3], allocs: &mut [f64; 3], is_long: bool
         levels[i] = l;
         allocs[i] = a;
     }
+}
+
+fn dynamic_funding_threshold(vol_p: f64, base_threshold: f64) -> f64 {
+    let vol_factor = if vol_p > 70.0 {
+        1.6
+    } else if vol_p > 50.0 {
+        1.3
+    } else if vol_p < 25.0 {
+        0.7
+    } else {
+        1.0
+    };
+    (base_threshold * vol_factor).max(0.0005)
+}
+
+fn dynamic_min_weighted_rr(vol_p: f64, regime: TrendStructure, base_rr: f64) -> f64 {
+    let vol_factor = if vol_p > 70.0 {
+        1.3
+    } else if vol_p < 25.0 {
+        0.85
+    } else {
+        1.0
+    };
+    let regime_factor = match regime {
+        TrendStructure::StrongBullish | TrendStructure::StrongBearish => 0.9,
+        TrendStructure::Range => 1.1,
+        _ => 1.0,
+    };
+    (base_rr * vol_factor * regime_factor).max(1.0)
+}
+
+fn dynamic_confidence_prior(vol_p: f64, regime: TrendStructure, base_prior: f64) -> f64 {
+    let vol_factor = if vol_p > 70.0 {
+        0.8
+    } else if vol_p < 25.0 {
+        1.1
+    } else {
+        1.0
+    };
+    let regime_factor = match regime {
+        TrendStructure::StrongBullish | TrendStructure::StrongBearish => 1.1,
+        TrendStructure::Range => 0.9,
+        _ => 1.0,
+    };
+    (base_prior * vol_factor * regime_factor).clamp(0.3, 0.7)
+}
+
+fn dynamic_confidence_range(vol_p: f64, regime: TrendStructure) -> (f64, f64) {
+    let (min_base, max_base): (f64, f64) = if vol_p > 70.0 {
+        (0.3_f64, 1.4_f64)
+    } else if vol_p < 25.0 {
+        (0.5_f64, 1.8_f64)
+    } else {
+        (0.4_f64, 1.6_f64)
+    };
+
+    let (regime_mult_min, regime_mult_max): (f64, f64) = match regime {
+        TrendStructure::StrongBullish | TrendStructure::StrongBearish => (1.1_f64, 1.1_f64),
+        TrendStructure::Range => (0.9_f64, 0.9_f64),
+        _ => (1.0_f64, 1.0_f64),
+    };
+
+    let min = (min_base * regime_mult_min).max(0.2_f64);
+    let max = (max_base * regime_mult_max).min(2.0_f64);
+
+    (min, max)
+}
+
+fn dynamic_atr_sl_scale(vol_p: f64) -> f64 {
+    if vol_p > 70.0 {
+        1.4
+    } else if vol_p < 25.0 {
+        0.8
+    } else {
+        1.0
+    }
+}
+
+fn dynamic_vol_position_adj(vol_p: f64) -> f64 {
+    if vol_p > 80.0 {
+        0.7
+    } else if vol_p > 60.0 {
+        0.85
+    } else if vol_p < 20.0 {
+        1.15
+    } else {
+        1.0
+    }
+}
+
+fn dynamic_regime_position_adj(regime: TrendStructure) -> f64 {
+    match regime {
+        TrendStructure::StrongBullish | TrendStructure::StrongBearish => 1.1,
+        TrendStructure::Range => 0.9,
+        _ => 1.0,
+    }
+}
+
+fn dynamic_max_loss_pct(vol_p: f64, base_max_loss: Option<f64>) -> Option<f64> {
+    base_max_loss.map(|v| {
+        let factor = if vol_p > 70.0 {
+            0.8
+        } else if vol_p < 25.0 {
+            1.2
+        } else {
+            1.0
+        };
+        v * factor
+    })
 }
