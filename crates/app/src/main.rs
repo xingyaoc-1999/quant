@@ -15,6 +15,7 @@ use common::{
     Symbol,
 };
 use notify::telegram::BotApp;
+use quant::position::Position; // 新增
 use quant::risk_manager::RiskAssessment;
 use quant::{analyzer::ConfigurableAnalyzer, config::SignalStabilityConfig};
 use quant::{
@@ -69,14 +70,14 @@ async fn main() -> Result<()> {
     let engine = Arc::new(AnalysisEngine::new(Config::default(), analyzers));
     let config_arc = Arc::new(analyzer_config.clone());
 
-    let assessment_cache: Arc<TokioMutex<HashMap<Symbol, RiskAssessment>>> =
-        Arc::new(TokioMutex::new(HashMap::new()));
+    // 共享持仓容器（所有开仓由外部管理，分析服务仅更新动态止盈止损）
+    let open_positions = Arc::new(TokioMutex::new(HashMap::<Symbol, Position>::new()));
 
     let analysis_service = Arc::new(AnalysisService::new(
         engine.clone(),
         ctx_manager.clone(),
         analyzer_config.clone(),
-        assessment_cache.clone(),
+        open_positions.clone(),
     ));
 
     let integrity = Arc::new(DataIntegrityManager::new(
@@ -112,6 +113,7 @@ async fn main() -> Result<()> {
         })
     });
 
+    // 注意：BotApp::new 已不再需要 assessment_cache 参数
     let bot = BotApp::new(
         config.telegram.token.clone(),
         proxy_pool.clone(),
@@ -120,7 +122,6 @@ async fn main() -> Result<()> {
         ctx_manager.clone(),
         config_arc.clone(),
         execute_order,
-        assessment_cache.clone(),
     )
     .await?;
 
@@ -142,35 +143,9 @@ async fn main() -> Result<()> {
         info!("Analysis notification worker stopped");
     });
 
-    // AI Agent 初始化
-    let model = Model::openai(
-        "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",
-        "https://openrouter.ai/api/v1",
-        "openai/gpt-5.4",
-    )?;
-
-    let score_tool = ScoreQueryTool::new(ctx_manager.clone(), engine.clone());
-    let tool_set = ToolSet::builder().static_tool(score_tool).build();
-
-    // let agent_args = TechnicalAgentArgs {
-    //     model,
-    //     tx_out: tg_tx.clone(),
-    //     tool_set,
-    // };
-    // let (agent_actor, _handle) = Actor::spawn(
-    //     Some("TechnicalAgent".to_string()),
-    //     TechnicalAgent,
-    //     agent_args,
-    // )
-    // .await?;
-    // info!("AI Agent started");
-
-    // tokio::spawn(async move {
-    //     while let Some((cmd, chat_id)) = cmd_rx.recv().await {
-    //         info!("Received command: {} from {}", cmd, chat_id);
-    //         let _ = cast!(agent_actor, TechnicalAgentMessage::Task(cmd, chat_id));
-    //     }
-    // });
+    // AI Agent 初始化（暂时注释）
+    // let model = Model::openai(...)?;
+    // ...
 
     info!("System ready, waiting for Ctrl+C...");
     tokio::signal::ctrl_c().await?;

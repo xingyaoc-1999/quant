@@ -28,7 +28,6 @@ pub use resonance::ResonanceAnalyzer;
 pub use volatility::VolatilityEnvironmentAnalyzer;
 pub use volume::VolumeStructureAnalyzer;
 
-// ==================== ContextKey ====================
 #[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Clone, Copy)]
 pub enum ContextKey {
     VolAtrRatio,
@@ -49,7 +48,6 @@ pub enum ContextKey {
     FakeoutState,
 }
 
-// ==================== AnalyzerKind ====================
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 pub enum AnalyzerKind {
     Resonance,
@@ -60,7 +58,6 @@ pub enum AnalyzerKind {
     Fakeout,
 }
 
-// ==================== AnalysisResult ====================
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AnalysisResult<Extra = ()> {
     pub kind: AnalyzerKind,
@@ -140,7 +137,6 @@ pub trait Analyzer: Send + Sync {
     ) -> Result<AnalysisResult<Self::Extra>, AnalysisError>;
 }
 
-// ==================== AnalyzerWrapper ====================
 pub trait AnalyzerWrapper: Send + Sync {
     fn analyze_erased(
         &self,
@@ -180,7 +176,6 @@ impl<T: Analyzer> AnalyzerWrapper for T {
     }
 }
 
-// ==================== MarketContext ====================
 #[derive(Debug)]
 pub struct MarketContext {
     pub symbol: Symbol,
@@ -218,13 +213,11 @@ impl MarketContext {
     }
 }
 
-// ==================== ConfigurableAnalyzer ====================
 pub trait ConfigurableAnalyzer: Analyzer {
     fn with_config(config: AnalyzerConfig) -> Self;
     fn config(&self) -> &AnalyzerConfig;
 }
 
-// ==================== Config ====================
 #[derive(Debug, Clone)]
 pub struct Config {
     pub weights: HashMap<AnalyzerKind, f64>,
@@ -252,7 +245,6 @@ impl Default for Config {
     }
 }
 
-// ==================== FinalSignal ====================
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct FinalSignal {
     pub symbol: Symbol,
@@ -310,7 +302,6 @@ impl FinalSignal {
     }
 }
 
-// ==================== AnalysisError ====================
 #[derive(Debug, thiserror::Error)]
 pub enum AnalysisError {
     #[error("Missing data for role {0:?}")]
@@ -319,7 +310,6 @@ pub enum AnalysisError {
     Calculation(String),
 }
 
-// ==================== AnalysisEngine ====================
 pub struct AnalysisEngine {
     pub analyzers: Vec<Box<dyn AnalyzerWrapper>>,
     pub config: Config,
@@ -348,7 +338,6 @@ impl AnalysisEngine {
     }
 
     fn aggregate(&self, ctx: &MarketContext, results: Vec<ErasedAnalysisResult>) -> FinalSignal {
-        // 违规直接拒绝
         if results.iter().any(|r| r.is_violation) {
             return FinalSignal::rejected_with_reports(ctx.symbol, results);
         }
@@ -423,7 +412,6 @@ impl AnalysisEngine {
     }
     fn normalize_to_standard_range(&self, score: f64) -> f64 {
         let normalized = (score * self.config.sensitivity).tanh();
-        // 映射到 [-100, 100] 并保留一位小数
         (normalized * 1000.0).round() / 10.0
     }
 }

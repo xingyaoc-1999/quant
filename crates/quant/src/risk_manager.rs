@@ -30,15 +30,11 @@ pub struct RiskAssessment {
 
 pub struct RiskManager {
     config: AnalyzerConfig,
-    min_stop_dist_pct: f64,
 }
 
 impl RiskManager {
     pub fn new(config: AnalyzerConfig) -> Self {
-        Self {
-            config,
-            min_stop_dist_pct: 0.0005,
-        }
+        Self { config }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -67,6 +63,13 @@ impl RiskManager {
             if cfg.enable_funding_rate {
                 let threshold = dynamic_funding_threshold(vol_p, cfg.funding_rate_threshold);
                 if (is_long && rate > threshold) || (!is_long && rate < -threshold) {
+                    tracing::warn!(
+                        "Risk reject: dir={:?} price={:.2} reason=funding_rate rate={:.4} threshold={:.4}",
+                        dir,
+                        last_price,
+                        rate,
+                        threshold
+                    );
                     return None;
                 }
             }
@@ -102,6 +105,13 @@ impl RiskManager {
         let (wrr, rr_levels) = self.calculate_weighted_rr(last_price, &sl, &tp, &alloc);
         let min_wrr = dynamic_min_weighted_rr(vol_p, regime, self.config.risk.min_weighted_rr);
         if wrr < min_wrr {
+            tracing::warn!(
+                "Risk reject: dir={:?} price={:.2} reason=wrr_too_low wrr={:.2} min={:.2}",
+                dir,
+                last_price,
+                wrr,
+                min_wrr
+            );
             return None;
         }
 
@@ -667,7 +677,7 @@ impl RiskManager {
         (levels, allocs, used_offset_pct)
     }
 
-    fn calculate_trade_structure(
+    pub fn calculate_trade_structure(
         &self,
         wells: &[PriceGravityWell],
         last_price: f64,
@@ -717,7 +727,7 @@ impl RiskManager {
         let base_def = defense
             .map(|w| w.level)
             .unwrap_or_else(|| last_price * (1.0 - dir_sign * 0.015));
-        let min_sl_dist = last_price * self.min_stop_dist_pct;
+        let min_sl_dist = last_price * self.config.risk.min_stop_dist_pct;
 
         let mut sl_buffers: Vec<f64> = cfg.atr_sl_buffers.iter().take(2).copied().collect();
         while sl_buffers.len() < 2 {
@@ -830,7 +840,7 @@ impl RiskManager {
         if sl.len() < 2 || tp.len() < 2 {
             return (0.0, [0.0; 2]);
         }
-        let min_dist = price * self.min_stop_dist_pct;
+        let min_dist = price * self.config.risk.min_stop_dist_pct;
         let risks: Vec<f64> = sl
             .iter()
             .take(2)
@@ -918,6 +928,13 @@ impl RiskManager {
 
         if let Some(max_l) = max_loss_pct {
             if final_total_loss > max_l {
+                tracing::warn!(
+                    "Risk reject: price={:.2} sl={:.2} reason=max_loss_exceeded final_loss={:.2}% max_loss={:.2}%",
+                    last_price,
+                    sl_level,
+                    final_total_loss * 100.0,
+                    max_l * 100.0
+                );
                 tags.push(format!(
                     "FINAL_LOSS_VIOLATED:{:.2}% (cannot reduce further)",
                     final_total_loss * 100.0

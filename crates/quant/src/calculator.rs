@@ -197,7 +197,6 @@ impl FeatureCalculator {
 
         let is_warmed = self.count >= self.config.warmup_period;
 
-        // 2. 波动率与百分位
         let bb_w = if bb_v.average.abs() > f64::EPSILON {
             (bb_v.upper - bb_v.lower) / bb_v.average
         } else {

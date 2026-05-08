@@ -45,7 +45,6 @@ pub struct BotApp {
     engine: Arc<AnalysisEngine>,
     ctx_manager: Arc<FeatureContextManager>,
     config: Arc<AnalyzerConfig>,
-    assessment_cache: Arc<TokioMutex<HashMap<Symbol, RiskAssessment>>>,
     execute_order: Arc<
         dyn Fn(
                 &RiskAssessment,
@@ -72,7 +71,6 @@ impl BotApp {
                 + Send
                 + Sync,
         >,
-        assessment_cache: Arc<TokioMutex<HashMap<Symbol, RiskAssessment>>>,
     ) -> Result<Self> {
         Ok(Self {
             proxy_pool,
@@ -83,7 +81,6 @@ impl BotApp {
             ctx_manager,
             config,
             execute_order,
-            assessment_cache,
         })
     }
 
@@ -153,7 +150,6 @@ impl BotApp {
                 ctx_manager: Arc::clone(&app.ctx_manager),
                 config: Arc::clone(&app.config),
                 execute_order: Arc::clone(&app.execute_order),
-                assessment_cache: Arc::clone(&app.assessment_cache),
             };
 
             let storage_for_cmd = Arc::clone(&app.storage);

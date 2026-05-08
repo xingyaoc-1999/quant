@@ -183,6 +183,7 @@ impl FeatureContextManager {
             signal_config,
         }
     }
+
     pub fn get_status_info(
         &self,
     ) -> Vec<(
@@ -218,6 +219,7 @@ impl FeatureContextManager {
             })
             .collect()
     }
+
     #[inline]
     fn get_global_btc(&self) -> Option<f64> {
         let val = f64::from_bits(self.global_btc_price.load(Ordering::Relaxed));
@@ -408,6 +410,7 @@ impl FeatureContextManager {
             lock.timestamp = ts;
         }
     }
+
     pub fn update_funding_rate(&self, symbol: Symbol, rate: f64) {
         if let Some(ctx) = self.symbol_contexts.get(&symbol) {
             let mut snap = ctx.latest_snap.write().expect("Lock poisoned");
@@ -444,7 +447,7 @@ impl FeatureContextManager {
 
         if state.latch_remaining > 0 {
             state.latch_remaining -= 1;
-            return state.last_direction;
+            return None;
         }
 
         match (state.last_direction, raw_direction) {

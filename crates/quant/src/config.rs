@@ -507,8 +507,9 @@ pub struct RiskConfig {
     pub min_weighted_rr: f64,
     pub entry_strategy: EntryStrategy,
     pub stop_entry_offset_pct: f64,
-    pub tsunami_tp3_atr_mult: f64,          // 默认 5.0
-    pub min_reliable_defense_strength: f64, // 默认 0.3
+    pub tsunami_tp3_atr_mult: f64,
+    pub min_reliable_defense_strength: f64,
+    pub min_stop_dist_pct: f64,
 }
 
 impl Default for RiskConfig {
@@ -519,11 +520,11 @@ impl Default for RiskConfig {
             atr_sl_buffers: [0.8, 1.5, 2.2],
             min_sl_atr_mult: 0.5,
             max_strength_cap: 3.5,
-            base_size_max: 0.8,
-            min_base_size: 0.15,
+            base_size_max: 0.5,
+            min_base_size: 0.1,
             confidence_prior: 0.5,
             min_position_size: 0.05,
-            max_position_size: 0.8,
+            max_position_size: 0.5,
             mult_min: 0.4,
             mult_max: 1.6,
             tsunami_allocation: [0.2, 0.3, 0.5],
@@ -536,15 +537,16 @@ impl Default for RiskConfig {
             enable_funding_rate: true,
             funding_rate_threshold: 0.001,
             funding_rate_penalty: 0.7,
-            max_loss_per_trade: 0.08,
+            max_loss_per_trade: 0.05,
             entry_atr_step_mult: 0.5,
             default_entry_allocations: [0.5, 0.3, 0.2],
-            direction_base_threshold: 10.0,
-            min_weighted_rr: 1.2,
+            direction_base_threshold: 15.0,
+            min_weighted_rr: 1.5,
             entry_strategy: EntryStrategy::default(),
             stop_entry_offset_pct: 0.001,
             tsunami_tp3_atr_mult: 5.0,
             min_reliable_defense_strength: 0.3,
+            min_stop_dist_pct: 0.0005,
         }
     }
 }
@@ -558,8 +560,8 @@ pub struct SignalStabilityConfig {
 impl Default for SignalStabilityConfig {
     fn default() -> Self {
         Self {
-            confirm_bars: 2,
-            latch_bars: 3,
+            confirm_bars: 3,
+            latch_bars: 8,
         }
     }
 }

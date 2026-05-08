@@ -21,7 +21,6 @@ pub struct CallbackDeps {
     pub engine: Arc<AnalysisEngine>,
     pub ctx_manager: Arc<FeatureContextManager>,
     pub config: Arc<AnalyzerConfig>,
-    pub assessment_cache: Arc<TokioMutex<HashMap<Symbol, RiskAssessment>>>,
     pub execute_order: Arc<
         dyn Fn(
                 &RiskAssessment,
