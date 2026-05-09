@@ -23,12 +23,19 @@ pub enum Symbol {
     BNBUSDT,
     SOLUSDT,
     XRPUSDT,
+    DOGEUSDT,
+    ADAUSDT,
+    LINKUSDT,
+    SUIUSDT,
+    DOTUSDT,
+    AVAXUSDT,
 }
 
 impl Symbol {
     pub fn is_btc(&self) -> bool {
         matches!(self, Symbol::BTCUSDT)
     }
+
     pub fn all() -> Vec<Self> {
         let symbols = &[
             Self::BTCUSDT,
@@ -36,6 +43,12 @@ impl Symbol {
             Self::BNBUSDT,
             Self::SOLUSDT,
             Self::XRPUSDT,
+            Self::DOGEUSDT,
+            Self::ADAUSDT,
+            Self::LINKUSDT,
+            Self::SUIUSDT,
+            Self::DOTUSDT,
+            Self::AVAXUSDT,
         ];
         symbols.to_vec()
     }
@@ -47,6 +60,12 @@ impl Symbol {
             Symbol::BNBUSDT => "BNBUSDT",
             Symbol::SOLUSDT => "SOLUSDT",
             Symbol::XRPUSDT => "XRPUSDT",
+            Symbol::DOGEUSDT => "DOGEUSDT",
+            Symbol::ADAUSDT => "ADAUSDT",
+            Symbol::LINKUSDT => "LINKUSDT",
+            Symbol::SUIUSDT => "SUIUSDT",
+            Symbol::DOTUSDT => "DOTUSDT",
+            Symbol::AVAXUSDT => "AVAXUSDT",
         }
     }
 }
@@ -61,16 +80,22 @@ impl FromStr for Symbol {
             "BNBUSDT" | "BNB" => Ok(Symbol::BNBUSDT),
             "SOLUSDT" | "SOL" => Ok(Symbol::SOLUSDT),
             "XRPUSDT" | "XRP" => Ok(Symbol::XRPUSDT),
+            "DOGEUSDT" | "DOGE" => Ok(Symbol::DOGEUSDT),
+            "ADAUSDT" | "ADA" => Ok(Symbol::ADAUSDT),
+            "LINKUSDT" | "LINK" => Ok(Symbol::LINKUSDT),
+            "SUIUSDT" | "SUI" => Ok(Symbol::SUIUSDT),
+            "DOTUSDT" | "DOT" => Ok(Symbol::DOTUSDT),
+            "AVAXUSDT" | "AVAX" => Ok(Symbol::AVAXUSDT),
             _ => Err(format!("Unsupported symbol: {}", s)),
         }
     }
 }
+
 impl fmt::Display for Symbol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
-
 #[derive(Debug, Clone, Deserialize, Serialize, Copy)]
 
 pub struct Candle {
