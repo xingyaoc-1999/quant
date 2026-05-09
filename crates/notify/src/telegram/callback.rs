@@ -1,5 +1,4 @@
 use crate::telegram::menu::build_keyboard_for_user;
-use crate::telegram::TokioMutex;
 use anyhow::Result;
 use common::Symbol;
 use quant::analyzer::AnalysisEngine;

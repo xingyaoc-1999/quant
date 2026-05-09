@@ -145,12 +145,10 @@ impl AnalysisService {
                     assessment,
                     timestamp: ctx.global.timestamp,
                 });
-                // 缓存完整 Audit
                 self.audit_cache.lock().await.insert(symbol, audit);
             }
         }
 
-        // 更新已有持仓的动态止盈止损（无论是否有新信号）
         self.update_open_positions(symbol, &ctx).await;
     }
 
@@ -167,6 +165,12 @@ impl AnalysisService {
             .copied()
             .unwrap_or(0.005);
         let atr = atr_ratio * last_price;
+        let average_atr = ctx
+            .get_role(Role::Filter)
+            .or_else(|_| ctx.get_role(Role::Trend))
+            .ok()
+            .and_then(|r| r.feature_set.indicators.atr_median_20)
+            .unwrap_or(atr);
         let wells = ctx
             .get_cached::<Vec<PriceGravityWell>>(ContextKey::SpaceGravityWells)
             .cloned()
@@ -179,9 +183,7 @@ impl AnalysisService {
             .get_cached::<bool>(ContextKey::IsMomentumTsunami)
             .copied()
             .unwrap_or(false);
-        let average_atr = atr; // 简化，未来可替换为历史ATR中位值
 
-        // 初始化移动止损（首次）
         if pos.trailing_stop.is_none() {
             pos.trailing_stop = Some(TrailingStop::new(
                 pos.direction,
