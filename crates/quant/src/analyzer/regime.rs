@@ -188,7 +188,6 @@ impl Analyzer for MarketRegimeAnalyzer {
             TrendStructure::StrongBearish | TrendStructure::Bearish
         );
 
-        // 动态海啸OI阈值
         let base_tsunami_oi = cfg.tsunami_base_oi_delta();
         let tsunami_oi_threshold = dynamic_tsunami_oi_threshold(vol_p, base_tsunami_oi);
 
