@@ -1,9 +1,11 @@
 pub mod analyzer;
+pub mod audit;
 pub mod calculator;
 pub mod config;
 pub mod position;
 pub mod report;
 pub mod risk_manager;
+pub mod stats;
 pub mod trailing;
 pub mod types;
 pub mod utils;

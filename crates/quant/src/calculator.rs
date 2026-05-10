@@ -185,7 +185,6 @@ impl FeatureCalculator {
     ) -> FeatureSet {
         self.count += 1;
 
-        // 1. 基础指标
         let rsi_v = self.rsi.next(candle.close);
         let m20_v = self.ma20.next(candle.close);
         let m50_v = self.ma50.next(candle.close);
@@ -214,7 +213,6 @@ impl FeatureCalculator {
             50.0
         };
 
-        // 3. 极值状态机与磨损计算
         let mut dist_res = None;
         let mut dist_sup = None;
 
@@ -223,7 +221,6 @@ impl FeatureCalculator {
             let window_sup = self.recent_lows.iter().copied().fold(f64::MAX, f64::min);
             let hit_margin = atr_v.max(candle.close * 0.0015);
 
-            // 阻力位
             if window_res > self.current_res.unwrap_or(0.0) + f64::EPSILON {
                 self.current_res = Some(window_res);
                 self.res_hit_count = 1;
@@ -317,7 +314,6 @@ impl FeatureCalculator {
             VolumeState::Normal
         };
 
-        // ========== 新增：提取最近3根收盘价 ==========
         let mut rec_closes = [candle.close; 3];
         let len = self.recent_closes.len();
         if len >= 1 {
@@ -476,12 +472,12 @@ impl FeatureCalculator {
     }
 
     fn check_macd_divergence(&self, cur_p: f64, cur_h: f64) -> Option<DivergenceType> {
-        if self.recent_lows.len() < self.config.struct_window {
+        if self.recent_closes.len() < self.config.struct_window {
             return None;
         }
 
-        let (min_idx, min_p) =
-            self.recent_lows
+        let (min_idx, min_close) =
+            self.recent_closes
                 .iter()
                 .enumerate()
                 .fold(
@@ -489,8 +485,8 @@ impl FeatureCalculator {
                     |acc, (i, &p)| if p < acc.1 { (i, p) } else { acc },
                 );
 
-        let (max_idx, max_p) =
-            self.recent_highs
+        let (max_idx, max_close) =
+            self.recent_closes
                 .iter()
                 .enumerate()
                 .fold(
@@ -501,15 +497,14 @@ impl FeatureCalculator {
         let h_at_min = self.recent_macd_hists.get(min_idx).copied().unwrap_or(0.0);
         let h_at_max = self.recent_macd_hists.get(max_idx).copied().unwrap_or(0.0);
 
-        if cur_p < min_p && cur_h > h_at_min {
+        if cur_p < min_close && cur_h > h_at_min {
             return Some(DivergenceType::Bullish);
         }
-        if cur_p > max_p && cur_h < h_at_max {
+        if cur_p > max_close && cur_h < h_at_max {
             return Some(DivergenceType::Bearish);
         }
         None
     }
-
     fn is_volume_shrinking(&self) -> bool {
         self.volume_history[0].is_some()
             && self.volume_history[1].is_some()
@@ -563,7 +558,12 @@ impl FeatureCalculator {
             return None;
         }
 
-        if self.count >= 200 {
+        // 强趋势判定需要所有均线均已有效（指标 is_some 即可）
+        let m20_valid = self.count >= 20;
+        let m50_valid = self.count >= 50;
+        let m200_valid = self.count >= 200;
+
+        if m200_valid && m50_valid && m20_valid {
             if close > m20 && m20 > m50 && m50 > m200 {
                 return Some(TrendStructure::StrongBullish);
             }
@@ -572,12 +572,16 @@ impl FeatureCalculator {
             }
         }
 
-        if close > m20 && m20 > m50 {
-            Some(TrendStructure::Bullish)
-        } else if close < m20 && m20 < m50 {
-            Some(TrendStructure::Bearish)
+        if m20_valid && m50_valid {
+            if close > m20 && m20 > m50 {
+                Some(TrendStructure::Bullish)
+            } else if close < m20 && m20 < m50 {
+                Some(TrendStructure::Bearish)
+            } else {
+                Some(TrendStructure::Range)
+            }
         } else {
-            Some(TrendStructure::Range)
+            None
         }
     }
 

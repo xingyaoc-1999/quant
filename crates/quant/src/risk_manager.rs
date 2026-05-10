@@ -9,6 +9,7 @@ pub struct RiskAssessment {
     pub direction: TradeDirection,
     pub position_size_pct: f64,
     pub stop_loss_levels: Vec<f64>,
+    pub stop_loss_allocations: Vec<f64>,
     pub take_profit_levels: Vec<f64>,
     pub weighted_rr: f64,
     pub rr_levels: [f64; 2],
@@ -54,6 +55,7 @@ impl RiskManager {
         max_loss_pct: Option<f64>,
         funding_rate: Option<f64>,
         leverage: f64,
+        reject_reason: &mut Option<String>,
     ) -> Option<RiskAssessment> {
         let dir = direction?;
         let is_long = dir == TradeDirection::Long;
@@ -63,13 +65,7 @@ impl RiskManager {
             if cfg.enable_funding_rate {
                 let threshold = dynamic_funding_threshold(vol_p, cfg.funding_rate_threshold);
                 if (is_long && rate > threshold) || (!is_long && rate < -threshold) {
-                    tracing::warn!(
-                        "Risk reject: dir={:?} price={:.2} reason=funding_rate rate={:.4} threshold={:.4}",
-                        dir,
-                        last_price,
-                        rate,
-                        threshold
-                    );
+                    *reject_reason = Some(format!("funding_rate {:.4} > {:.4}", rate, threshold));
                     return None;
                 }
             }
@@ -91,7 +87,7 @@ impl RiskManager {
                 &mut tags,
             );
 
-        let (sl, tp, alloc) = self.calculate_trade_structure(
+        let (sl_levels, tp_levels, tp_alloc, sl_alloc) = self.calculate_trade_structure(
             wells,
             last_price,
             atr_v,
@@ -102,16 +98,11 @@ impl RiskManager {
             &mut tags,
         );
 
-        let (wrr, rr_levels) = self.calculate_weighted_rr(last_price, &sl, &tp, &alloc);
+        let (wrr, rr_levels) =
+            self.calculate_weighted_rr(last_price, &sl_levels, &sl_alloc, &tp_levels, &tp_alloc);
         let min_wrr = dynamic_min_weighted_rr(vol_p, regime, self.config.risk.min_weighted_rr);
         if wrr < min_wrr {
-            tracing::warn!(
-                "Risk reject: dir={:?} price={:.2} reason=wrr_too_low wrr={:.2} min={:.2}",
-                dir,
-                last_price,
-                wrr,
-                min_wrr
-            );
+            *reject_reason = Some(format!("wrr_too_low {:.2} < {:.2}", wrr, min_wrr));
             return None;
         }
 
@@ -146,22 +137,13 @@ impl RiskManager {
 
         let def_strength = self.get_defense_strength(wells, last_price, is_long);
 
-        let nearest_sl = sl
-            .iter()
-            .min_by(|a, b| {
-                (last_price - *a)
-                    .abs()
-                    .partial_cmp(&(last_price - *b).abs())
-                    .unwrap()
-            })
-            .copied()?;
-
         let dynamic_max_loss = dynamic_max_loss_pct(vol_p, max_loss_pct);
 
         let (size, total_loss, margin_loss, violated) = self.calculate_final_position(
             def_strength,
             last_price,
-            nearest_sl,
+            &sl_levels,
+            &sl_alloc,
             conf_mult,
             vol_p,
             is_tsunami,
@@ -169,19 +151,21 @@ impl RiskManager {
             leverage,
             regime,
             &mut tags,
+            reject_reason,
         )?;
 
         Some(RiskAssessment {
             direction: dir,
             position_size_pct: size,
-            stop_loss_levels: sl,
-            take_profit_levels: tp,
+            stop_loss_levels: sl_levels,
+            stop_loss_allocations: sl_alloc,
+            take_profit_levels: tp_levels,
             weighted_rr: wrr,
             rr_levels,
             confidence: posterior,
             confidence_mult: conf_mult,
             audit_tags: tags,
-            allocation: alloc,
+            allocation: tp_alloc,
             entry_strategy,
             stop_entry_offset_pct: used_offset_pct,
             is_tsunami,
@@ -687,7 +671,7 @@ impl RiskManager {
         is_tsunami: bool,
         vol_p: f64,
         tags: &mut Vec<String>,
-    ) -> (Vec<f64>, Vec<f64>, [f64; 2]) {
+    ) -> (Vec<f64>, Vec<f64>, [f64; 2], Vec<f64>) {
         let dir_sign = if is_long { 1.0 } else { -1.0 };
         let cfg = &self.config.risk;
 
@@ -708,7 +692,7 @@ impl RiskManager {
                 .total_cmp(&(b.level - last_price).abs())
         });
 
-        let defense = wells
+        let mut defenses: Vec<_> = wells
             .iter()
             .filter(|w| {
                 w.is_active
@@ -718,37 +702,61 @@ impl RiskManager {
                         w.level > last_price
                     }
             })
-            .min_by(|a, b| {
-                (a.level - last_price)
-                    .abs()
-                    .total_cmp(&(b.level - last_price).abs())
-            });
+            .collect();
+        defenses.sort_by(|a, b| {
+            (a.level - last_price)
+                .abs()
+                .total_cmp(&(b.level - last_price).abs())
+        });
 
-        let base_def = defense
+        let mut sl_levels = Vec::with_capacity(2);
+        let mut sl_alloc = Vec::with_capacity(2);
+        let min_sl_dist = last_price * cfg.min_stop_dist_pct;
+
+        let base_def = defenses
+            .first()
             .map(|w| w.level)
             .unwrap_or_else(|| last_price * (1.0 - dir_sign * 0.015));
-        let min_sl_dist = last_price * self.config.risk.min_stop_dist_pct;
 
-        let mut sl_buffers: Vec<f64> = cfg.atr_sl_buffers.iter().take(2).copied().collect();
-        while sl_buffers.len() < 2 {
-            sl_buffers.push(1.0);
-        }
         let sl_scale = dynamic_atr_sl_scale(vol_p);
-        sl_buffers.iter_mut().for_each(|b| *b *= sl_scale);
-
-        let mut sl_levels: Vec<f64> = sl_buffers
+        let mut buffers = cfg
+            .atr_sl_buffers
             .iter()
-            .map(|&buf| {
-                let raw = base_def - dir_sign * atr_v * buf;
-                if is_long {
-                    raw.min(last_price - atr_v * cfg.min_sl_atr_mult)
-                        .min(last_price - min_sl_dist)
-                } else {
-                    raw.max(last_price + atr_v * cfg.min_sl_atr_mult)
-                        .max(last_price + min_sl_dist)
-                }
-            })
-            .collect();
+            .take(2)
+            .copied()
+            .collect::<Vec<_>>();
+        while buffers.len() < 2 {
+            buffers.push(1.0);
+        }
+        buffers.iter_mut().for_each(|b| *b *= sl_scale);
+
+        for (i, &buf) in buffers.iter().enumerate() {
+            let raw = base_def - dir_sign * atr_v * buf;
+            let sl = if is_long {
+                raw.min(last_price - atr_v * cfg.min_sl_atr_mult)
+                    .min(last_price - min_sl_dist)
+            } else {
+                raw.max(last_price + atr_v * cfg.min_sl_atr_mult)
+                    .max(last_price + min_sl_dist)
+            };
+            sl_levels.push(sl);
+        }
+
+        let total_defense_strength: f64 = defenses.iter().take(2).map(|w| w.strength).sum();
+        if defenses.len() >= 2 && total_defense_strength > 0.0 {
+            for w in defenses.iter().take(2) {
+                let alloc = w.strength / total_defense_strength;
+                sl_alloc.push(alloc);
+            }
+        } else {
+            sl_alloc = vec![0.5, 0.5];
+        }
+        let sum_sl: f64 = sl_alloc.iter().sum();
+        if sum_sl > 0.0 {
+            sl_alloc.iter_mut().for_each(|a| *a /= sum_sl);
+        } else {
+            sl_alloc = vec![0.5, 0.5];
+        }
 
         let tp1 = targets
             .first()
@@ -777,7 +785,7 @@ impl RiskManager {
         };
 
         let mut tp_levels = [tp1, tp2];
-        let mut allocation = if is_tsunami {
+        let mut tp_alloc = if is_tsunami {
             let ta = &cfg.tsunami_allocation;
             if ta.len() >= 2 {
                 [ta[0], ta[1]]
@@ -788,14 +796,34 @@ impl RiskManager {
             self.dynamic_allocation(&targets, last_price, tags)
         };
 
-        sort_trade_levels_by_sl_distance(
-            &mut tp_levels,
-            &mut sl_levels,
-            &mut allocation,
-            last_price,
-        );
+        let n = sl_levels.len().min(2);
+        if n > 0 {
+            let mut sl_pairs: Vec<(f64, f64)> = sl_levels
+                .iter()
+                .take(n)
+                .zip(sl_alloc.iter().take(n))
+                .map(|(&l, &a)| (l, a))
+                .collect();
+            sl_pairs
+                .sort_by(|a, b| ((last_price - a.0).abs()).total_cmp(&(last_price - b.0).abs()));
+            for (i, (l, a)) in sl_pairs.into_iter().enumerate() {
+                sl_levels[i] = l;
+                sl_alloc[i] = a;
+            }
+        }
 
-        (sl_levels, tp_levels.to_vec(), allocation)
+        let mut tp_pairs: Vec<(f64, f64)> = tp_levels
+            .iter()
+            .zip(tp_alloc.iter())
+            .map(|(&l, &a)| (l, a))
+            .collect();
+        tp_pairs.sort_by(|a, b| ((last_price - a.0).abs()).total_cmp(&(last_price - b.0).abs()));
+        for (i, (l, a)) in tp_pairs.into_iter().enumerate() {
+            tp_levels[i] = l;
+            tp_alloc[i] = a;
+        }
+
+        (sl_levels, tp_levels.to_vec(), tp_alloc, sl_alloc)
     }
 
     fn dynamic_allocation(
@@ -834,22 +862,29 @@ impl RiskManager {
         &self,
         price: f64,
         sl: &[f64],
+        sl_alloc: &[f64],
         tp: &[f64],
-        alloc: &[f64; 2],
+        tp_alloc: &[f64; 2],
     ) -> (f64, [f64; 2]) {
         if sl.len() < 2 || tp.len() < 2 {
             return (0.0, [0.0; 2]);
         }
         let min_dist = price * self.config.risk.min_stop_dist_pct;
-        let risks: Vec<f64> = sl
-            .iter()
-            .take(2)
-            .map(|&s| ((price - s).abs()).max(min_dist))
-            .collect();
+        let mut risks = Vec::with_capacity(2);
+        for &s in sl.iter().take(2) {
+            let risk = ((price - s).abs()).max(min_dist);
+            risks.push(risk);
+        }
         let rewards: Vec<f64> = tp.iter().take(2).map(|&t| (t - price).abs()).collect();
+
         let rr_levels = [rewards[0] / risks[0], rewards[1] / risks[1]];
-        let w_risk: f64 = risks.iter().enumerate().map(|(i, r)| r * alloc[i]).sum();
-        let w_reward: f64 = rewards.iter().enumerate().map(|(i, r)| r * alloc[i]).sum();
+
+        let w_risk: f64 = risks.iter().zip(sl_alloc.iter()).map(|(r, a)| r * a).sum();
+        let w_reward: f64 = rewards
+            .iter()
+            .zip(tp_alloc.iter())
+            .map(|(r, a)| r * a)
+            .sum();
         let wrr = if w_risk > f64::EPSILON {
             w_reward / w_risk
         } else {
@@ -883,7 +918,8 @@ impl RiskManager {
         &self,
         def_strength: f64,
         last_price: f64,
-        sl_level: f64,
+        sl_levels: &[f64],
+        sl_alloc: &[f64],
         conf_mult: f64,
         vol_p: f64,
         is_tsunami: bool,
@@ -891,6 +927,7 @@ impl RiskManager {
         leverage: f64,
         regime: TrendStructure,
         tags: &mut Vec<String>,
+        reject_reason: &mut Option<String>,
     ) -> Option<(f64, f64, f64, bool)> {
         let cfg = &self.config.risk;
         let base =
@@ -903,8 +940,22 @@ impl RiskManager {
             tags.push("TSUNAMI_MODE".into());
         }
 
-        let sl_pct = (last_price - sl_level).abs() / last_price;
-        let sl_pct = sl_pct.max(f64::EPSILON);
+        let mut weighted_sl_pct = 0.0;
+        let mut total_alloc = 0.0;
+        for (i, &sl) in sl_levels.iter().enumerate() {
+            if i >= sl_alloc.len() {
+                break;
+            }
+            let sl_pct = (last_price - sl).abs() / last_price;
+            weighted_sl_pct += sl_pct * sl_alloc[i];
+            total_alloc += sl_alloc[i];
+        }
+        if total_alloc > 0.0 {
+            weighted_sl_pct /= total_alloc;
+        } else {
+            weighted_sl_pct = 0.01;
+        }
+        let sl_pct = weighted_sl_pct.max(f64::EPSILON);
 
         let mut total_loss = size * sl_pct * leverage;
         let margin_loss = sl_pct * leverage;
@@ -928,10 +979,15 @@ impl RiskManager {
 
         if let Some(max_l) = max_loss_pct {
             if final_total_loss > max_l {
+                *reject_reason = Some(format!(
+                    "max_loss_exceeded ({:.2}% > {:.2}%)",
+                    final_total_loss * 100.0,
+                    max_l * 100.0
+                ));
                 tracing::warn!(
-                    "Risk reject: price={:.2} sl={:.2} reason=max_loss_exceeded final_loss={:.2}% max_loss={:.2}%",
+                    "Risk reject: price={:.2} weighted_sl_pct={:.4} reason=max_loss_exceeded final_loss={:.2}% max_loss={:.2}%",
                     last_price,
-                    sl_level,
+                    sl_pct,
                     final_total_loss * 100.0,
                     max_l * 100.0
                 );
@@ -944,32 +1000,6 @@ impl RiskManager {
         }
 
         Some((final_size, final_total_loss, margin_loss, violated))
-    }
-}
-
-fn sort_trade_levels_by_sl_distance(
-    tp: &mut [f64; 2],
-    sl: &mut Vec<f64>,
-    alloc: &mut [f64; 2],
-    last_price: f64,
-) {
-    if sl.len() < 2 {
-        return;
-    }
-    let mut combined: Vec<(f64, f64, f64)> = (0..2).map(|i| (tp[i], sl[i], alloc[i])).collect();
-
-    combined.sort_by(|a, b| {
-        let dist_a = (last_price - a.1).abs();
-        let dist_b = (last_price - b.1).abs();
-        dist_a
-            .partial_cmp(&dist_b)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    for i in 0..2 {
-        tp[i] = combined[i].0;
-        sl[i] = combined[i].1;
-        alloc[i] = combined[i].2;
     }
 }
 
@@ -1037,22 +1067,21 @@ fn dynamic_confidence_prior(vol_p: f64, regime: TrendStructure, base_prior: f64)
 
 fn dynamic_confidence_range(vol_p: f64, regime: TrendStructure) -> (f64, f64) {
     let (min_base, max_base): (f64, f64) = if vol_p > 70.0 {
-        (0.3_f64, 1.4_f64)
+        (0.3, 1.4)
     } else if vol_p < 25.0 {
-        (0.5_f64, 1.8_f64)
+        (0.5, 1.8)
     } else {
-        (0.4_f64, 1.6_f64)
+        (0.4, 1.6)
     };
 
     let (regime_mult_min, regime_mult_max): (f64, f64) = match regime {
-        TrendStructure::StrongBullish | TrendStructure::StrongBearish => (1.1_f64, 1.1_f64),
-        TrendStructure::Range => (0.9_f64, 0.9_f64),
-        _ => (1.0_f64, 1.0_f64),
+        TrendStructure::StrongBullish | TrendStructure::StrongBearish => (1.1, 1.1),
+        TrendStructure::Range => (0.9, 0.9),
+        _ => (1.0, 1.0),
     };
 
-    let min = (min_base * regime_mult_min).max(0.2_f64);
-    let max = (max_base * regime_mult_max).min(2.0_f64);
-
+    let min = (min_base * regime_mult_min).max(0.2);
+    let max = (max_base * regime_mult_max).min(2.0);
     (min, max)
 }
 

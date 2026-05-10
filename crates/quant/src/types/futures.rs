@@ -64,11 +64,11 @@ impl OIData {
     }
 
     pub fn delta_ratio(&self) -> f64 {
-        if self.change_history.is_empty() || self.current_oi_amount <= 0.0 {
+        if self.change_history.is_empty() {
             return 0.0;
         }
         let last_change = self.change_history.last().cloned().unwrap_or(0.0);
-        (last_change / self.current_oi_amount).clamp(-0.2, 0.2)
+        last_change.clamp(-0.2, 0.2)
     }
 }
 

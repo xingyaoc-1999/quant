@@ -1,6 +1,7 @@
 use crate::risk_manager::RiskManager;
 use crate::types::gravity::PriceGravityWell;
 use crate::types::market::TradeDirection;
+
 #[derive(Debug, Clone)]
 pub struct TrailingStop {
     direction: TradeDirection,
@@ -90,9 +91,9 @@ pub fn refresh_take_profits(
     is_tsunami: bool,
     vol_p: f64,
     current_tps: &[f64; 2],
-) -> Option<[f64; 2]> {
+) -> Option<([f64; 2], [f64; 2])> {
     let mut tags = Vec::new();
-    let (_sl, new_tp, _alloc) = risk_mgr.calculate_trade_structure(
+    let (_sl, new_tp, tp_alloc, _sl_alloc) = risk_mgr.calculate_trade_structure(
         wells,
         last_price,
         atr_v,
@@ -111,7 +112,7 @@ pub fn refresh_take_profits(
     };
 
     if better {
-        Some(new_tp_array)
+        Some((new_tp_array, tp_alloc))
     } else {
         None
     }

@@ -15,7 +15,6 @@ use common::{
     Symbol,
 };
 use notify::telegram::BotApp;
-use quant::position::Position; // 新增
 use quant::risk_manager::RiskAssessment;
 use quant::{analyzer::ConfigurableAnalyzer, config::SignalStabilityConfig};
 use quant::{
@@ -26,6 +25,7 @@ use quant::{
     },
     config::AnalyzerConfig,
 };
+use quant::{position::Position, stats::SignalStats}; // 新增
 use ractor::{cast, Actor};
 use rig::tool::ToolSet;
 use service::{
@@ -48,9 +48,12 @@ async fn main() -> Result<()> {
     let storage = Arc::new(init_storage(&config.database).await?);
     let archive = Arc::new(ArchiveProvider::new(proxy_pool.clone()));
 
+    let stats = Arc::new(TokioMutex::new(SignalStats::default()));
+
     let ctx_manager = Arc::new(FeatureContextManager::new(
         &symbols,
         SignalStabilityConfig::default(),
+        stats.clone(),
     ));
     let analyzer_config = AnalyzerConfig::default();
 
@@ -70,14 +73,16 @@ async fn main() -> Result<()> {
     let engine = Arc::new(AnalysisEngine::new(Config::default(), analyzers));
     let config_arc = Arc::new(analyzer_config.clone());
 
-    // 共享持仓容器（所有开仓由外部管理，分析服务仅更新动态止盈止损）
     let open_positions = Arc::new(TokioMutex::new(HashMap::<Symbol, Position>::new()));
+
+    let stats = Arc::new(TokioMutex::new(SignalStats::default()));
 
     let analysis_service = Arc::new(AnalysisService::new(
         engine.clone(),
         ctx_manager.clone(),
         analyzer_config.clone(),
         open_positions.clone(),
+        stats.clone(),
     ));
 
     let integrity = Arc::new(DataIntegrityManager::new(
@@ -153,8 +158,6 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
-// ========== 辅助函数 ==========
 
 fn init_tracing() {
     tracing_subscriber::fmt()

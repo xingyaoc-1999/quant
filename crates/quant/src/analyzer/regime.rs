@@ -346,9 +346,9 @@ impl MarketRegimeAnalyzer {
 
 fn dynamic_tsunami_oi_threshold(vol_p: f64, base: f64) -> f64 {
     let factor = if vol_p > 70.0 {
-        1.3
-    } else if vol_p < 25.0 {
         0.8
+    } else if vol_p < 25.0 {
+        1.2
     } else {
         1.0
     };

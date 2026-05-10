@@ -5,6 +5,7 @@ use quant::{
     analyzer::{ContextKey, MarketContext},
     calculator::FeatureCalculator,
     config::SignalStabilityConfig,
+    stats::SignalStats,
     types::{
         futures::{OIData, Role, RoleData, TakerFlowData},
         gravity::PriceGravityWell,
@@ -14,12 +15,13 @@ use quant::{
 use rayon::prelude::*;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    RwLock,
+    Arc, RwLock,
 };
 use std::{
     collections::{HashMap, VecDeque},
     f64,
 };
+use tokio::sync::Mutex;
 use tracing::info;
 
 #[derive(Default, Clone)]
@@ -154,10 +156,15 @@ pub struct FeatureContextManager {
     pub cross_cycle_state: DashMap<Symbol, CrossCycleState>,
     pub signal_states: DashMap<Symbol, SignalConfirmState>,
     pub signal_config: SignalStabilityConfig,
+    pub stats: Arc<Mutex<SignalStats>>,
 }
 
 impl FeatureContextManager {
-    pub fn new(symbols: &[Symbol], signal_config: SignalStabilityConfig) -> Self {
+    pub fn new(
+        symbols: &[Symbol],
+        signal_config: SignalStabilityConfig,
+        stats: Arc<Mutex<SignalStats>>,
+    ) -> Self {
         let symbol_contexts = DashMap::new();
         let cfg = Appconfig::global();
 
@@ -181,6 +188,7 @@ impl FeatureContextManager {
             cross_cycle_state: DashMap::new(),
             signal_states: DashMap::new(),
             signal_config,
+            stats,
         }
     }
 

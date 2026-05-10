@@ -8,25 +8,22 @@ use crate::types::market::{PriceAction, RsiState, VolumeState};
 use crate::types::session::TradingSession;
 use std::collections::HashMap;
 
-/// 将价格水平转换为可哈希的整数键
-/// 使用微单位（价格 × 1_000_000）避免浮点 NaN/-0.0 导致的键冲突
 fn price_to_key(price: f64) -> i64 {
-    (price * 1_000_000.0).round() as i64
+    (price * 100_000_000.0).round() as i64
 }
 
-/// 井的唯一标识：源 + 侧 + 量化价格水平
 type WellKey = (WellSource, WellSide, i64);
 
-/// 单个井的假突破状态
 #[derive(Debug, Clone, Copy)]
 struct WellState {
-    /// 连续确认柱数
     confirm_count: usize,
-    /// 冷却剩余柱数
     cooldown_remaining: usize,
+    miss_count: usize,
 }
 
 type FakeoutState = HashMap<WellKey, WellState>;
+
+const MAX_MISS_COUNT: usize = 2;
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct FakeoutExtra {
@@ -84,7 +81,6 @@ impl Analyzer for FakeoutDetector {
             return Ok(AnalysisResult::new(self.kind()).with_score(0.0));
         }
 
-        // 提取所需数据
         let (price, wells, atr, slope, rsi_state, efficiency, rvol, volume_state, vol_p) = {
             let role_data = ctx
                 .get_role(Role::Entry)
@@ -130,7 +126,6 @@ impl Analyzer for FakeoutDetector {
         let session_adj = session.factor(&self.config.session);
         let vol_bias = self.compute_vol_bias(vol_p);
 
-        // 从缓存恢复之前的状态（排除 Magnet 井）
         let mut state = ctx
             .cache
             .remove(&ContextKey::FakeoutState)
@@ -202,7 +197,6 @@ impl Analyzer for FakeoutDetector {
 }
 
 impl FakeoutDetector {
-    /// 波动率偏差：高波动区间降低信号强度，低波动区间适当放大
     #[inline]
     fn compute_vol_bias(&self, vol_p: f64) -> f64 {
         if vol_p > 80.0 {
@@ -214,7 +208,6 @@ impl FakeoutDetector {
         }
     }
 
-    /// 处理单个井的假突破逻辑
     fn process_well(
         &self,
         well: &PriceGravityWell,
@@ -230,7 +223,6 @@ impl FakeoutDetector {
         cfg: &FakeoutConfig,
         state: &mut FakeoutState,
     ) -> Option<(f64, String)> {
-        // 防御：忽略无效价格水平的井
         if !well.level.is_finite() {
             return None;
         }
@@ -260,7 +252,6 @@ impl FakeoutDetector {
                 false,
             );
 
-        // 无突破时：递减冷却或重置计数
         if !breach_up && !breach_down {
             if let Some(entry) = state.get_mut(&well_key) {
                 if entry.cooldown_remaining > 0 {
@@ -272,16 +263,22 @@ impl FakeoutDetector {
             return None;
         }
 
-        // 收盘价必须回到井内（相对于 level 的阈值范围），否则清除状态
-        if !self.is_closed_inside(price.close, well.level, cfg.close_return_threshold()) {
-            state.remove(&well_key);
+        if !self.is_closed_inside(price.close, well.level, atr, cfg.close_return_threshold()) {
+            if let Some(entry) = state.get_mut(&well_key) {
+                entry.miss_count += 1;
+                if entry.miss_count > MAX_MISS_COUNT {
+                    state.remove(&well_key);
+                }
+            }
             return None;
         }
 
         let entry = state.entry(well_key).or_insert(WellState {
             confirm_count: 0,
             cooldown_remaining: 0,
+            miss_count: 0,
         });
+        entry.miss_count = 0;
 
         if entry.cooldown_remaining > 0 {
             entry.cooldown_remaining -= 1;
@@ -293,7 +290,6 @@ impl FakeoutDetector {
             return None;
         }
 
-        // 假突破确认，计算惩罚/奖励
         let strength = well.strength.clamp(0.2, 3.0);
         let adjustment = self.calculate_total_adjustment(
             breach_up,
@@ -321,16 +317,13 @@ impl FakeoutDetector {
             adjustment
         );
 
-        // 重置计数并启动冷却
         entry.confirm_count = 0;
         entry.cooldown_remaining = cfg.fakeout_cooldown_bars();
 
         Some((score, reason))
     }
 
-    /// 获取井的主要来源标识（按优先级顺序）
     fn primary_well_source(&self, well: &PriceGravityWell) -> WellSource {
-        // 优先顺序：EntryResistance → EntrySupport → TrendResistance → TrendSupport → FilterResistance → FilterSupport → Ma20
         static ORDERED_SOURCES: &[WellSource] = &[
             WellSource::EntryResistance,
             WellSource::EntrySupport,
@@ -386,13 +379,12 @@ impl FakeoutDetector {
     }
 
     #[inline]
-    fn is_closed_inside(&self, close: f64, level: f64, threshold: f64) -> bool {
-        (close - level).abs() / level < threshold
+    fn is_closed_inside(&self, close: f64, level: f64, atr: f64, threshold: f64) -> bool {
+        let abs_diff = (close - level).abs();
+        let dynamic_thresh = (atr * threshold).max(1e-6);
+        abs_diff < dynamic_thresh
     }
 
-    /// 斜率对假突破的调整：
-    /// - 突破方向与趋势同向时（假突破更可靠），给予强因子
-    /// - 与趋势反向时，给予弱因子
     fn slope_adjustment(&self, up: bool, slope: f64, cfg: &FakeoutConfig) -> f64 {
         let thresh = cfg.slope_strong_threshold();
         match (up, slope) {
@@ -404,9 +396,6 @@ impl FakeoutDetector {
         }
     }
 
-    /// RSI 极值对假突破的加成：
-    /// - 向上突破阻力时若 RSI 超买，加强看跌信号
-    /// - 向下突破支撑时若 RSI 超卖，加强看涨信号
     fn rsi_adjustment(&self, up: bool, down: bool, rsi: RsiState, cfg: &FakeoutConfig) -> f64 {
         match (up, down, rsi) {
             (true, _, RsiState::Overbought) => cfg.rsi_overbought_factor(),
@@ -415,7 +404,6 @@ impl FakeoutDetector {
         }
     }
 
-    /// 成交量/效率综合调整
     fn volume_efficiency_penalty(
         &self,
         eff: f64,

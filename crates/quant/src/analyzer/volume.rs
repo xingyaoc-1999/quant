@@ -10,20 +10,13 @@ use crate::types::session::TradingSession;
 use crate::utils::efficiency::{calculate_efficiency, consistency_penalty};
 use crate::utils::volatility::{compute_vol_factor, volatility_adaptation};
 
-// ==================== 常量 ====================
-/// 低效率判断默认阈值（配置中无对应项时临时使用）
 const DEFAULT_EFF_LOW_THRESHOLD: f64 = 0.2;
-
-/// 磁铁井信号分数常数（可未来移至配置）
 const MAGNET_SCORE_NORMAL: f64 = 55.0;
 const MAGNET_MULT_NORMAL: f64 = 1.7;
 const MAGNET_SCORE_PROBE: f64 = 15.0;
 const MAGNET_MULT_PROBE: f64 = 1.2;
-
-/// 趋势延伸分数常数
 const TREND_EFF_NORMAL_RVOL: f64 = 1.2;
 
-// ==================== 数据结构 ====================
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct VolumeExtra {
     pub efficiency: f64,
@@ -142,7 +135,6 @@ impl Analyzer for VolumeStructureAnalyzer {
         };
         let consistency = consistency_penalty(rvol, Some(current_volume_state));
 
-        // 方向因子：阳线为 +1，阴线为 -1
         let direction = if p_action.close > p_action.open {
             1.0
         } else {
@@ -165,7 +157,6 @@ impl Analyzer for VolumeStructureAnalyzer {
 
         let mut res = AnalysisResult::new(self.kind());
 
-        // 信号上下文
         let signal_ctx = SignalContext {
             is_up: direction > 0.0,
             last_price,
@@ -231,7 +222,6 @@ impl Analyzer for VolumeStructureAnalyzer {
     }
 }
 
-// ==================== 辅助结构 ====================
 struct DynamicThresholds {
     rvol_break: f64,
     rvol_extreme: f64,
@@ -263,7 +253,6 @@ impl DynamicThresholds {
     }
 }
 
-/// 井信号评估所需的上下文参数
 struct SignalContext<'a> {
     is_up: bool,
     last_price: f64,
@@ -309,7 +298,6 @@ impl TrendExtension {
     }
 }
 
-// ==================== 核心评估逻辑 ====================
 impl VolumeStructureAnalyzer {
     fn evaluate_well_signal(
         &self,
@@ -379,7 +367,14 @@ impl VolumeStructureAnalyzer {
             (WellSide::Support, _, e) if e < thresh.eff_low && taker_bearish && oi_surge => {
                 WellSignal::new(55.0, 1.6, "被动吸收: 卖盘沉重但价格拒绝下跌")
             }
-            _ => return None,
+            (side, _, _) => {
+                let (score, reason) = match side {
+                    WellSide::Resistance => (-5.0, "阻力位量价博弈偏弱"),
+                    WellSide::Support => (5.0, "支撑位量价博弈偏弱"),
+                    _ => unreachable!(),
+                };
+                WellSignal::new(score, 1.0, reason)
+            }
         };
 
         Some(signal)

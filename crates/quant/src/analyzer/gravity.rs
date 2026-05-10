@@ -98,9 +98,6 @@ impl Analyzer for GravityAnalyzer {
             .unwrap_or_default();
 
         let mut wells = Vec::new();
-
-        // 为了跨调用去重削弱，使用一个 HashSet 记录已经削弱过的井索引
-        // 由于井可能因为合并而消失，索引可能变化，但简单场景下足够
         let mut dampened_indices = std::collections::HashSet::new();
 
         let sources_to_add = [
@@ -271,7 +268,6 @@ impl Analyzer for GravityAnalyzer {
     }
 }
 
-// ==================== Private Methods ====================
 impl GravityAnalyzer {
     fn add_well_source(
         &self,

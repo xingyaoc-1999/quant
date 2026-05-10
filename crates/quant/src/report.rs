@@ -1,14 +1,12 @@
 use crate::{
     analyzer::{ContextKey, FinalSignal, MarketContext},
-    config::{AnalyzerConfig, EntryStrategy},
-    risk_manager::{RiskAssessment, RiskManager},
+    config::EntryStrategy,
+    risk_manager::RiskAssessment,
     types::{
         futures::Role,
         gravity::{PriceGravityWell, WellSide},
-        market::TrendStructure,
         session::TradingSession,
     },
-    utils::math::dynamic_direction_threshold,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -47,7 +45,6 @@ impl ReportFormatter {
     }
 }
 
-// ==================== 主结构体 ====================
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct MarketSnapshot {
     pub timestamp: i64,
@@ -126,97 +123,6 @@ impl AnalysisAudit {
             gravity_wells,
             risk_assessment: None,
         }
-    }
-
-    pub fn attach_risk(
-        &mut self,
-        ctx: &MarketContext,
-        config: &AnalyzerConfig,
-    ) -> Option<&RiskAssessment> {
-        let vol_p = ctx
-            .get_cached::<f64>(ContextKey::VolPercentile)
-            .copied()
-            .unwrap_or(50.0);
-        let regime = ctx
-            .get_cached::<TrendStructure>(ContextKey::RegimeStructure)
-            .copied()
-            .unwrap_or(TrendStructure::Range);
-        let is_tsunami = ctx
-            .get_cached::<bool>(ContextKey::IsMomentumTsunami)
-            .copied()
-            .unwrap_or(false);
-
-        let taker = ctx
-            .get_role(Role::Entry)
-            .ok()
-            .and_then(|r| r.taker_flow.taker_buy_ratio)
-            .unwrap_or(0.5);
-
-        let ma_dist = ctx
-            .get_role(Role::Trend)
-            .ok()
-            .and_then(|r| r.feature_set.space.ma20_dist_ratio);
-
-        let atr_ratio = ctx
-            .get_cached::<f64>(ContextKey::VolAtrRatio)
-            .copied()
-            .unwrap_or(0.005);
-
-        let funding_rate = Some(ctx.global.funding_rate);
-
-        let average_atr = {
-            let trend_role = ctx.get_role(Role::Trend).ok();
-            let filter_role = ctx.get_role(Role::Filter).ok();
-            let median_atr = trend_role
-                .and_then(|r| r.feature_set.indicators.atr_median_20)
-                .or_else(|| filter_role.and_then(|r| r.feature_set.indicators.atr_median_20));
-            median_atr.unwrap_or(atr_ratio * self.snapshot.price)
-        };
-
-        let risk_mgr = RiskManager::new(config.clone());
-
-        let is_long_hint = self.signal.net_score > 0.0;
-        let estimated_confidence = risk_mgr.estimate_confidence(
-            is_long_hint,
-            regime,
-            taker,
-            vol_p,
-            ma_dist,
-            atr_ratio,
-            self.signal.net_score,
-            is_tsunami,
-            funding_rate,
-        );
-
-        let direction = dynamic_direction_threshold(
-            self.signal.net_score,
-            vol_p,
-            regime,
-            estimated_confidence,
-            config.risk.direction_base_threshold,
-        );
-
-        let max_loss_pct = Some(config.risk.max_loss_per_trade);
-
-        let risk = risk_mgr.assess(
-            direction,
-            &self.gravity_wells,
-            self.snapshot.price,
-            atr_ratio,
-            average_atr,
-            vol_p,
-            regime,
-            is_tsunami,
-            taker,
-            ma_dist,
-            self.signal.net_score,
-            max_loss_pct,
-            funding_rate,
-            10.0,
-        )?;
-
-        self.risk_assessment = Some(risk);
-        self.risk_assessment.as_ref()
     }
 
     pub fn to_markdown_v2(&self, ctx: &MarketContext) -> String {
@@ -373,7 +279,6 @@ impl AnalysisAudit {
         let size_pct = escape_markdown_v2(&format!("{:.1}", risk.position_size_pct * 100.0));
         let wrr = escape_markdown_v2(&format!("{:.2}", risk.weighted_rr));
 
-        // 两个止损价格
         let sl_str = if risk.stop_loss_levels.len() >= 2 {
             format!(
                 "{}/{}",
@@ -387,15 +292,13 @@ impl AnalysisAudit {
         };
         let sl_str = escape_markdown_v2(&sl_str);
 
-        // 止损仓位百分比，不显示总和
-        let sl_alloc1 = risk.allocation.first().copied().unwrap_or(0.0) * 100.0;
-        let sl_alloc2 = risk.allocation.get(1).copied().unwrap_or(0.0) * 100.0;
+        let sl_alloc1 = risk.stop_loss_allocations.first().copied().unwrap_or(0.0) * 100.0;
+        let sl_alloc2 = risk.stop_loss_allocations.get(1).copied().unwrap_or(0.0) * 100.0;
         let sl_alloc_str = escape_markdown_v2(&format!(
             "止损仓位: SL1 {:.0}% / SL2 {:.0}%",
             sl_alloc1, sl_alloc2
         ));
 
-        // 入场计划（仍为3个级别）
         let entry_lines: Vec<String> = risk
             .entry_levels
             .iter()
@@ -408,7 +311,6 @@ impl AnalysisAudit {
             })
             .collect();
 
-        // 止盈目标（2个）
         let tp_lines: Vec<String> = (0..2)
             .map(|idx| {
                 let tp = ReportFormatter::price_esc(risk.take_profit_levels[idx]);
@@ -449,7 +351,6 @@ impl AnalysisAudit {
     }
 }
 
-// ================= MarkdownV2 转义工具 =================
 pub fn escape_markdown_v2(s: &str) -> String {
     let mut result = String::with_capacity(s.len() * 2);
     for c in s.chars() {

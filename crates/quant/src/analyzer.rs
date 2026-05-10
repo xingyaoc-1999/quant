@@ -412,6 +412,6 @@ impl AnalysisEngine {
     }
     fn normalize_to_standard_range(&self, score: f64) -> f64 {
         let normalized = (score * self.config.sensitivity).tanh();
-        (normalized * 1000.0).round() / 10.0
+        (normalized * 100.0).round() / 10.0
     }
 }

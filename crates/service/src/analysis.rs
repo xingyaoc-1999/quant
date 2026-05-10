@@ -1,5 +1,9 @@
 use chrono::Utc;
 use common::Symbol;
+use quant::audit::{
+    build_analysis_details, write_audit_log, AuditEvent, AuditRecord, SignalSummary,
+};
+use quant::stats::SignalStats;
 use quant::{
     analyzer::{AnalysisEngine, ContextKey},
     config::AnalyzerConfig,
@@ -13,7 +17,7 @@ use quant::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{integrity::context::FeatureContextManager, types::MarketEvent};
 
@@ -32,6 +36,7 @@ pub struct AnalysisService {
     manager: Arc<FeatureContextManager>,
     open_positions: Arc<TokioMutex<HashMap<Symbol, Position>>>,
     audit_cache: Arc<TokioMutex<HashMap<Symbol, AnalysisAudit>>>,
+    stats: Arc<TokioMutex<SignalStats>>,
 }
 
 impl AnalysisService {
@@ -40,6 +45,7 @@ impl AnalysisService {
         manager: Arc<FeatureContextManager>,
         config: AnalyzerConfig,
         open_positions: Arc<TokioMutex<HashMap<Symbol, Position>>>,
+        stats: Arc<TokioMutex<SignalStats>>,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(256);
         Self {
@@ -49,6 +55,7 @@ impl AnalysisService {
             manager,
             open_positions,
             audit_cache: Arc::new(TokioMutex::new(HashMap::new())),
+            stats,
         }
     }
 
@@ -133,19 +140,84 @@ impl AnalysisService {
 
         self.manager.save_cross_cycle_state(symbol, &ctx);
 
-        // 新信号推送
-        if let Some(_dir) = confirmed_direction {
-            let mut audit = audit; // 捕获所有权
-            if audit.attach_risk(&ctx, &self.config).is_some() {
+        let average_atr = ctx
+            .get_role(Role::Filter)
+            .or_else(|_| ctx.get_role(Role::Trend))
+            .ok()
+            .and_then(|r| r.feature_set.indicators.atr_median_20)
+            .unwrap_or(atr_ratio * ctx.global.last_price);
+
+        let mut reject_reason: Option<String> = None;
+
+        if let Some(confirmed_dir) = confirmed_direction {
+            let risk = risk_mgr.assess(
+                Some(confirmed_dir),
+                &audit.gravity_wells,
+                audit.snapshot.price,
+                atr_ratio,
+                average_atr,
+                vol_p,
+                regime,
+                is_tsunami,
+                taker_ratio,
+                ma_dist,
+                net_score,
+                Some(self.config.risk.max_loss_per_trade),
+                funding_rate,
+                10.0,
+                &mut reject_reason,
+            );
+
+            if let Some(assessment) = risk {
+                let mut audit = audit;
+                audit.risk_assessment = Some(assessment.clone());
                 let message = audit.to_markdown_v2(&ctx);
-                let assessment = audit.risk_assessment.clone();
                 let _ = self.event_tx.send(AnalysisEvent {
                     symbol,
                     message,
-                    assessment,
+                    assessment: Some(assessment.clone()),
                     timestamp: ctx.global.timestamp,
                 });
+
+                let analysis = build_analysis_details(&audit.signal.sub_reports);
+                let signal_summary = SignalSummary {
+                    direction: format!("{:?}", assessment.direction),
+                    entry_price: assessment.entry_levels.first().copied(),
+                    stop_loss: assessment.stop_loss_levels.clone(),
+                    take_profit: assessment.take_profit_levels.clone(),
+                    weighted_rr: assessment.weighted_rr,
+                    confidence: assessment.confidence,
+                    tags: assessment.audit_tags.clone(),
+                };
+                let record = AuditRecord {
+                    timestamp: Utc::now().timestamp_millis(),
+                    event: AuditEvent::Signal,
+                    symbol: symbol.as_str().to_string(),
+                    signal: Some(signal_summary),
+                    market_snapshot: Some(audit.snapshot.clone()),
+                    analysis,
+                    reject_reason: None,
+                };
+                write_audit_log(&record).await;
+
+                self.stats.lock().await.add_signal(assessment.weighted_rr);
                 self.audit_cache.lock().await.insert(symbol, audit);
+            } else {
+                let reason = reject_reason.unwrap_or_else(|| "unknown".into());
+                warn!("Risk rejected for {}: {:?}", symbol, reason);
+
+                let analysis = build_analysis_details(&audit.signal.sub_reports);
+                let record = AuditRecord {
+                    timestamp: Utc::now().timestamp_millis(),
+                    event: AuditEvent::Reject,
+                    symbol: symbol.as_str().to_string(),
+                    signal: None,
+                    market_snapshot: Some(audit.snapshot.clone()),
+                    analysis,
+                    reject_reason: Some(reason.clone()),
+                };
+                write_audit_log(&record).await;
+                self.stats.lock().await.add_reject(symbol, reason);
             }
         }
 
@@ -196,6 +268,7 @@ impl AnalysisService {
         let mut need_update = false;
         let mut new_sl = pos.stop_loss;
         let mut new_tps = [pos.take_profit1, pos.take_profit2];
+        let mut new_alloc = None;
 
         if let Some(ts) = pos.trailing_stop.as_mut() {
             if let Some(sl) = ts.update(last_price, atr) {
@@ -207,7 +280,7 @@ impl AnalysisService {
         }
 
         let risk_mgr = RiskManager::new(self.config.clone());
-        if let Some(tps) = refresh_take_profits(
+        if let Some((tps, alloc)) = refresh_take_profits(
             &risk_mgr,
             &wells,
             last_price,
@@ -219,6 +292,7 @@ impl AnalysisService {
             &new_tps,
         ) {
             new_tps = tps;
+            new_alloc = Some(alloc);
             need_update = true;
         }
 
@@ -229,9 +303,17 @@ impl AnalysisService {
 
             if let Some(audit) = self.audit_cache.lock().await.get_mut(&symbol) {
                 if let Some(ref mut assessment) = audit.risk_assessment {
-                    assessment.stop_loss_levels = vec![new_sl, new_tps[1]];
+                    if assessment.stop_loss_levels.len() >= 2 {
+                        assessment.stop_loss_levels[0] = new_sl;
+                    } else {
+                        assessment.stop_loss_levels = vec![new_sl];
+                    }
                     assessment.take_profit_levels = new_tps.to_vec();
+                    if let Some(alloc) = new_alloc {
+                        assessment.allocation = alloc;
+                    }
                 }
+
                 let message = audit.to_markdown_v2(ctx);
                 let _ = self.event_tx.send(AnalysisEvent {
                     symbol,
@@ -239,10 +321,31 @@ impl AnalysisService {
                     assessment: audit.risk_assessment.clone(),
                     timestamp: Utc::now().timestamp_millis(),
                 });
+
+                let analysis = build_analysis_details(&audit.signal.sub_reports);
+                let signal_summary = audit.risk_assessment.as_ref().map(|r| SignalSummary {
+                    direction: format!("{:?}", r.direction),
+                    entry_price: r.entry_levels.first().copied(),
+                    stop_loss: r.stop_loss_levels.clone(),
+                    take_profit: r.take_profit_levels.clone(),
+                    weighted_rr: r.weighted_rr,
+                    confidence: r.confidence,
+                    tags: r.audit_tags.clone(),
+                });
+                let record = AuditRecord {
+                    timestamp: Utc::now().timestamp_millis(),
+                    event: AuditEvent::Update,
+                    symbol: symbol.as_str().to_string(),
+                    signal: signal_summary,
+                    market_snapshot: None,
+                    analysis,
+                    reject_reason: None,
+                };
+                write_audit_log(&record).await;
+                self.stats.lock().await.add_update();
             }
         }
     }
-
     pub fn spawn_worker(
         self: Arc<Self>,
         mut event_rx: mpsc::Receiver<MarketEvent>,

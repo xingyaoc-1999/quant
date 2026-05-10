@@ -5,8 +5,8 @@ use quant::analyzer::AnalysisEngine;
 use quant::config::AnalyzerConfig;
 use quant::risk_manager::RiskAssessment;
 use service::integrity::context::FeatureContextManager;
+use std::str::FromStr;
 use std::sync::Arc;
-use std::{collections::HashMap, str::FromStr};
 use storage::postgres::Storage;
 use teloxide::{
     prelude::*,
@@ -79,7 +79,7 @@ async fn handle_subscribe_callback(
         return Ok(());
     };
 
-    // 确保用户存在
+    
     if let Err(e) = deps.storage.ensure_user(user_id).await {
         bot.answer_callback_query(q.id.clone())
             .text(format!("用户初始化失败: {e}"))

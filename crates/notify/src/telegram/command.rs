@@ -121,7 +121,7 @@ impl MyCommand {
                 }
 
                 let now = Utc::now().timestamp_millis();
-                let all_status = ctx_manager.get_status_info(); // 返回 (Symbol, i64, usize, bool, Option<TradeDirection>, Option<TradeDirection>, usize)
+                let all_status = ctx_manager.get_status_info();
 
                 let user_status: Vec<_> = all_status
                     .into_iter()
@@ -161,7 +161,7 @@ impl MyCommand {
                             .map(|p| format!("${:.2}", p))
                             .unwrap_or_else(|| "—".into());
 
-                        let symbol_esc: String = escape(symbol.as_str());
+                        let symbol_esc = escape(symbol.as_str());
                         let price_esc = escape(&price_str);
                         let last_esc = escape(&last_str);
                         let current_esc = escape(&current_str);
@@ -169,8 +169,8 @@ impl MyCommand {
 
                         msg.push_str(&format!(
                             "`{symbol}`  ⏱ {age}s ago  💵 {price}\n\
-                 \x20\x20📌 历史方向: `{hist}`  当前方向: `{curr}`\n\
-                 \x20\x20📈 计数: `{count}/{need}`  {latch}\n\n",
+                 📌 历史方向: `{hist}`  当前方向: `{curr}`\n\
+                 📈 计数: `{count}/{need}`  {latch}\n\n",
                             symbol = symbol_esc,
                             age = seconds_ago,
                             price = price_esc,
@@ -182,16 +182,30 @@ impl MyCommand {
                         ));
                     }
 
+                    let stats = ctx_manager.stats.lock().await;
+                    let avg_rr = if stats.recent_rrs.is_empty() {
+                        0.0
+                    } else {
+                        stats.recent_rrs.iter().sum::<f64>() / stats.recent_rrs.len() as f64
+                    };
+
                     msg.push_str("───────\n");
                     msg.push_str(&format!(
-                        "⚙️ 确认需连续 `{}` 根 \\| 锁存 `{}` 根\n",
-                        ctx_manager.signal_config.confirm_bars,
-                        ctx_manager.signal_config.latch_bars,
+                        "📊 今日信号: `{}` \\| 被拒: `{}` \\| 更新: `{}` \\| 平均RR: `{:.2}`\n",
+                        stats.signal_count, stats.reject_count, stats.update_count, avg_rr
                     ));
-                    msg.push_str(&format!(
-                        "📡 总监控交易对: {}",
-                        ctx_manager.symbol_contexts.len(), // 系统实际监控总数
-                    ));
+
+                    for sym in &subscribed {
+                        if let Some(reason) = stats.reject_reasons.get(sym) {
+                            msg.push_str(&format!(
+                                "`{}`  ⚠️ 上次拒绝: {}\n",
+                                escape(sym.as_str()),
+                                escape(reason)
+                            ));
+                        }
+                    }
+
+                    msg.push_str(&format!("📡 当前订阅交易对: {}", subscribed.len()));
 
                     bot.send_message(chat_id, &msg)
                         .parse_mode(ParseMode::MarkdownV2)
