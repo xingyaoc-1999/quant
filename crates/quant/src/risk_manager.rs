@@ -465,13 +465,15 @@ impl RiskManager {
     ) -> (Vec<f64>, Vec<f64>, Option<f64>) {
         match strategy {
             EntryStrategy::Limit => {
-                let (levels, allocs) = self
-                    .calculate_limit_entries(wells, last_price, atr_v, is_long, is_tsunami, tags);
+                let (levels, allocs) = self.calculate_limit_entries(
+                    wells, last_price, atr_v, is_long, is_tsunami, tags, strategy,
+                );
                 (levels.to_vec(), allocs.to_vec(), None)
             }
             EntryStrategy::Stop => {
-                let (levels, allocs, used_offset) = self
-                    .calculate_stop_entries(wells, last_price, atr_v, is_long, is_tsunami, tags);
+                let (levels, allocs, used_offset) = self.calculate_stop_entries(
+                    wells, last_price, atr_v, is_long, is_tsunami, tags, strategy,
+                );
                 (levels.to_vec(), allocs.to_vec(), Some(used_offset))
             }
         }
@@ -485,6 +487,7 @@ impl RiskManager {
         is_long: bool,
         is_tsunami: bool,
         tags: &mut Vec<String>,
+        strategy: &EntryStrategy,
     ) -> ([f64; 3], [f64; 3]) {
         let dir_sign = if is_long { 1.0 } else { -1.0 };
         let cfg = &self.config.risk;
@@ -519,7 +522,7 @@ impl RiskManager {
             allocs[1] = cfg.default_entry_allocations[1];
             levels[2] = last_price - dir_sign * step * 2.0;
             allocs[2] = cfg.default_entry_allocations[2];
-            sort_entry_levels(&mut levels, &mut allocs, is_long);
+            sort_entry_levels(&mut levels, &mut allocs, is_long, strategy);
             return (levels, allocs);
         } else if count == 1 {
             let solo_w = defense_wells[0];
@@ -536,7 +539,7 @@ impl RiskManager {
                     levels[0] = last_price;
                     tags.push("ENTRY_TSUNAMI_ADJUST".into());
                 }
-                sort_entry_levels(&mut levels, &mut allocs, is_long);
+                sort_entry_levels(&mut levels, &mut allocs, is_long, strategy);
                 return (levels, allocs);
             }
         }
@@ -574,7 +577,22 @@ impl RiskManager {
             tags.push("ENTRY_TSUNAMI_ADJUST".into());
         }
 
-        sort_entry_levels(&mut levels, &mut allocs, is_long);
+        sort_entry_levels(&mut levels, &mut allocs, is_long, strategy);
+
+        // 保护 Tsunami 覆盖：确保 last_price 在第一位
+        if is_tsunami {
+            let ts_level = if is_long { last_price } else { last_price };
+            if let Some(pos) = levels
+                .iter()
+                .position(|&v| (v - ts_level).abs() < f64::EPSILON)
+            {
+                if pos != 0 {
+                    levels.swap(0, pos);
+                    allocs.swap(0, pos);
+                }
+            }
+        }
+
         (levels, allocs)
     }
 
@@ -586,6 +604,7 @@ impl RiskManager {
         is_long: bool,
         is_tsunami: bool,
         tags: &mut Vec<String>,
+        strategy: &EntryStrategy,
     ) -> ([f64; 3], [f64; 3], f64) {
         let dir_sign = if is_long { 1.0 } else { -1.0 };
         let cfg = &self.config.risk;
@@ -626,7 +645,7 @@ impl RiskManager {
             allocs[1] = 0.3;
             levels[2] = last_price + dir_sign * (step * 2.0 + offset_abs);
             allocs[2] = 0.2;
-            sort_entry_levels(&mut levels, &mut allocs, is_long);
+            sort_entry_levels(&mut levels, &mut allocs, is_long, strategy);
             return (levels, allocs, used_offset_pct);
         }
 
@@ -663,15 +682,33 @@ impl RiskManager {
             tags.push(format!("ENTRY_STOP_DYN_OFFSET:{:.4}", used_offset_pct));
         }
 
-        if is_tsunami && count > 0 {
+        let tsunami_level_opt = if is_tsunami && count > 0 {
             let dynamic_offset_pct = base_offset_pct + atr_pct * 0.5;
             used_offset_pct = dynamic_offset_pct;
             let offset_abs = last_price * dynamic_offset_pct;
-            levels[0] = last_price + dir_sign * offset_abs;
+            let new_level = last_price + dir_sign * offset_abs;
+            levels[0] = new_level;
             tags.push("ENTRY_TSUNAMI_ADJUST".into());
+            Some(new_level)
+        } else {
+            None
+        };
+
+        sort_entry_levels(&mut levels, &mut allocs, is_long, strategy);
+
+        // 保护 Tsunami 覆盖：将新计算的追价价位移到第一位
+        if let Some(ts_level) = tsunami_level_opt {
+            if let Some(pos) = levels
+                .iter()
+                .position(|&v| (v - ts_level).abs() < f64::EPSILON)
+            {
+                if pos != 0 {
+                    levels.swap(0, pos);
+                    allocs.swap(0, pos);
+                }
+            }
         }
 
-        sort_entry_levels(&mut levels, &mut allocs, is_long);
         (levels, allocs, used_offset_pct)
     }
 
@@ -1008,17 +1045,38 @@ impl RiskManager {
     }
 }
 
-fn sort_entry_levels(levels: &mut [f64; 3], allocs: &mut [f64; 3], is_long: bool) {
+// 根据策略和方向调整排序：Stop 策略应优先离现价近的，Limit 策略不变
+fn sort_entry_levels(
+    levels: &mut [f64; 3],
+    allocs: &mut [f64; 3],
+    is_long: bool,
+    strategy: &EntryStrategy,
+) {
     let mut pairs: Vec<(f64, f64)> = levels
         .iter()
         .zip(allocs.iter())
         .map(|(&l, &a)| (l, a))
         .collect();
-    if is_long {
-        pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    } else {
-        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    }
+
+    let cmp: fn(&(f64, f64), &(f64, f64)) -> std::cmp::Ordering = match strategy {
+        EntryStrategy::Limit => {
+            if is_long {
+                |a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+        EntryStrategy::Stop => {
+            if is_long {
+                |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                |a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+    };
+
+    pairs.sort_by(cmp);
+
     for (i, (l, a)) in pairs.into_iter().enumerate() {
         levels[i] = l;
         allocs[i] = a;
