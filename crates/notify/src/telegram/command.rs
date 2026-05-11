@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use common::Symbol;
+use quant::{analyzer::ContextKey, types::gravity::PriceGravityWell};
 use service::integrity::context::FeatureContextManager;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -154,23 +155,62 @@ impl MyCommand {
                             "🔓 未锁存".into()
                         };
 
-                        let price_str = ctx_manager
+                        // 获取当前价格
+                        let current_price = ctx_manager
                             .symbol_contexts
                             .get(symbol)
                             .and_then(|ctx| ctx.latest_snap.read().ok().map(|s| s.last_price))
-                            .map(|p| format!("${:.2}", p))
-                            .unwrap_or_else(|| "—".into());
+                            .unwrap_or(0.0);
+                        let price_str = format!("${:.2}", current_price);
+
+                        let (resistance, support) = ctx_manager
+                            .get_market_context(*symbol)
+                            .map(|mc| {
+                                mc.get_cached::<Vec<PriceGravityWell>>(
+                                    ContextKey::SpaceGravityWells,
+                                )
+                                .cloned()
+                                .unwrap_or_default()
+                            })
+                            .map(|wells| {
+                                let nearest_res = wells
+                                    .iter()
+                                    .filter(|w| w.is_active && w.level > current_price)
+                                    .min_by(|a, b| {
+                                        (a.level - current_price)
+                                            .total_cmp(&(b.level - current_price))
+                                    });
+                                let nearest_sup = wells
+                                    .iter()
+                                    .filter(|w| w.is_active && w.level < current_price)
+                                    .min_by(|a, b| {
+                                        (current_price - a.level)
+                                            .total_cmp(&(current_price - b.level))
+                                    });
+                                (
+                                    nearest_res
+                                        .map(|w| format!("${:.2}", w.level))
+                                        .unwrap_or_else(|| "—".into()),
+                                    nearest_sup
+                                        .map(|w| format!("${:.2}", w.level))
+                                        .unwrap_or_else(|| "—".into()),
+                                )
+                            })
+                            .unwrap_or_else(|| ("—".into(), "—".into()));
 
                         let symbol_esc = escape(symbol.as_str());
                         let price_esc = escape(&price_str);
                         let last_esc = escape(&last_str);
                         let current_esc = escape(&current_str);
                         let latch_esc = escape(&latch_status);
+                        let res_esc = escape(&resistance);
+                        let sup_esc = escape(&support);
 
                         msg.push_str(&format!(
                             "`{symbol}`  ⏱ {age}s ago  💵 {price}\n\
                  📌 历史方向: `{hist}`  当前方向: `{curr}`\n\
-                 📈 计数: `{count}/{need}`  {latch}\n\n",
+                 📈 计数: `{count}/{need}`  {latch}\n\
+                 🧲 阻力: {res}  支撑: {sup}\n\n",
                             symbol = symbol_esc,
                             age = seconds_ago,
                             price = price_esc,
@@ -179,6 +219,8 @@ impl MyCommand {
                             count = count,
                             need = ctx_manager.signal_config.confirm_bars,
                             latch = latch_esc,
+                            res = res_esc,
+                            sup = sup_esc,
                         ));
                     }
 

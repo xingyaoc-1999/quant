@@ -12,7 +12,6 @@ pub struct RiskAssessment {
     pub stop_loss_allocations: Vec<f64>,
     pub take_profit_levels: Vec<f64>,
     pub weighted_rr: f64,
-    pub rr_levels: [f64; 2],
     pub confidence: f64,
     pub confidence_mult: f64,
     pub audit_tags: Vec<String>,
@@ -108,7 +107,7 @@ impl RiskManager {
             &mut tags,
         );
 
-        let (wrr, rr_levels) =
+        let wrr =
             self.calculate_weighted_rr(last_price, &sl_levels, &sl_alloc, &tp_levels, &tp_alloc);
         let min_wrr = dynamic_min_weighted_rr(vol_p, regime, self.config.risk.min_weighted_rr);
         if wrr < min_wrr {
@@ -171,7 +170,6 @@ impl RiskManager {
             stop_loss_allocations: sl_alloc,
             take_profit_levels: tp_levels,
             weighted_rr: wrr,
-            rr_levels,
             confidence: posterior,
             confidence_mult: conf_mult,
             audit_tags: tags,
@@ -816,7 +814,7 @@ impl RiskManager {
 
         let tp2 = if is_tsunami {
             let base_atr = average_atr.max(atr_v);
-            let atr_target = last_price + dir_sign * base_atr * cfg.tsunami_tp3_atr_mult;
+            let atr_target = last_price + dir_sign * base_atr * cfg.tsunami_tp2_atr_mult;
             let well_target = targets.get(1).map(|w| w.level);
             match well_target {
                 Some(wt) => {
@@ -899,7 +897,6 @@ impl RiskManager {
             [0.5, 0.5]
         }
     }
-
     fn calculate_weighted_rr(
         &self,
         price: f64,
@@ -907,9 +904,9 @@ impl RiskManager {
         sl_alloc: &[f64],
         tp: &[f64],
         tp_alloc: &[f64; 2],
-    ) -> (f64, [f64; 2]) {
+    ) -> f64 {
         if sl.len() < 2 || tp.len() < 2 {
-            return (0.0, [0.0; 2]);
+            return 0.0;
         }
         let min_dist = price * self.config.risk.min_stop_dist_pct;
         let mut risks = Vec::with_capacity(2);
@@ -918,8 +915,6 @@ impl RiskManager {
             risks.push(risk);
         }
         let rewards: Vec<f64> = tp.iter().take(2).map(|&t| (t - price).abs()).collect();
-
-        let rr_levels = [rewards[0] / risks[0], rewards[1] / risks[1]];
 
         let w_risk: f64 = risks.iter().zip(sl_alloc.iter()).map(|(r, a)| r * a).sum();
         let w_reward: f64 = rewards
@@ -932,9 +927,8 @@ impl RiskManager {
         } else {
             0.0
         };
-        (wrr, rr_levels)
+        wrr
     }
-
     fn get_defense_strength(
         &self,
         wells: &[PriceGravityWell],
@@ -1045,7 +1039,6 @@ impl RiskManager {
     }
 }
 
-// 根据策略和方向调整排序：Stop 策略应优先离现价近的，Limit 策略不变
 fn sort_entry_levels(
     levels: &mut [f64; 3],
     allocs: &mut [f64; 3],

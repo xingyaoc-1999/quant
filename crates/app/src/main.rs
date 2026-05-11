@@ -25,7 +25,7 @@ use quant::{
     },
     config::AnalyzerConfig,
 };
-use quant::{position::Position, stats::SignalStats}; // 新增
+use quant::{position::Position, stats::SignalStats};
 use ractor::{cast, Actor};
 use rig::tool::ToolSet;
 use service::{
@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
     let storage = Arc::new(init_storage(&config.database).await?);
     let archive = Arc::new(ArchiveProvider::new(proxy_pool.clone()));
 
+    // 唯一 stats 实例
     let stats = Arc::new(TokioMutex::new(SignalStats::default()));
 
     let ctx_manager = Arc::new(FeatureContextManager::new(
@@ -75,8 +76,7 @@ async fn main() -> Result<()> {
 
     let open_positions = Arc::new(TokioMutex::new(HashMap::<Symbol, Position>::new()));
 
-    let stats = Arc::new(TokioMutex::new(SignalStats::default()));
-
+    // 注意：这里删除了原来的第二行 let stats = ... ，现在直接使用上面的 stats.clone()
     let analysis_service = Arc::new(AnalysisService::new(
         engine.clone(),
         ctx_manager.clone(),
@@ -118,7 +118,6 @@ async fn main() -> Result<()> {
         })
     });
 
-    // 注意：BotApp::new 已不再需要 assessment_cache 参数
     let bot = BotApp::new(
         config.telegram.token.clone(),
         proxy_pool.clone(),

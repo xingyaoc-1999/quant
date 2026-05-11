@@ -256,11 +256,9 @@ impl AnalysisAudit {
     }
 
     fn build_risk_section(&self) -> String {
-        let risk = match &self.risk_assessment {
-            Some(r) => r,
-            None => return String::new(),
+        let Some(risk) = &self.risk_assessment else {
+            return String::new();
         };
-
         let dir_str = escape_markdown_v2(risk.direction.as_str());
 
         let (strategy_label, strategy_note) = match risk.entry_strategy {
@@ -311,12 +309,15 @@ impl AnalysisAudit {
             })
             .collect();
 
-        let tp_lines: Vec<String> = (0..2)
-            .map(|idx| {
-                let tp = ReportFormatter::price_esc(risk.take_profit_levels[idx]);
-                let rr = escape_markdown_v2(&format!("{:.1}", risk.rr_levels[idx]));
-                let alloc = escape_markdown_v2(&format!("{:.0}", risk.allocation[idx] * 100.0));
-                format!("▸ TP{}: `${}` \\(RR:{} \\| {}%\\)", idx + 1, tp, rr, alloc)
+        let tp_lines: Vec<String> = risk
+            .take_profit_levels
+            .iter()
+            .zip(risk.allocation.iter())
+            .enumerate()
+            .map(|(idx, (&tp, &alloc))| {
+                let tp_str = ReportFormatter::price_esc(tp);
+                let alloc_str = escape_markdown_v2(&format!("{:.0}", alloc * 100.0));
+                format!("▸ TP{}: `${}` \\({}%\\)", idx + 1, tp_str, alloc_str)
             })
             .collect();
 

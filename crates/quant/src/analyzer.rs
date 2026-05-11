@@ -240,7 +240,7 @@ impl Default for Config {
             weights,
             sensitivity: 0.02,
             divergence_threshold: 0.2,
-            min_signal_threshold: 5.0,
+            min_signal_threshold: 2.4,
         }
     }
 }

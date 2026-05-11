@@ -341,7 +341,6 @@ impl RegimeConfig {
     }
 }
 
-// ==================== FakeoutConfig ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FakeoutConfig {
     pub severity: f64,
@@ -408,7 +407,6 @@ impl FakeoutConfig {
     }
 }
 
-// ==================== SessionConfig ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     pub asian_factor: f64,
@@ -428,7 +426,6 @@ impl Default for SessionConfig {
     }
 }
 
-// ==================== ResonanceConfig ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResonanceConfig {
     pub ma20_trigger_score: f64,
@@ -487,8 +484,7 @@ pub struct RiskConfig {
     pub confidence_prior: f64,
     pub min_position_size: f64,
     pub max_position_size: f64,
-    pub mult_min: f64,
-    pub mult_max: f64,
+
     pub trailing_atr_mult: f64,
     pub lr_trend_strong: f64,
     pub lr_trend_weak: f64,
@@ -505,7 +501,7 @@ pub struct RiskConfig {
     pub min_weighted_rr: f64,
     pub entry_strategy: EntryStrategy,
     pub stop_entry_offset_pct: f64,
-    pub tsunami_tp3_atr_mult: f64,
+    pub tsunami_tp2_atr_mult: f64,
     pub min_reliable_defense_strength: f64,
     pub min_stop_dist_pct: f64,
     pub initial_protection_bars: usize,
@@ -524,8 +520,7 @@ impl Default for RiskConfig {
             confidence_prior: 0.5,
             min_position_size: 0.05,
             max_position_size: 0.5,
-            mult_min: 0.4,
-            mult_max: 1.6,
+
             trailing_atr_mult: 2.0,
             lr_trend_strong: 2.5,
             lr_trend_weak: 0.6,
@@ -542,7 +537,7 @@ impl Default for RiskConfig {
             min_weighted_rr: 1.2,
             entry_strategy: EntryStrategy::default(),
             stop_entry_offset_pct: 0.001,
-            tsunami_tp3_atr_mult: 5.0,
+            tsunami_tp2_atr_mult: 5.0,
             min_reliable_defense_strength: 0.3,
             min_stop_dist_pct: 0.0005,
             initial_protection_bars: 3,
