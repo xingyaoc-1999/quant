@@ -46,12 +46,7 @@ pub enum WellSource {
     EntrySupport,
     Ma20,
 }
-pub struct WellSourceInput {
-    dist_opt: Option<f64>,
-    source: WellSource,
-    hits: u32,
-    last_ts: i64,
-}
+
 impl WellSource {
     pub fn as_str(&self) -> &'static str {
         match self {
