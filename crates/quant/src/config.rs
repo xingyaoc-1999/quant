@@ -442,9 +442,9 @@ pub struct ResonanceConfig {
     pub bearish_div_short_boost: f64,
     pub bullish_div_long_boost: f64,
     pub mtf_misalign_penalty: f64,
-    pub div_opposite_weaken_mult: f64, // 背离弱势方削弱系数，默认0.6
-    pub aging_decay_period: f64,       // 老化衰减周期，默认30.0
-    pub mtf_unknown_penalty: f64,      // 未知趋势惩罚，默认0.95
+    pub div_opposite_weaken_mult: f64,
+    pub aging_decay_period: f64,
+    pub mtf_unknown_penalty: f64,
 }
 
 impl Default for ResonanceConfig {
