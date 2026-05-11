@@ -59,6 +59,7 @@ impl RiskManager {
         let dir = direction?;
         let is_long = dir == TradeDirection::Long;
 
+        // 资金费率硬拒绝
         if let Some(rate) = funding_rate {
             let cfg = &self.config.risk;
             if cfg.enable_funding_rate {
@@ -73,29 +74,7 @@ impl RiskManager {
         let mut tags = Vec::with_capacity(16);
         let atr_v = atr_ratio * last_price;
 
-        let has_valid_targets = wells.iter().any(|w| {
-            w.is_active
-                && if is_long {
-                    w.level > last_price
-                } else {
-                    w.level < last_price
-                }
-        });
-
-        let entry_strategy =
-            self.select_entry_strategy(regime, vol_p, is_tsunami, has_valid_targets);
-
-        let (entry_levels, entry_allocations, used_offset_pct) = self
-            .calculate_entry_levels_with_strategy(
-                wells,
-                last_price,
-                atr_v,
-                is_long,
-                is_tsunami,
-                &entry_strategy,
-                &mut tags,
-            );
-
+        // 1. 计算止损止盈结构（不依赖入场策略）
         let (sl_levels, tp_levels, tp_alloc, sl_alloc) = self.calculate_trade_structure(
             wells,
             last_price,
@@ -107,6 +86,7 @@ impl RiskManager {
             &mut tags,
         );
 
+        // 2. 计算加权盈亏比，并立即检查硬门槛
         let wrr =
             self.calculate_weighted_rr(last_price, &sl_levels, &sl_alloc, &tp_levels, &tp_alloc);
         let min_wrr = dynamic_min_weighted_rr(vol_p, regime, self.config.risk.min_weighted_rr);
@@ -115,16 +95,7 @@ impl RiskManager {
             return None;
         }
 
-        let trailing = false;
-        let dynamic_tp = !is_tsunami
-            && matches!(
-                regime,
-                TrendStructure::StrongBullish | TrendStructure::StrongBearish
-            );
-        if dynamic_tp {
-            tags.push("DYNAMIC_TP".into());
-        }
-
+        // 3. 贝叶斯置信度计算（需要 wrr）
         let likelihoods = self.compute_likelihoods(
             is_long,
             &regime,
@@ -144,8 +115,48 @@ impl RiskManager {
         let conf_mult = (posterior * 2.4 - 0.4).clamp(mult_min, mult_max);
         tags.push(format!("CONF_MULT:{:.2}", conf_mult));
 
-        let def_strength = self.get_defense_strength(wells, last_price, is_long);
+        // 4. 动态标志
+        let trailing = false;
+        let dynamic_tp = !is_tsunami
+            && matches!(
+                regime,
+                TrendStructure::StrongBullish | TrendStructure::StrongBearish
+            );
+        if dynamic_tp {
+            tags.push("DYNAMIC_TP".into());
+        }
 
+        // 5. 确定入场策略（现在可以使用真正的 conf_mult）
+        let has_valid_targets = wells.iter().any(|w| {
+            w.is_active
+                && if is_long {
+                    w.level > last_price
+                } else {
+                    w.level < last_price
+                }
+        });
+        let entry_strategy = self.select_entry_strategy(
+            regime,
+            vol_p,
+            is_tsunami,
+            has_valid_targets,
+            conf_mult, // 直接传入真正的置信度
+        );
+
+        // 6. 计算入场价位
+        let (entry_levels, entry_allocations, used_offset_pct) = self
+            .calculate_entry_levels_with_strategy(
+                wells,
+                last_price,
+                atr_v,
+                is_long,
+                is_tsunami,
+                &entry_strategy,
+                &mut tags,
+            );
+
+        // 7. 最终仓位计算
+        let def_strength = self.get_defense_strength(wells, last_price, is_long);
         let dynamic_max_loss = dynamic_max_loss_pct(vol_p, max_loss_pct);
 
         let (size, total_loss, margin_loss, violated) = self.calculate_final_position(
@@ -193,13 +204,21 @@ impl RiskManager {
         vol_p: f64,
         is_tsunami: bool,
         has_valid_target: bool,
+        conf_mult: f64,
     ) -> EntryStrategy {
+        // 高置信度 + 有效目标 → 直接追单，避免踏空
+        if conf_mult > 1.2 && has_valid_target {
+            return EntryStrategy::Stop;
+        }
+        // 无有效目标 → 只能挂限价单
         if !has_valid_target {
             return EntryStrategy::Limit;
         }
+        // 动量海啸 → 强制追单
         if is_tsunami {
             return EntryStrategy::Stop;
         }
+        // 根据趋势结构和波动率选择
         match regime {
             TrendStructure::StrongBullish | TrendStructure::StrongBearish if vol_p < 70.0 => {
                 EntryStrategy::Stop
