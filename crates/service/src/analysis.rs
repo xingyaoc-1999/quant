@@ -262,6 +262,7 @@ impl AnalysisService {
                 pos.entry_price,
                 pos.stop_loss,
                 self.config.risk.trailing_atr_mult,
+                self.config.risk.initial_protection_bars,
             ));
         }
 

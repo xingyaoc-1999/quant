@@ -9,6 +9,8 @@ pub struct TrailingStop {
     best_price: f64,
     stop_price: f64,
     trail_mult: f64,
+    protection_bars_remaining: usize,
+
     breakeven_activated: bool,
 }
 
@@ -18,6 +20,7 @@ impl TrailingStop {
         entry_price: f64,
         initial_stop: f64,
         trail_mult: f64,
+        protection_bars: usize,
     ) -> Self {
         Self {
             direction,
@@ -25,11 +28,16 @@ impl TrailingStop {
             best_price: entry_price,
             stop_price: initial_stop,
             trail_mult,
+            protection_bars_remaining: protection_bars,
             breakeven_activated: false,
         }
     }
 
     pub fn update(&mut self, current_price: f64, atr: f64) -> Option<f64> {
+        if self.protection_bars_remaining > 0 {
+            self.protection_bars_remaining -= 1;
+            return None;
+        }
         let old_stop = self.stop_price;
 
         match self.direction {

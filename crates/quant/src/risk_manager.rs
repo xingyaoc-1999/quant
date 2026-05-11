@@ -74,7 +74,17 @@ impl RiskManager {
         let mut tags = Vec::with_capacity(16);
         let atr_v = atr_ratio * last_price;
 
-        let entry_strategy = self.select_entry_strategy(regime, vol_p, is_tsunami);
+        let has_valid_targets = wells.iter().any(|w| {
+            w.is_active
+                && if is_long {
+                    w.level > last_price
+                } else {
+                    w.level < last_price
+                }
+        });
+
+        let entry_strategy =
+            self.select_entry_strategy(regime, vol_p, is_tsunami, has_valid_targets);
 
         let (entry_levels, entry_allocations, used_offset_pct) = self
             .calculate_entry_levels_with_strategy(
@@ -184,7 +194,11 @@ impl RiskManager {
         regime: TrendStructure,
         vol_p: f64,
         is_tsunami: bool,
+        has_valid_target: bool,
     ) -> EntryStrategy {
+        if !has_valid_target {
+            return EntryStrategy::Limit;
+        }
         if is_tsunami {
             return EntryStrategy::Stop;
         }
@@ -785,16 +799,7 @@ impl RiskManager {
         };
 
         let mut tp_levels = [tp1, tp2];
-        let mut tp_alloc = if is_tsunami {
-            let ta = &cfg.tsunami_allocation;
-            if ta.len() >= 2 {
-                [ta[0], ta[1]]
-            } else {
-                [0.6, 0.4]
-            }
-        } else {
-            self.dynamic_allocation(&targets, last_price, tags)
-        };
+        let mut tp_alloc = self.dynamic_allocation(&targets, last_price, tags);
 
         let n = sl_levels.len().min(2);
         if n > 0 {
