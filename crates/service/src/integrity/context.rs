@@ -441,6 +441,7 @@ impl FeatureContextManager {
         &self,
         symbol: Symbol,
         raw_direction: Option<TradeDirection>,
+        required_confirm_bars: usize,
     ) -> Option<TradeDirection> {
         let mut state = self.signal_states.entry(symbol).or_default();
         info!(
@@ -469,7 +470,7 @@ impl FeatureContextManager {
             (_, None) => {}
         }
 
-        if state.consecutive_count >= self.signal_config.confirm_bars {
+        if state.consecutive_count >= required_confirm_bars {
             state.latch_remaining = self.signal_config.latch_bars;
             state.consecutive_count = 0;
             state.last_direction

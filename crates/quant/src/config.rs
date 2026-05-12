@@ -533,7 +533,7 @@ impl Default for RiskConfig {
             max_loss_per_trade: 0.05,
             entry_atr_step_mult: 0.5,
             default_entry_allocations: [0.5, 0.3, 0.2],
-            direction_base_threshold: 15.0,
+            direction_base_threshold: 8.0,
             min_weighted_rr: 1.2,
             entry_strategy: EntryStrategy::default(),
             stop_entry_offset_pct: 0.001,
@@ -548,14 +548,18 @@ impl Default for RiskConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalStabilityConfig {
     pub confirm_bars: usize,
+    pub confirm_bars_stop: usize,
     pub latch_bars: usize,
+    pub reversal_confirm_bars: usize,
 }
 
 impl Default for SignalStabilityConfig {
     fn default() -> Self {
         Self {
-            confirm_bars: 3,
+            confirm_bars: 2,
+            confirm_bars_stop: 1,
             latch_bars: 8,
+            reversal_confirm_bars: 2,
         }
     }
 }

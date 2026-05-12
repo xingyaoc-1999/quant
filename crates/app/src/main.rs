@@ -76,7 +76,6 @@ async fn main() -> Result<()> {
 
     let open_positions = Arc::new(TokioMutex::new(HashMap::<Symbol, Position>::new()));
 
-    // 注意：这里删除了原来的第二行 let stats = ... ，现在直接使用上面的 stats.clone()
     let analysis_service = Arc::new(AnalysisService::new(
         engine.clone(),
         ctx_manager.clone(),

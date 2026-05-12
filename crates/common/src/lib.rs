@@ -14,6 +14,7 @@ use ta::{Close, High, Low, Open, Volume};
 pub mod config;
 
 pub mod utils;
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, PartialOrd, Ord,
 )]
@@ -29,6 +30,14 @@ pub enum Symbol {
     SUIUSDT,
     DOTUSDT,
     AVAXUSDT,
+    ARBUSDT,
+    OPUSDT,
+    NEARUSDT,
+    INJUSDT,
+    APTUSDT,
+    LDOUSDT,
+    ONDOUSDT,
+    HYPEUSDT,
 }
 
 impl Symbol {
@@ -37,20 +46,12 @@ impl Symbol {
     }
 
     pub fn all() -> Vec<Self> {
-        let symbols = &[
-            Self::BTCUSDT,
-            Self::ETHUSDT,
-            Self::BNBUSDT,
-            Self::SOLUSDT,
-            Self::XRPUSDT,
-            Self::DOGEUSDT,
-            Self::ADAUSDT,
-            Self::LINKUSDT,
-            Self::SUIUSDT,
-            Self::DOTUSDT,
-            Self::AVAXUSDT,
-        ];
-        symbols.to_vec()
+        use Symbol::*;
+        vec![
+            BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT, XRPUSDT, DOGEUSDT, ADAUSDT, LINKUSDT, SUIUSDT,
+            DOTUSDT, AVAXUSDT, ARBUSDT, OPUSDT, NEARUSDT, INJUSDT, APTUSDT, LDOUSDT, ONDOUSDT,
+            HYPEUSDT,
+        ]
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -66,6 +67,14 @@ impl Symbol {
             Symbol::SUIUSDT => "SUIUSDT",
             Symbol::DOTUSDT => "DOTUSDT",
             Symbol::AVAXUSDT => "AVAXUSDT",
+            Symbol::ARBUSDT => "ARBUSDT",
+            Symbol::OPUSDT => "OPUSDT",
+            Symbol::NEARUSDT => "NEARUSDT",
+            Symbol::INJUSDT => "INJUSDT",
+            Symbol::APTUSDT => "APTUSDT",
+            Symbol::LDOUSDT => "LDOUSDT",
+            Symbol::ONDOUSDT => "ONDOUSDT",
+            Symbol::HYPEUSDT => "HYPEUSDT",
         }
     }
 }
@@ -86,6 +95,14 @@ impl FromStr for Symbol {
             "SUIUSDT" | "SUI" => Ok(Symbol::SUIUSDT),
             "DOTUSDT" | "DOT" => Ok(Symbol::DOTUSDT),
             "AVAXUSDT" | "AVAX" => Ok(Symbol::AVAXUSDT),
+            "ARBUSDT" | "ARB" => Ok(Symbol::ARBUSDT),
+            "OPUSDT" | "OP" => Ok(Symbol::OPUSDT),
+            "NEARUSDT" | "NEAR" => Ok(Symbol::NEARUSDT),
+            "INJUSDT" | "INJ" => Ok(Symbol::INJUSDT),
+            "APTUSDT" | "APT" => Ok(Symbol::APTUSDT),
+            "LDOUSDT" | "LDO" => Ok(Symbol::LDOUSDT),
+            "ONDOUSDT" | "ONDO" => Ok(Symbol::ONDOUSDT),
+            "HYPEUSDT" | "HYPE" => Ok(Symbol::HYPEUSDT),
             _ => Err(format!("Unsupported symbol: {}", s)),
         }
     }

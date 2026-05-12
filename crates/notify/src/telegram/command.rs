@@ -21,7 +21,8 @@ pub enum MyCommand {
     Help,
     #[command(description = "订阅交易对")]
     Subscribe(String),
-
+    #[command(description = "查询交易对")]
+    Check(String),
     #[command(description = "系统状态")]
     Status,
 }
@@ -45,10 +46,7 @@ impl MyCommand {
                 )
                 .await?;
             }
-            Self::Help => {
-                bot.send_message(chat_id, Self::descriptions().to_string())
-                    .await?;
-            }
+
             Self::Subscribe(input) => {
                 storage.ensure_user(telegram_id).await.unwrap_or_default();
 
@@ -253,6 +251,31 @@ impl MyCommand {
                         .parse_mode(ParseMode::MarkdownV2)
                         .await?;
                 }
+            }
+            Self::Help => {
+                bot.send_message(chat_id, Self::descriptions().to_string())
+                    .await?;
+            }
+
+            Self::Check(input) => {
+                let symbol = match Symbol::from_str(&input) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        bot.send_message(chat_id, format!("❌ 无效交易对: {}", escape(&input)))
+                            .await?;
+                        return Ok(());
+                    }
+                };
+
+                let mut ctx = match ctx_manager.get_market_context(symbol) {
+                    Some(c) => c,
+                    None => {
+                        bot.send_message(chat_id, "📭 该交易对暂无市场数据，请稍后再试。")
+                            .await?;
+                        return Ok(());
+                    }
+                };
+                // let audit = engine.run(&mut ctx);
             }
         }
         Ok(())

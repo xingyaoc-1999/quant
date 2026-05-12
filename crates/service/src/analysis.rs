@@ -135,8 +135,32 @@ impl AnalysisService {
             net_score,
             raw_direction,
         );
+        let has_valid_targets = audit.gravity_wells.iter().any(|w| {
+            w.is_active
+                && if is_long_hint {
+                    w.level > audit.snapshot.price
+                } else {
+                    w.level < audit.snapshot.price
+                }
+        });
 
-        let confirmed_direction = self.manager.filter_direction(symbol, raw_direction);
+        let likely_stop = is_tsunami
+            || (estimated_confidence > 1.2 && has_valid_targets)
+            || (matches!(
+                regime,
+                TrendStructure::StrongBullish | TrendStructure::StrongBearish
+            ) && vol_p < 70.0)
+            || (vol_p > 70.0);
+
+        let required_confirm = if likely_stop {
+            self.manager.signal_config.confirm_bars_stop
+        } else {
+            self.manager.signal_config.confirm_bars
+        };
+
+        let confirmed_direction =
+            self.manager
+                .filter_direction(symbol, raw_direction, required_confirm);
 
         self.manager.save_cross_cycle_state(symbol, &ctx);
 
