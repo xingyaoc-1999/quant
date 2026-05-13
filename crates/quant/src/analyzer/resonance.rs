@@ -3,7 +3,7 @@ use crate::analyzer::{
     MarketContext, Role,
 };
 use crate::config::AnalyzerConfig;
-use crate::types::market::{DivergenceType, MacdCross, MacdMomentum, TrendStructure};
+use crate::types::market::{DivergenceType, MacdCross, MacdMomentum, RsiState, TrendStructure};
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct ResonanceExtra {
@@ -60,6 +60,43 @@ impl Analyzer for ResonanceAnalyzer {
         let macd_cross = feat.signals.macd_cross;
 
         if !is_reclaim && !is_breakdown && macd_cross.is_none() {
+            let ma20_slope = feat.structure.ma20_slope;
+            let rsi_state = feat.structure.rsi_state;
+
+            let price_above_ma20 = feat
+                .indicators
+                .ma_20
+                .map(|ma20| last_price > ma20)
+                .unwrap_or(false);
+            let slope_up = ma20_slope.map_or(false, |s| s > 0.0);
+            let slope_down = ma20_slope.map_or(false, |s| s < 0.0);
+
+            let mut direction = 0.0;
+            let mut reason = String::new();
+
+            if price_above_ma20 && slope_up {
+                direction = 1.0;
+                reason = "WEAK_BULLISH (price > MA20 && slope > 0)".into();
+            } else if !price_above_ma20 && slope_down {
+                direction = -1.0;
+                reason = "WEAK_BEARISH (price < MA20 && slope < 0)".into();
+            }
+
+            if direction != 0.0 {
+                if let Some(rsi) = rsi_state {
+                    let rsi_ok = (direction > 0.0
+                        && matches!(rsi, RsiState::Strong | RsiState::Overbought))
+                        || (direction < 0.0 && matches!(rsi, RsiState::Weak | RsiState::Oversold));
+                    if rsi_ok {
+                        reason.push_str(" + RSI_CONFIRM");
+                    }
+                }
+                let base_score = 15.0 * direction;
+                return Ok(AnalysisResult::new(self.kind())
+                    .with_score(base_score)
+                    .because(reason));
+            }
+
             return Ok(AnalysisResult::new(self.kind()).with_score(0.0));
         }
 

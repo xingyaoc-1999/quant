@@ -9,7 +9,8 @@ use common::{
 };
 use quant::{analyzer::AnalysisEngine, config::AnalyzerConfig, risk_manager::RiskAssessment};
 use reqwest::Proxy;
-use service::{analysis::AnalysisEvent, integrity::context::FeatureContextManager};
+use service::analysis::AnalysisEvent;
+use service::integrity::context::FeatureContextManager;
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -154,6 +155,7 @@ impl BotApp {
 
             let storage_for_cmd = Arc::clone(&app.storage);
             let ctx_manager_for_cmd = Arc::clone(&app.ctx_manager);
+            let engine_for_cmd = Arc::clone(&app.engine);
 
             let handler = dptree::entry()
                 .branch(
@@ -162,9 +164,12 @@ impl BotApp {
                         .endpoint(move |bot: Bot, msg: Message, cmd: MyCommand| {
                             let storage = Arc::clone(&storage_for_cmd);
                             let ctx_manager = ctx_manager_for_cmd.clone();
+                            let engine = engine_for_cmd.clone();
+
                             async move {
-                                if let Err(e) =
-                                    cmd.handle(&bot, msg.chat.id, storage, ctx_manager).await
+                                if let Err(e) = cmd
+                                    .handle(&bot, msg.chat.id, storage, ctx_manager, engine)
+                                    .await
                                 {
                                     error!("❌ [Command Error] {:#}", e);
                                 }
@@ -201,91 +206,150 @@ impl BotApp {
                     .await
             });
 
-            let last_message_ids = Arc::new(TokioMutex::new(
-                HashMap::<(Symbol, ChatId), MessageId>::new(),
-            ));
+            let last_message_ids = Arc::new(TokioMutex::new(HashMap::<
+                (Symbol, ChatId),
+                (MessageId, String),
+            >::new()));
 
             loop {
                 tokio::select! {
-                     Some(event) = rx_in.recv() => {
-                         let subscribers = match app.storage.get_subscribed_users(event.symbol).await {
-                             Ok(list) => list,
-                             Err(e) => {
-                                 error!("Failed to fetch subscribers for {}: {}", event.symbol, e);
-                                 continue;
-                             }
-                         };
-                         if subscribers.is_empty() {
-                             continue;
-                         }
+                    Some(event) = rx_in.recv() => {
+                        match event {
+                            AnalysisEvent::Signal { symbol, message, assessment: _, timestamp } => {
+                                let subscribers = match app.storage.get_subscribed_users(symbol).await {
+                                    Ok(list) => list,
+                                    Err(e) => {
+                                        error!("Failed to fetch subscribers for {}: {}", symbol, e);
+                                        continue;
+                                    }
+                                };
+                                if subscribers.is_empty() { continue; }
 
-                     let timestamp = DateTime::from_timestamp_millis(event.timestamp)
-                             .unwrap_or_else(|| Utc::now())
-                .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap())
-                   .format("%Y-%m-%d %H:%M:%S")
-                           .to_string();
-                         let final_text = format!("{}\n\n🕒 Last update: `{}`", event.message, timestamp);
+                                let ts = DateTime::from_timestamp_millis(timestamp)
+                                    .unwrap_or_else(|| Utc::now())
+                                    .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap())
+                                    .format("%Y-%m-%d %H:%M:%S")
+                                    .to_string();
+                                let final_text = format!("{}\n\n🕒 Last update: `{}`", message, ts);
 
-                         for telegram_id in subscribers {
-                             let chat_id = ChatId(telegram_id);
-                             let bot = bot.clone();
-                             let text = final_text.clone();
-                             let msg_cache = Arc::clone(&last_message_ids);
-                             let storage = Arc::clone(&app.storage);
-                             let sym = event.symbol;
+                                for telegram_id in subscribers {
+                                    let chat_id = ChatId(telegram_id);
+                                    let bot = bot.clone();
+                                    let text = final_text.clone();
+                                    let msg_cache = Arc::clone(&last_message_ids);
+                                    let storage = Arc::clone(&app.storage);
+                                    let sym = symbol;
 
-                             tokio::spawn(async move {
-                                 let keyboard = build_keyboard_for_user(&storage, telegram_id, sym).await;
+                                    tokio::spawn(async move {
+                                        let keyboard = build_keyboard_for_user(&storage, telegram_id, sym).await;
+                                        let key = (sym, chat_id);
+                                        let old_entry = msg_cache.lock().await.get(&key).cloned();
 
-                                 let key = (sym, chat_id);
-                                 let old_id = msg_cache.lock().await.get(&key).copied();
+                                        if let Some((msg_id, _old_text)) = old_entry {
+                                            match bot.edit_message_text(chat_id, msg_id, &text)
+                                                .parse_mode(ParseMode::MarkdownV2)
+                                                .reply_markup(keyboard.clone())
+                                                .await
+                                            {
+                                                Ok(_) => {
+                                                    // 更新文本缓存
+                                                    msg_cache.lock().await.insert(key, (msg_id, text.clone()));
+                                                    return;
+                                                }
+                                                Err(RequestError::Api(teloxide::ApiError::MessageNotModified)) => return,
+                                                Err(RequestError::Api(teloxide::ApiError::MessageToEditNotFound)) => {
+                                                    msg_cache.lock().await.remove(&key);
+                                                }
+                                                Err(e) => {
+                                                    error!("Edit failed for [{}]: {:?}", key.0, e);
+                                                    return;
+                                                }
+                                            }
+                                        }
 
-                                 if let Some(msg_id) = old_id {
-                                     match bot.edit_message_text(chat_id, msg_id, &text)
-                                         .parse_mode(ParseMode::MarkdownV2)
-                                         .reply_markup(keyboard.clone())
-                                         .await
-                                     {
-                                         Ok(_) => return,
-                                         Err(RequestError::Api(teloxide::ApiError::MessageNotModified)) => return,
-                                         Err(RequestError::Api(teloxide::ApiError::MessageToEditNotFound)) => {
-                                             info!("Message for [{}] not found, resending.", key.0);
-                                             msg_cache.lock().await.remove(&key);
-                                         }
-                                         Err(e) => {
-                                             error!("Edit failed for [{}]: {:?}", key.0, e);
-                                             return;
-                                         }
-                                     }
-                                 }
+                                        // 发送新消息
+                                        match bot.send_message(chat_id, &text)
+                                            .parse_mode(ParseMode::MarkdownV2)
+                                            .reply_markup(keyboard)
+                                            .await
+                                        {
+                                            Ok(msg) => {
+                                                msg_cache.lock().await.insert(key, (msg.id, text.clone()));
+                                                info!("Sent new message for [{}].", key.0);
+                                            }
+                                            Err(e) => error!("Send failed for [{}]: {:?}", key.0, e),
+                                        }
+                                    });
+                                }
+                            }
+                            AnalysisEvent::SignalExpired { symbol, reason: _ } => {
+                                let subscribers = match app.storage.get_subscribed_users(symbol).await {
+                                    Ok(list) => list,
+                                    Err(e) => {
+                                        error!("Failed to fetch subscribers for {}: {}", symbol, e);
+                                        continue;
+                                    }
+                                };
+                                if subscribers.is_empty() { continue; }
 
-                                 match bot.send_message(chat_id, &text)
-                                     .parse_mode(ParseMode::MarkdownV2)
-                                     .reply_markup(keyboard)
-                                     .await
-                                 {
-                                     Ok(msg) => {
-                                         msg_cache.lock().await.insert(key, msg.id);
-                                         info!("Sent new message for [{}].", key.0);
-                                     }
-                                     Err(e) => error!("Send failed for [{}]: {:?}", key.0, e),
-                                 }
-                             });
-                         }
-                     }
-                     _ = switch_rx.recv() => {
-                         info!("🔄 Switch signal received, restarting dispatcher...");
-                         let _ = shutdown_token.shutdown();
-                         let _ = dispatch_task.await;
-                         break;
-                     }
-                     result = &mut dispatch_task => {
-                         match result {
-                             Ok(_) => { info!("Dispatcher finished."); return Ok(()); }
-                             Err(e) => { error!("Dispatcher Task Panic: {:?}", e); break; }
-                         }
-                     }
-                 }
+                                for telegram_id in subscribers {
+                                    let chat_id = ChatId(telegram_id);
+                                    let bot = bot.clone();
+                                    let msg_cache = Arc::clone(&last_message_ids);
+                                    let sym = symbol;
+
+                                    tokio::spawn(async move {
+                                        let key = (sym, chat_id);
+                                        let entry = msg_cache.lock().await.get(&key).cloned();
+
+                                        if let Some((msg_id, original_text)) = entry {
+                                            let edited = format!("{}\n\n⚠️ *信号已失效*", original_text);
+                                            match bot.edit_message_text(chat_id, msg_id, &edited)
+                                                .parse_mode(ParseMode::MarkdownV2)
+                                                .await
+                                            {
+                                                Ok(_) => {
+                                                    // 更新缓存文本
+                                                    msg_cache.lock().await.insert(key, (msg_id, edited));
+                                                    info!("Expired mark added for [{}].", key.0);
+                                                }
+                                                Err(RequestError::Api(teloxide::ApiError::MessageToEditNotFound)) => {
+                                                    msg_cache.lock().await.remove(&key);
+                                                    // 原消息已删除，发送一条独立通知
+                                                    let fallback = format!("⚠️ `{}` 信号已失效", sym);
+                                                    let _ = bot.send_message(chat_id, &fallback)
+                                                        .parse_mode(ParseMode::MarkdownV2)
+                                                        .await;
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to edit expired for [{}]: {:?}", key.0, e);
+                                                }
+                                            }
+                                        } else {
+
+                                            let msg = format!("⚠️ `{}` 信号已失效", sym);
+                                            let _ = bot.send_message(chat_id, &msg)
+                                                .parse_mode(ParseMode::MarkdownV2)
+                                                .await;
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    _ = switch_rx.recv() => {
+                        info!("🔄 Switch signal received, restarting dispatcher...");
+                        let _ = shutdown_token.shutdown();
+                        let _ = dispatch_task.await;
+                        break;
+                    }
+                    result = &mut dispatch_task => {
+                        match result {
+                            Ok(_) => { info!("Dispatcher finished."); return Ok(()); }
+                            Err(e) => { error!("Dispatcher Task Panic: {:?}", e); break; }
+                        }
+                    }
+                }
             }
 
             app.switching.store(false, Ordering::SeqCst);

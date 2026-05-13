@@ -4,6 +4,7 @@ use quant::audit::{
     build_analysis_details, write_audit_log, AuditEvent, AuditRecord, SignalSummary,
 };
 use quant::stats::SignalStats;
+use quant::types::market::TradeDirection;
 use quant::{
     analyzer::{AnalysisEngine, ContextKey},
     config::AnalyzerConfig,
@@ -22,11 +23,17 @@ use tracing::{info, warn};
 use crate::{integrity::context::FeatureContextManager, types::MarketEvent};
 
 #[derive(Debug, Clone)]
-pub struct AnalysisEvent {
-    pub symbol: Symbol,
-    pub message: String,
-    pub assessment: Option<RiskAssessment>,
-    pub timestamp: i64,
+pub enum AnalysisEvent {
+    Signal {
+        symbol: Symbol,
+        message: String,
+        assessment: Option<RiskAssessment>,
+        timestamp: i64,
+    },
+    SignalExpired {
+        symbol: Symbol,
+        reason: String,
+    },
 }
 
 pub struct AnalysisService {
@@ -37,6 +44,7 @@ pub struct AnalysisService {
     open_positions: Arc<TokioMutex<HashMap<Symbol, Position>>>,
     audit_cache: Arc<TokioMutex<HashMap<Symbol, AnalysisAudit>>>,
     stats: Arc<TokioMutex<SignalStats>>,
+    last_confirmed: TokioMutex<HashMap<Symbol, Option<TradeDirection>>>,
 }
 
 impl AnalysisService {
@@ -56,6 +64,7 @@ impl AnalysisService {
             open_positions,
             audit_cache: Arc::new(TokioMutex::new(HashMap::new())),
             stats,
+            last_confirmed: TokioMutex::new(HashMap::new()),
         }
     }
 
@@ -116,13 +125,13 @@ impl AnalysisService {
             vol_p,
             ma_dist,
             atr_ratio,
-            net_score,
+            audit.signal.raw_adjusted_score,
             is_tsunami,
             funding_rate,
         );
 
         let raw_direction = dynamic_direction_threshold(
-            net_score,
+            audit.signal.raw_adjusted_score,
             vol_p,
             regime,
             estimated_confidence,
@@ -135,6 +144,7 @@ impl AnalysisService {
             net_score,
             raw_direction,
         );
+
         let has_valid_targets = audit.gravity_wells.iter().any(|w| {
             w.is_active
                 && if is_long_hint {
@@ -163,6 +173,69 @@ impl AnalysisService {
                 .filter_direction(symbol, raw_direction, required_confirm);
 
         self.manager.save_cross_cycle_state(symbol, &ctx);
+
+        let higher_tf_trend = ctx
+            .get_role(Role::Filter)
+            .or_else(|_| ctx.get_role(Role::Trend))
+            .ok()
+            .and_then(|r| r.feature_set.structure.trend_structure);
+
+        if let (Some(confirmed_dir), Some(htf_trend)) = (confirmed_direction, higher_tf_trend) {
+            let signal_long = confirmed_dir == TradeDirection::Long;
+            let htf_bullish = matches!(
+                htf_trend,
+                TrendStructure::StrongBullish | TrendStructure::Bullish
+            );
+            let htf_bearish = matches!(
+                htf_trend,
+                TrendStructure::StrongBearish | TrendStructure::Bearish
+            );
+
+            if (signal_long && htf_bearish) || (!signal_long && htf_bullish) {
+                let reason = format!(
+                    "counter_htf: signal={:?}, htf_trend={:?}",
+                    confirmed_dir, htf_trend
+                );
+                warn!("[HTF REJECT] {} {}", symbol, reason);
+
+                let analysis = build_analysis_details(&audit.signal.sub_reports);
+                let record = AuditRecord {
+                    timestamp: Utc::now().timestamp_millis(),
+                    event: AuditEvent::Reject,
+                    symbol: symbol.as_str().to_string(),
+                    signal: None,
+                    market_snapshot: Some(audit.snapshot.clone()),
+                    analysis,
+                    reject_reason: Some(reason.clone()),
+                };
+                write_audit_log(&record).await;
+                self.stats.lock().await.add_reject(symbol, reason);
+                return;
+            }
+        }
+
+        {
+            let mut last_dir_map = self.last_confirmed.lock().await;
+            let old_dir = last_dir_map.get(&symbol).copied().flatten();
+            let new_dir = confirmed_direction;
+
+            if let Some(old) = old_dir {
+                let expired = match new_dir {
+                    Some(new) => new != old,
+                    None => true,
+                };
+                if expired {
+                    let reason = match new_dir {
+                        Some(d) => format!("方向反转 → {:?}", d),
+                        None => "方向信号丢失".into(),
+                    };
+                    let _ = self
+                        .event_tx
+                        .send(AnalysisEvent::SignalExpired { symbol, reason });
+                }
+            }
+            last_dir_map.insert(symbol, new_dir);
+        }
 
         let average_atr = ctx
             .get_role(Role::Filter)
@@ -196,7 +269,7 @@ impl AnalysisService {
                 let mut audit = audit;
                 audit.risk_assessment = Some(assessment.clone());
                 let message = audit.to_markdown_v2(&ctx);
-                let _ = self.event_tx.send(AnalysisEvent {
+                let _ = self.event_tx.send(AnalysisEvent::Signal {
                     symbol,
                     message,
                     assessment: Some(assessment.clone()),
@@ -340,7 +413,7 @@ impl AnalysisService {
                 }
 
                 let message = audit.to_markdown_v2(ctx);
-                let _ = self.event_tx.send(AnalysisEvent {
+                let _ = self.event_tx.send(AnalysisEvent::Signal {
                     symbol,
                     message,
                     assessment: audit.risk_assessment.clone(),
@@ -371,6 +444,7 @@ impl AnalysisService {
             }
         }
     }
+
     pub fn spawn_worker(
         self: Arc<Self>,
         mut event_rx: mpsc::Receiver<MarketEvent>,

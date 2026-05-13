@@ -74,8 +74,7 @@ impl RiskManager {
         let mut tags = Vec::with_capacity(16);
         let atr_v = atr_ratio * last_price;
 
-        // 1. 计算止损止盈结构（不依赖入场策略）
-        let (sl_levels, tp_levels, tp_alloc, sl_alloc) = self.calculate_trade_structure(
+        let (sl_levels, mut tp_levels, tp_alloc, sl_alloc) = self.calculate_trade_structure(
             wells,
             last_price,
             atr_v,
@@ -86,9 +85,9 @@ impl RiskManager {
             &mut tags,
         );
 
-        // 2. 计算加权盈亏比，并立即检查硬门槛
-        let wrr =
-            self.calculate_weighted_rr(last_price, &sl_levels, &sl_alloc, &tp_levels, &tp_alloc);
+        let wrr = self.calculate_weighted_rr(
+            last_price, last_price, &sl_levels, &sl_alloc, &tp_levels, &tp_alloc,
+        );
         let min_wrr = dynamic_min_weighted_rr(vol_p, regime, self.config.risk.min_weighted_rr);
         if wrr < min_wrr {
             *reject_reason = Some(format!("wrr_too_low {:.2} < {:.2}", wrr, min_wrr));
@@ -145,7 +144,7 @@ impl RiskManager {
             return None;
         }
 
-        // 6. 确定入场策略（使用真实的 conf_mult）
+        // 6. 确定入场策略
         let entry_strategy =
             self.select_entry_strategy(regime, vol_p, is_tsunami, has_valid_targets, conf_mult);
 
@@ -161,13 +160,47 @@ impl RiskManager {
                 &mut tags,
             );
 
-        // 8. 最终仓位计算
+        if entry_strategy == EntryStrategy::Stop {
+            let real_entry = entry_levels.first().copied().unwrap_or(last_price);
+            let tp_invalid = if is_long {
+                tp_levels.first().map_or(false, |&tp| tp <= real_entry)
+            } else {
+                tp_levels.first().map_or(false, |&tp| tp >= real_entry)
+            };
+            if tp_invalid {
+                let backup = if is_long {
+                    tp_levels.get(1).filter(|&&tp| tp > real_entry).copied()
+                } else {
+                    tp_levels.get(1).filter(|&&tp| tp < real_entry).copied()
+                };
+                if let Some(new_tp1) = backup {
+                    tp_levels[0] = new_tp1;
+                } else {
+                    *reject_reason = Some("stop_entry_without_valid_tp".into());
+                    return None;
+                }
+            }
+        }
+
+        // 9. 重新计算加权盈亏比（使用真实入场价）
+        let real_entry = entry_levels.first().copied().unwrap_or(last_price);
+        let final_wrr = self.calculate_weighted_rr(
+            last_price, real_entry, &sl_levels, &sl_alloc, &tp_levels, &tp_alloc,
+        );
+        let min_wrr = dynamic_min_weighted_rr(vol_p, regime, self.config.risk.min_weighted_rr);
+        if final_wrr < min_wrr {
+            *reject_reason = Some(format!("wrr_too_low {:.2} < {:.2}", final_wrr, min_wrr));
+            return None;
+        }
+
+        // 10. 最终仓位计算（传入真实入场价以修正风险计算）
         let def_strength = self.get_defense_strength(wells, last_price, is_long);
         let dynamic_max_loss = dynamic_max_loss_pct(vol_p, max_loss_pct);
 
         let (size, total_loss, margin_loss, violated) = self.calculate_final_position(
             def_strength,
             last_price,
+            real_entry, // 新增参数，用于准确计算风险
             &sl_levels,
             &sl_alloc,
             conf_mult,
@@ -186,7 +219,7 @@ impl RiskManager {
             stop_loss_levels: sl_levels,
             stop_loss_allocations: sl_alloc,
             take_profit_levels: tp_levels,
-            weighted_rr: wrr,
+            weighted_rr: final_wrr,
             confidence: posterior,
             confidence_mult: conf_mult,
             audit_tags: tags,
@@ -215,16 +248,12 @@ impl RiskManager {
         if conf_mult > 1.2 && has_valid_target {
             return EntryStrategy::Stop;
         }
-
         if is_tsunami {
-            // 此时 has_valid_target 一定为 true，因为已在 assess 中检查并拒绝无目标的信号
             return EntryStrategy::Stop;
         }
-
         if !has_valid_target {
             return EntryStrategy::Limit;
         }
-
         match regime {
             TrendStructure::StrongBullish | TrendStructure::StrongBearish if vol_p < 70.0 => {
                 EntryStrategy::Stop
@@ -501,7 +530,6 @@ impl RiskManager {
         }
     }
 
-    // 限价入场计算已移除所有海啸相关调整，因为海啸信号现在不会使用 Limit 策略。
     fn calculate_limit_entries(
         &self,
         wells: &[PriceGravityWell],
@@ -557,6 +585,15 @@ impl RiskManager {
                 allocs[1] = cfg.default_entry_allocations[1];
                 levels[2] = last_price - dir_sign * step * 2.0;
                 allocs[2] = cfg.default_entry_allocations[2];
+                // 归一化分配，保证和为1.0
+                let sum: f64 = allocs.iter().sum();
+                if sum > 0.0 {
+                    for a in &mut allocs {
+                        *a /= sum;
+                    }
+                } else {
+                    allocs = [0.5, 0.3, 0.2];
+                }
                 sort_entry_levels(&mut levels, &mut allocs, is_long, strategy);
                 return (levels, allocs);
             }
@@ -653,8 +690,7 @@ impl RiskManager {
             .sum();
         for i in 0..count {
             let w = targets[i];
-            let strength_factor = 1.0 / (w.strength.clamp(0.5, 3.0).sqrt());
-            let dynamic_offset_pct = (base_offset_pct + atr_pct * 0.3) * strength_factor;
+            let dynamic_offset_pct = base_offset_pct + atr_pct * 0.3; // 移除了强度放大因子
             if i == 0 {
                 used_offset_pct = dynamic_offset_pct;
             }
@@ -680,24 +716,44 @@ impl RiskManager {
             tags.push(format!("ENTRY_STOP_DYN_OFFSET:{:.4}", used_offset_pct));
         }
 
-        // 海啸模式下的追单偏移处理（有目标时）
+        // 海啸模式：重置分配，并同步调整价格
         if is_tsunami {
             let dynamic_offset_pct = base_offset_pct + atr_pct * 0.5;
             used_offset_pct = dynamic_offset_pct;
             let offset_abs = last_price * dynamic_offset_pct;
             let new_level = last_price + dir_sign * offset_abs;
+
+            // 重新生成分配：海啸追单使用固定分配，不再沿用目标井分配
             levels[0] = new_level;
-            tags.push("ENTRY_TSUNAMI_ADJUST".into());
-            // 确保追单价排在第一位
-            if let Some(pos) = levels
-                .iter()
-                .position(|&v| (v - new_level).abs() < f64::EPSILON)
-            {
-                if pos != 0 {
-                    levels.swap(0, pos);
-                    allocs.swap(0, pos);
+            allocs[0] = 0.5;
+            if count >= 2 {
+                levels[1] = targets[1].level + dir_sign * offset_abs;
+                allocs[1] = 0.3;
+                if count >= 3 {
+                    levels[2] = targets[2].level + dir_sign * offset_abs;
+                    allocs[2] = 0.2;
+                } else {
+                    // 补足第三个价位
+                    let step = atr_v * 0.5;
+                    levels[2] = new_level + dir_sign * (step * 2.0 + offset_abs);
+                    allocs[2] = 0.2;
+                }
+            } else {
+                // count == 1，只有一个目标井
+                let step = atr_v * 0.5;
+                levels[1] = new_level + dir_sign * (step + offset_abs);
+                allocs[1] = 0.3;
+                levels[2] = new_level + dir_sign * (step * 2.0 + offset_abs);
+                allocs[2] = 0.2;
+            }
+            // 确保归一化
+            let sum: f64 = allocs.iter().sum();
+            if sum > 0.0 {
+                for a in &mut allocs {
+                    *a /= sum;
                 }
             }
+            tags.push("ENTRY_TSUNAMI_ADJUST".into());
         }
 
         sort_entry_levels(&mut levels, &mut allocs, is_long, strategy);
@@ -838,6 +894,7 @@ impl RiskManager {
         let mut tp_levels = [tp1, tp2];
         let mut tp_alloc = self.dynamic_allocation(&targets, last_price, tags);
 
+        // 只对止损排序
         let n = sl_levels.len().min(2);
         if n > 0 {
             let mut sl_pairs: Vec<(f64, f64)> = sl_levels
@@ -853,18 +910,7 @@ impl RiskManager {
                 sl_alloc[i] = a;
             }
         }
-
-        let mut tp_pairs: Vec<(f64, f64)> = tp_levels
-            .iter()
-            .zip(tp_alloc.iter())
-            .map(|(&l, &a)| (l, a))
-            .collect();
-        tp_pairs.sort_by(|a, b| ((last_price - a.0).abs()).total_cmp(&(last_price - b.0).abs()));
-        for (i, (l, a)) in tp_pairs.into_iter().enumerate() {
-            tp_levels[i] = l;
-            tp_alloc[i] = a;
-        }
-
+        // 止盈不再排序，避免分配错乱
         (sl_levels, tp_levels.to_vec(), tp_alloc, sl_alloc)
     }
 
@@ -902,7 +948,8 @@ impl RiskManager {
 
     fn calculate_weighted_rr(
         &self,
-        price: f64,
+        price: f64,       // 当前价（仅用于最小距离限制）
+        entry_price: f64, // 实际成交参考价
         sl: &[f64],
         sl_alloc: &[f64],
         tp: &[f64],
@@ -914,10 +961,14 @@ impl RiskManager {
         let min_dist = price * self.config.risk.min_stop_dist_pct;
         let mut risks = Vec::with_capacity(2);
         for &s in sl.iter().take(2) {
-            let risk = ((price - s).abs()).max(min_dist);
+            let risk = ((entry_price - s).abs()).max(min_dist);
             risks.push(risk);
         }
-        let rewards: Vec<f64> = tp.iter().take(2).map(|&t| (t - price).abs()).collect();
+        let rewards: Vec<f64> = tp
+            .iter()
+            .take(2)
+            .map(|&t| (t - entry_price).abs())
+            .collect();
 
         let w_risk: f64 = risks.iter().zip(sl_alloc.iter()).map(|(r, a)| r * a).sum();
         let w_reward: f64 = rewards
@@ -957,6 +1008,7 @@ impl RiskManager {
         &self,
         def_strength: f64,
         last_price: f64,
+        entry_price: f64, // 新增：真实入场价，用于止损距离计算
         sl_levels: &[f64],
         sl_alloc: &[f64],
         conf_mult: f64,
@@ -985,7 +1037,7 @@ impl RiskManager {
             if i >= sl_alloc.len() {
                 break;
             }
-            let sl_pct = (last_price - sl).abs() / last_price;
+            let sl_pct = (entry_price - sl).abs() / entry_price; // 用真实入场价
             weighted_sl_pct += sl_pct * sl_alloc[i];
             total_alloc += sl_alloc[i];
         }

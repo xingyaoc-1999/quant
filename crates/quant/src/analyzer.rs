@@ -249,6 +249,8 @@ impl Default for Config {
 pub struct FinalSignal {
     pub symbol: Symbol,
     pub net_score: f64,
+    pub raw_adjusted_score: f64,
+
     pub is_rejected: bool,
     pub reason: String,
     pub sub_reports: Vec<ErasedAnalysisResult>,
@@ -258,6 +260,7 @@ impl FinalSignal {
     pub fn new_with_reports(
         symbol: Symbol,
         score: f64,
+        raw_adjusted_score: f64,
         reports: Vec<ErasedAnalysisResult>,
     ) -> Self {
         Self {
@@ -266,6 +269,7 @@ impl FinalSignal {
             is_rejected: false,
             reason: "OK".to_string(),
             sub_reports: reports,
+            raw_adjusted_score,
         }
     }
 
@@ -281,6 +285,8 @@ impl FinalSignal {
         Self {
             symbol,
             net_score: 0.0,
+            raw_adjusted_score: 0.0,
+
             is_rejected: true,
             reason,
             sub_reports: reports,
@@ -295,6 +301,8 @@ impl FinalSignal {
         Self {
             symbol,
             net_score: 0.0,
+            raw_adjusted_score: 0.0,
+
             is_rejected: true,
             reason: reason.into(),
             sub_reports: reports,
@@ -408,7 +416,7 @@ impl AnalysisEngine {
             );
         }
 
-        FinalSignal::new_with_reports(ctx.symbol, final_score, results)
+        FinalSignal::new_with_reports(ctx.symbol, final_score, adjusted_score, results)
     }
     fn normalize_to_standard_range(&self, score: f64) -> f64 {
         let normalized = (score * self.config.sensitivity).tanh();

@@ -29,7 +29,7 @@ pub struct SignalConfirmState {
     pub last_direction: Option<TradeDirection>,
     pub current_direction: Option<TradeDirection>,
     pub consecutive_count: usize,
-    pub latch_remaining: usize,
+    pub opposite_count: usize,
 }
 
 pub struct RoleProcessor {
@@ -215,14 +215,17 @@ impl FeatureContextManager {
                     .and_then(|ctx| ctx.latest_snap.read().ok().map(|snap| snap.timestamp))
                     .unwrap_or(0);
 
+                let is_latched = state.last_direction.is_some();
+                let opposite = state.opposite_count;
+
                 Some((
                     sym,
                     last_ts,
                     state.consecutive_count,
-                    state.latch_remaining > 0,
+                    is_latched,
                     state.last_direction,
                     state.current_direction,
-                    state.latch_remaining,
+                    opposite,
                 ))
             })
             .collect()
@@ -445,37 +448,56 @@ impl FeatureContextManager {
     ) -> Option<TradeDirection> {
         let mut state = self.signal_states.entry(symbol).or_default();
         info!(
-            "[FILTER] {} | raw={:?} | last={:?} | count={} | latch_remain={}",
+            "[FILTER] {} | raw={:?} | last={:?} | consec={} | opp={}",
             symbol.as_str(),
             raw_direction,
             state.last_direction,
             state.consecutive_count,
-            state.latch_remaining,
+            state.opposite_count,
         );
         state.current_direction = raw_direction;
 
-        if state.latch_remaining > 0 {
-            state.latch_remaining -= 1;
-            return None;
+        // 情况1：已锁存方向
+        if let Some(current_dir) = state.last_direction {
+            match raw_direction {
+                Some(dir) if dir == current_dir => {
+                    state.opposite_count = 0;
+                    return Some(current_dir);
+                }
+                Some(dir) if dir != current_dir => {
+                    state.opposite_count += 1;
+                    if state.opposite_count >= self.signal_config.reversal_confirm_bars {
+                        state.last_direction = Some(dir);
+                        state.consecutive_count = 0;
+                        state.opposite_count = 0;
+                        return Some(dir);
+                    } else {
+                        return Some(current_dir);
+                    }
+                }
+                _ => {
+                    return Some(current_dir);
+                }
+            }
         }
 
-        match (state.last_direction, raw_direction) {
-            (Some(prev), Some(curr)) if prev == curr => {
+        if let Some(dir) = raw_direction {
+            if state.last_direction == Some(dir) {
                 state.consecutive_count += 1;
-            }
-            (_, Some(curr)) => {
+            } else {
+                state.last_direction = Some(dir);
                 state.consecutive_count = 1;
-                state.last_direction = Some(curr);
             }
-            (_, None) => {}
-        }
-
-        if state.consecutive_count >= required_confirm_bars {
-            state.latch_remaining = self.signal_config.latch_bars;
-            state.consecutive_count = 0;
-            state.last_direction
+            if state.consecutive_count >= required_confirm_bars {
+                // 初次确认成功，重置反向计数，返回方向
+                state.opposite_count = 0;
+                return Some(dir);
+            }
         } else {
-            None
+            // raw 为 None，且无锁存方向，重置计数
+            state.consecutive_count = 0;
+            state.last_direction = None;
         }
+        None
     }
 }

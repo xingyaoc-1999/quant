@@ -5,3 +5,11 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+binance-sdk = { version = "49.0.0", features = [
+    "spot",
+    "derivatives_trading_usds_futures",
+    "rustls-tls",
+], default-features = false }
+
+common = { path = "../common" }
+quant = { path = "../quant" }

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use common::Symbol;
-use quant::{analyzer::ContextKey, types::gravity::PriceGravityWell};
+use quant::analyzer::AnalysisEngine;
 use service::integrity::context::FeatureContextManager;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -34,6 +34,7 @@ impl MyCommand {
         chat_id: ChatId,
         storage: Arc<Storage>,
         ctx_manager: Arc<FeatureContextManager>,
+        engine: Arc<AnalysisEngine>,
     ) -> Result<()> {
         let telegram_id = chat_id.0;
 
@@ -133,8 +134,15 @@ impl MyCommand {
                 } else {
                     let mut msg = String::from("*📊 实时系统状态*\n\n");
 
-                    for (symbol, last_ts, count, latch, last_dir, current_dir, latch_remain) in
-                        &user_status
+                    for (
+                        symbol,
+                        last_ts,
+                        consec_count,
+                        is_latched,
+                        last_dir,
+                        current_dir,
+                        opposite_count,
+                    ) in &user_status
                     {
                         let seconds_ago = (now - *last_ts as i64) / 1000;
 
@@ -147,10 +155,14 @@ impl MyCommand {
                             None => "—".into(),
                         };
 
-                        let latch_status = if *latch {
-                            format!("🔒 锁存中 (剩余 {} 根)", latch_remain)
+                        // 锁存状态描述
+                        let latch_status = if *is_latched {
+                            format!("🔒 已锁存 (反向计数 {})", opposite_count)
                         } else {
-                            "🔓 未锁存".into()
+                            format!(
+                                "🔓 未锁存 (确认 {}/{})",
+                                consec_count, ctx_manager.signal_config.confirm_bars
+                            )
                         };
 
                         // 获取当前价格
@@ -161,64 +173,22 @@ impl MyCommand {
                             .unwrap_or(0.0);
                         let price_str = format!("${:.2}", current_price);
 
-                        let (resistance, support) = ctx_manager
-                            .get_market_context(*symbol)
-                            .map(|mc| {
-                                mc.get_cached::<Vec<PriceGravityWell>>(
-                                    ContextKey::SpaceGravityWells,
-                                )
-                                .cloned()
-                                .unwrap_or_default()
-                            })
-                            .map(|wells| {
-                                let nearest_res = wells
-                                    .iter()
-                                    .filter(|w| w.is_active && w.level > current_price)
-                                    .min_by(|a, b| {
-                                        (a.level - current_price)
-                                            .total_cmp(&(b.level - current_price))
-                                    });
-                                let nearest_sup = wells
-                                    .iter()
-                                    .filter(|w| w.is_active && w.level < current_price)
-                                    .min_by(|a, b| {
-                                        (current_price - a.level)
-                                            .total_cmp(&(current_price - b.level))
-                                    });
-                                (
-                                    nearest_res
-                                        .map(|w| format!("${:.2}", w.level))
-                                        .unwrap_or_else(|| "—".into()),
-                                    nearest_sup
-                                        .map(|w| format!("${:.2}", w.level))
-                                        .unwrap_or_else(|| "—".into()),
-                                )
-                            })
-                            .unwrap_or_else(|| ("—".into(), "—".into()));
-
                         let symbol_esc = escape(symbol.as_str());
                         let price_esc = escape(&price_str);
                         let last_esc = escape(&last_str);
                         let current_esc = escape(&current_str);
                         let latch_esc = escape(&latch_status);
-                        let res_esc = escape(&resistance);
-                        let sup_esc = escape(&support);
 
                         msg.push_str(&format!(
                             "`{symbol}`  ⏱ {age}s ago  💵 {price}\n\
                  📌 历史方向: `{hist}`  当前方向: `{curr}`\n\
-                 📈 计数: `{count}/{need}`  {latch}\n\
-                 🧲 阻力: {res}  支撑: {sup}\n\n",
+                 📈 状态: {latch}\n\n",
                             symbol = symbol_esc,
                             age = seconds_ago,
                             price = price_esc,
                             hist = last_esc,
                             curr = current_esc,
-                            count = count,
-                            need = ctx_manager.signal_config.confirm_bars,
                             latch = latch_esc,
-                            res = res_esc,
-                            sup = sup_esc,
                         ));
                     }
 
@@ -275,7 +245,27 @@ impl MyCommand {
                         return Ok(());
                     }
                 };
-                // let audit = engine.run(&mut ctx);
+
+                let audit = engine.run(&mut ctx);
+
+                let mut analysis_lines = Vec::new();
+                for r in &audit.signal.sub_reports {
+                    let score_str = format!("{:+.1}", r.score);
+                    analysis_lines.push(format!("`{:?}` {}", r.kind, score_str));
+                }
+                let analysis_text = analysis_lines.join("\n");
+
+                let mut final_text = format!("📊 *{}* 分析器评分\n\n", escape(symbol.as_str()));
+                final_text.push_str(&analysis_text);
+                final_text.push_str(&format!("\n\n🎯 净得分: {:.1}", audit.signal.net_score));
+                final_text.push_str(&format!(
+                    "\n📈 原始调整得分: {:.1}",
+                    audit.signal.raw_adjusted_score
+                ));
+
+                bot.send_message(chat_id, &final_text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
             }
         }
         Ok(())

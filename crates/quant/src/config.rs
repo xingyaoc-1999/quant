@@ -154,14 +154,14 @@ impl Default for VolatilityConfig {
             low_momentum_ratio: 0.7,
             meat_grinder_ratio: 2.0,
             acceleration_ratio: 2.2,
-            dead_multiplier: 0.15,
+            dead_multiplier: 0.25,
             acceleration_multiplier: 1.1,
-            weak_momentum_multiplier: 0.7,
+            weak_momentum_multiplier: 1.0,
             trend_resonance_multiplier: 1.35,
             squeeze_multiplier: 0.9,
             meat_grinder_multiplier: 0.25,
             normal_range_multiplier: 1.0,
-            compressed_threshold: 22.0,
+            compressed_threshold: 10.0,
         }
     }
 }
@@ -350,7 +350,7 @@ pub struct FakeoutConfig {
 impl Default for FakeoutConfig {
     fn default() -> Self {
         Self {
-            severity: 0.5,
+            severity: 0.2,
             persistence: 0.5,
         }
     }
@@ -376,7 +376,7 @@ impl FakeoutConfig {
         0.25
     }
     pub(crate) fn close_return_threshold(&self) -> f64 {
-        0.001
+        0.005
     }
     pub(crate) fn slope_strong_threshold(&self) -> f64 {
         0.1
@@ -465,7 +465,7 @@ impl Default for ResonanceConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema, PartialEq, Eq)]
 pub enum EntryStrategy {
     #[default]
     Limit,
@@ -533,7 +533,7 @@ impl Default for RiskConfig {
             max_loss_per_trade: 0.05,
             entry_atr_step_mult: 0.5,
             default_entry_allocations: [0.5, 0.3, 0.2],
-            direction_base_threshold: 8.0,
+            direction_base_threshold: 15.0,
             min_weighted_rr: 1.2,
             entry_strategy: EntryStrategy::default(),
             stop_entry_offset_pct: 0.001,
@@ -549,7 +549,6 @@ impl Default for RiskConfig {
 pub struct SignalStabilityConfig {
     pub confirm_bars: usize,
     pub confirm_bars_stop: usize,
-    pub latch_bars: usize,
     pub reversal_confirm_bars: usize,
 }
 
@@ -558,7 +557,6 @@ impl Default for SignalStabilityConfig {
         Self {
             confirm_bars: 2,
             confirm_bars_stop: 1,
-            latch_bars: 8,
             reversal_confirm_bars: 2,
         }
     }

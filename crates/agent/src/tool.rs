@@ -6,7 +6,6 @@ use serde::Deserialize;
 use service::integrity::context::FeatureContextManager;
 use std::{str::FromStr, sync::Arc};
 use thiserror::Error;
-use tracing::info;
 
 #[derive(Debug, Error)]
 pub enum ScoringToolError {
