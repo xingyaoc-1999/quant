@@ -31,7 +31,6 @@ impl Default for AnalyzerConfig {
     }
 }
 
-// ==================== GravityConfig ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GravityConfig {
     /// Gravity range (0.3~1.8). Larger value = wider influence radius.
@@ -48,6 +47,8 @@ pub struct GravityConfig {
     pub active_well_threshold: f64,
     /// Wear scales per role.
     pub wear_scales: WearScales,
+    pub conversion_confirm_bars: usize,
+    pub conversion_cooldown_bars: usize,
 }
 
 impl Default for GravityConfig {
@@ -59,6 +60,8 @@ impl Default for GravityConfig {
             wear_sensitivity: 0.6,
             wear_recovery_rate: 0.5,
             active_well_threshold: 0.08,
+            conversion_confirm_bars: 2,
+            conversion_cooldown_bars: 5,
             wear_scales: WearScales::default(),
         }
     }
@@ -373,7 +376,7 @@ impl FakeoutConfig {
         1.2
     }
     pub(crate) fn breach_atr_mult(&self) -> f64 {
-        0.25
+        0.4
     }
     pub(crate) fn close_return_threshold(&self) -> f64 {
         0.005

@@ -59,6 +59,7 @@ impl Analyzer for ResonanceAnalyzer {
         let is_breakdown = feat.signals.ma20_breakdown.unwrap_or(false);
         let macd_cross = feat.signals.macd_cross;
 
+        // ---------- 无强触发信号时，尝试弱共振 ----------
         if !is_reclaim && !is_breakdown && macd_cross.is_none() {
             let ma20_slope = feat.structure.ma20_slope;
             let rsi_state = feat.structure.rsi_state;
@@ -91,7 +92,7 @@ impl Analyzer for ResonanceAnalyzer {
                         reason.push_str(" + RSI_CONFIRM");
                     }
                 }
-                let base_score = 15.0 * direction;
+                let base_score = 15.0 * direction; // 弱共振基础分
                 return Ok(AnalysisResult::new(self.kind())
                     .with_score(base_score)
                     .because(reason));
@@ -100,6 +101,7 @@ impl Analyzer for ResonanceAnalyzer {
             return Ok(AnalysisResult::new(self.kind()).with_score(0.0));
         }
 
+        // ---------- 原有强触发逻辑 ----------
         let direction = if is_reclaim || macd_cross == Some(MacdCross::Golden) {
             1.0
         } else {

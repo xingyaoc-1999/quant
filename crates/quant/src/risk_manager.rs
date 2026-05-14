@@ -1168,7 +1168,20 @@ fn dynamic_confidence_prior(vol_p: f64, regime: TrendStructure, base_prior: f64)
         TrendStructure::Range => 0.9,
         _ => 1.0,
     };
-    (base_prior * vol_factor * regime_factor).clamp(0.3, 0.7)
+
+    let mut prior = (base_prior * vol_factor * regime_factor);
+    let (min_prior, max_prior) = if matches!(
+        regime,
+        TrendStructure::StrongBullish | TrendStructure::StrongBearish
+    ) && (vol_p > 70.0 || vol_p < 25.0)
+    {
+        (0.25, 0.75)
+    } else {
+        (0.3, 0.7)
+    };
+
+    prior = prior.clamp(min_prior, max_prior);
+    prior
 }
 
 fn dynamic_confidence_range(vol_p: f64, regime: TrendStructure) -> (f64, f64) {

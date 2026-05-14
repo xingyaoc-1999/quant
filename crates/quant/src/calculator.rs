@@ -29,13 +29,12 @@ pub struct CalculatorConfig {
     pub doji_body_ratio: f64,
     pub rsi_range_3_low: f64,
     pub rsi_range_3_high: f64,
-    // 新增：窗口大小配置
     pub struct_window: usize,
     pub vol_window: usize,
+    pub early_trend_slope_bars: i32,
 }
 
 impl CalculatorConfig {
-    /// 基础配置（适用于 H1/H4）
     fn base_config() -> Self {
         Self {
             warmup_period: 120,
@@ -51,6 +50,7 @@ impl CalculatorConfig {
             rsi_range_3_high: 55.0,
             struct_window: 50,
             vol_window: 200,
+            early_trend_slope_bars: 3,
         }
     }
 
@@ -546,7 +546,6 @@ impl FeatureCalculator {
         }
         Some(s)
     }
-
     fn get_trend_struct(
         &self,
         close: f64,
@@ -558,11 +557,11 @@ impl FeatureCalculator {
             return None;
         }
 
-        // 强趋势判定需要所有均线均已有效（指标 is_some 即可）
         let m20_valid = self.count >= 20;
         let m50_valid = self.count >= 50;
         let m200_valid = self.count >= 200;
 
+        // 标准的多空排列判断
         if m200_valid && m50_valid && m20_valid {
             if close > m20 && m20 > m50 && m50 > m200 {
                 return Some(TrendStructure::StrongBullish);
@@ -574,17 +573,25 @@ impl FeatureCalculator {
 
         if m20_valid && m50_valid {
             if close > m20 && m20 > m50 {
-                Some(TrendStructure::Bullish)
+                return Some(TrendStructure::Bullish);
             } else if close < m20 && m20 < m50 {
-                Some(TrendStructure::Bearish)
-            } else {
-                Some(TrendStructure::Range)
+                return Some(TrendStructure::Bearish);
             }
-        } else {
-            None
-        }
-    }
 
+            let slope_bars = self.ma20_slope_bars;
+            let threshold = self.config.early_trend_slope_bars;
+
+            if slope_bars >= threshold && close > m20 {
+                return Some(TrendStructure::Bullish);
+            }
+            if slope_bars <= -threshold && close < m20 {
+                return Some(TrendStructure::Bearish);
+            }
+            return Some(TrendStructure::Range);
+        }
+
+        None
+    }
     pub fn peek(
         &self,
         acc_candle: &Candle,

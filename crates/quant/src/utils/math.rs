@@ -13,21 +13,9 @@ pub fn push_fixed_window(queue: &mut VecDeque<f64>, value: f64, window: usize) {
     queue.push_back(value);
 }
 
-// ==================== 中位数计算 ====================
-
-/// 计算浮点数切片的中位数（原地修改，平均时间复杂度 O(N)）。
-///
-/// 使用快速选择算法（`select_nth_unstable_by`）使得索引 `mid` 处的元素成为
-/// 第 mid 小的元素，且左侧元素均 ≤ 它，右侧元素均 ≥ 它。
-///
-/// # 注意
-/// - 调用此函数后，`values` 中的元素顺序会被改变（处于半排序状态）。
-/// - 所有的 `NaN` 会被视为与任何值相等进行比较，因此如果中位数位置恰为 `NaN`，返回值为 `NaN`。
-/// - 空切片返回 `None`。
-///
-/// # 返回值
-/// - `Some(median)`: 中位数
-/// - `None`: 输入切片为空
+pub fn price_to_key(price: f64) -> i64 {
+    (price * 100_000_000.0).round() as i64
+}
 pub fn median(values: &mut [f64]) -> Option<f64> {
     let len = values.len();
     if len == 0 {
@@ -36,7 +24,6 @@ pub fn median(values: &mut [f64]) -> Option<f64> {
 
     let mid = len / 2;
 
-    // 第一次快速选择：使 values[mid] 成为第 mid 小的元素
     values.select_nth_unstable_by(mid, |a, b| {
         a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
     });
@@ -45,8 +32,6 @@ pub fn median(values: &mut [f64]) -> Option<f64> {
         // 奇数长度：中间元素即为中位数
         Some(values[mid])
     } else {
-        // 偶数长度：需要左中位数（第 mid-1 小的元素）
-        // 左中位数必然在 values[..mid] 中，且是其中的最大值
         let left_max = values[..mid]
             .iter()
             .copied()
@@ -103,7 +88,7 @@ pub fn dynamic_direction_threshold(
         _ => 1.0,
     };
 
-    let confidence_factor = 1.0 / confidence_mult.clamp(0.5, 2.0);
+    let confidence_factor = 1.0 / confidence_mult.clamp(0.5, 2.0).sqrt();
     let threshold = base_threshold * vol_factor * regime_factor * confidence_factor;
 
     if net_score > threshold {

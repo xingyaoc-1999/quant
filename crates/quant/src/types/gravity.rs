@@ -9,7 +9,12 @@ pub enum WellSide {
     Resistance,
     Magnet,
 }
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConversionState {
+    pub target_side: WellSide,
+    pub consecutive_bars: usize,
+    pub cooldown_remaining: usize,
+}
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct PriceGravityWell {
     pub level: f64,

@@ -8,7 +8,7 @@ use quant::{
     stats::SignalStats,
     types::{
         futures::{OIData, Role, RoleData, TakerFlowData},
-        gravity::PriceGravityWell,
+        gravity::{PriceGravityWell, WellSide},
         market::{DerivativeSnapshot, TradeDirection},
     },
 };
@@ -143,6 +143,7 @@ impl RoleProcessor {
 pub struct CrossCycleState {
     pub gravity_wells: Vec<PriceGravityWell>,
     pub fakeout_state: HashMap<String, (usize, usize)>,
+    pub pending_conversions: HashMap<(WellSide, i64), ConversionState>,
 }
 
 pub struct SymbolContext {
@@ -307,6 +308,10 @@ impl FeatureContextManager {
         if let Some(state) = self.cross_cycle_state.get(&symbol) {
             mc.set_cached(ContextKey::SpaceGravityWells, state.gravity_wells.clone());
             mc.set_cached(ContextKey::FakeoutState, state.fakeout_state.clone());
+            mc.set_cached(
+                ContextKey::WellConversionState,
+                state.pending_conversions.clone(),
+            );
         }
         Some(mc)
     }
@@ -320,16 +325,22 @@ impl FeatureContextManager {
             .get_cached::<HashMap<String, (usize, usize)>>(ContextKey::FakeoutState)
             .cloned()
             .unwrap_or_default();
+        let pending_conversions = ctx
+            .get_cached::<HashMap<(WellSide, i64), ConversionState>>(
+                ContextKey::WellConversionState,
+            )
+            .cloned()
+            .unwrap_or_default();
 
         self.cross_cycle_state.insert(
             symbol,
             CrossCycleState {
                 gravity_wells,
                 fakeout_state,
+                pending_conversions,
             },
         );
     }
-
     pub fn warmup_symbols(
         &self,
         history_map: HashMap<Symbol, HashMap<Interval, Vec<Candle>>>,

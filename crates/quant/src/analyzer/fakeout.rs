@@ -6,11 +6,8 @@ use crate::config::{AnalyzerConfig, FakeoutConfig};
 use crate::types::gravity::{PriceGravityWell, WellSide, WellSource};
 use crate::types::market::{PriceAction, RsiState, VolumeState};
 use crate::types::session::TradingSession;
+use crate::utils::math::price_to_key;
 use std::collections::HashMap;
-
-fn price_to_key(price: f64) -> i64 {
-    (price * 100_000_000.0).round() as i64
-}
 
 type WellKey = (WellSource, WellSide, i64);
 

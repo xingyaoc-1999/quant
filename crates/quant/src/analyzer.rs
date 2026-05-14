@@ -46,6 +46,7 @@ pub enum ContextKey {
     FundingRate,
     MarketStressLevel,
     FakeoutState,
+    WellConversionState,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy, Serialize, Deserialize, JsonSchema)]

@@ -3,9 +3,11 @@ use crate::analyzer::{
     MarketContext, Role,
 };
 use crate::config::AnalyzerConfig;
-use crate::types::gravity::{PriceGravityWell, WellSide, WellSource};
+use crate::types::gravity::{ConversionState, PriceGravityWell, WellSide, WellSource};
 use crate::types::market::TrendStructure;
+use crate::utils::math::price_to_key;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::f64::consts::LN_2;
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -217,6 +219,77 @@ impl Analyzer for GravityAnalyzer {
             regime,
         );
 
+        // ───── 非海啸模式下的突破后角色转换（支撑↔阻力） ─────
+        let confirm_bars = cfg.conversion_confirm_bars;
+        let cooldown_bars = cfg.conversion_cooldown_bars;
+        let effective_buffer = sigma * 0.5;
+
+        let mut pending: HashMap<(WellSide, i64), ConversionState> = ctx
+            .cache
+            .remove(&ContextKey::WellConversionState)
+            .and_then(|boxed| {
+                boxed
+                    .downcast::<HashMap<(WellSide, i64), ConversionState>>()
+                    .ok()
+            })
+            .map(|b| *b)
+            .unwrap_or_default();
+
+        for well in &mut wells {
+            if !well.is_active || well.side == WellSide::Magnet {
+                let key = (well.side, price_to_key(well.level));
+                pending.remove(&key);
+                continue;
+            }
+
+            let dist_pct = (well.level - last_price) / last_price;
+            let key = (well.side, price_to_key(well.level));
+
+            // 冷却处理
+            if let Some(state) = pending.get_mut(&key) {
+                if state.cooldown_remaining > 0 {
+                    state.cooldown_remaining -= 1;
+                    continue; // 冷却期内不检查突破
+                }
+            }
+
+            let (crossed, target_side) = match well.side {
+                WellSide::Resistance if dist_pct < -effective_buffer => (true, WellSide::Support),
+                WellSide::Support if dist_pct > effective_buffer => (true, WellSide::Resistance),
+                _ => (false, well.side),
+            };
+
+            if crossed {
+                let entry = pending.entry(key).or_insert(ConversionState {
+                    target_side,
+                    consecutive_bars: 0,
+                    cooldown_remaining: 0,
+                });
+                entry.consecutive_bars += 1;
+                if entry.consecutive_bars >= confirm_bars {
+                    // 确认转换
+                    well.side = entry.target_side;
+                    entry.cooldown_remaining = cooldown_bars;
+                    entry.consecutive_bars = 0;
+                }
+            } else {
+                if let Some(entry) = pending.get_mut(&key) {
+                    entry.consecutive_bars = 0;
+                }
+            }
+        }
+
+        // 清理已经不存在的井的待定状态
+        let current_keys: Vec<(WellSide, i64)> = wells
+            .iter()
+            .filter(|w| w.is_active && w.side != WellSide::Magnet)
+            .map(|w| (w.side, price_to_key(w.level)))
+            .collect();
+        pending.retain(|k, _| current_keys.contains(k));
+
+        ctx.set_cached(ContextKey::WellConversionState, pending);
+
+        // 继续计算总分
         let total_res = Self::composite_strength(
             wells
                 .iter()
