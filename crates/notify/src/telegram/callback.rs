@@ -10,7 +10,8 @@ use std::sync::Arc;
 use storage::postgres::Storage;
 use teloxide::{
     prelude::*,
-    types::{CallbackQuery, ChatId, MessageId},
+    types::{CallbackQuery, ChatId, MessageId, ParseMode},
+    utils::markdown::escape,
     Bot,
 };
 
@@ -56,8 +57,69 @@ pub async fn handle_callback(
         d if d.starts_with("unmute_") => {
             handle_unmute(&bot, &q, d, chat_id, msg_id, &deps, user_id).await?
         }
+        d if d.starts_with("check_") => handle_check_callback(&bot, &q, d, chat_id, &deps).await?,
         _ => {}
     }
+    Ok(())
+}
+
+async fn handle_check_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+    data: &str,
+    chat_id: ChatId,
+    deps: &CallbackDeps,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let symbol_str = data.trim_start_matches("check_");
+    let symbol = match Symbol::from_str(symbol_str) {
+        Ok(s) => s,
+        Err(_) => {
+            bot.answer_callback_query(q.id.clone())
+                .text("无效交易对")
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
+    };
+
+    // 通知用户正在查询
+    bot.answer_callback_query(q.id.clone())
+        .text(format!("正在查询 {} …", symbol_str))
+        .await?;
+
+    // 获取市场上下文
+    let mut ctx = match deps.ctx_manager.get_market_context(symbol) {
+        Some(c) => c,
+        None => {
+            bot.send_message(chat_id, "📭 该交易对暂无市场数据，请稍后再试。")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    // 运行分析引擎
+    let audit = deps.engine.run(&mut ctx);
+
+    // 收集子分析器分数
+    let mut analysis_lines = Vec::new();
+    for r in &audit.signal.sub_reports {
+        let score_str = format!("{:+.1}", r.score);
+        analysis_lines.push(format!("`{:?}` {}", r.kind, score_str));
+    }
+    let analysis_text = analysis_lines.join("\n");
+
+    // 构造最终消息
+    let mut final_text = format!("📊 *{}* 分析器评分\n\n", escape(symbol.as_str()));
+    final_text.push_str(&analysis_text);
+    final_text.push_str(&format!(
+        "\n\n📈 原始调整得分: {:.1}",
+        audit.signal.raw_adjusted_score
+    ));
+
+    bot.send_message(chat_id, &final_text)
+        .parse_mode(ParseMode::MarkdownV2)
+        .await?;
+
     Ok(())
 }
 
@@ -79,7 +141,6 @@ async fn handle_subscribe_callback(
         return Ok(());
     };
 
-    
     if let Err(e) = deps.storage.ensure_user(user_id).await {
         bot.answer_callback_query(q.id.clone())
             .text(format!("用户初始化失败: {e}"))

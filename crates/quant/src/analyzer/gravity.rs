@@ -99,6 +99,29 @@ impl Analyzer for GravityAnalyzer {
             .cloned()
             .unwrap_or_default();
 
+        let rvol = ctx
+            .get_cached::<f64>(ContextKey::LastRVol)
+            .copied()
+            .unwrap_or(1.0);
+        let eff = ctx
+            .get_cached::<f64>(ContextKey::LastEfficiency)
+            .copied()
+            .unwrap_or(0.5);
+
+        // 可配置的阈值与乘数（后续可移入 GravityConfig）
+        let volume_boost_threshold = 1.5;
+        let volume_boost_mult = 1.3;
+        let volume_penalty_threshold = 0.5;
+        let volume_penalty_mult = 0.7;
+
+        let volume_factor = if rvol > volume_boost_threshold && eff > 0.6 {
+            volume_boost_mult
+        } else if rvol < volume_penalty_threshold && eff < 0.3 {
+            volume_penalty_mult
+        } else {
+            1.0
+        };
+
         let mut wells = Vec::new();
         let mut dampened_indices = std::collections::HashSet::new();
 
@@ -139,6 +162,7 @@ impl Analyzer for GravityAnalyzer {
                 last_price,
                 confluence_gate,
                 &mut dampened_indices,
+                volume_factor,
             );
         }
 
@@ -157,6 +181,7 @@ impl Analyzer for GravityAnalyzer {
                 last_price,
                 confluence_gate,
                 &mut dampened_indices,
+                volume_factor,
             );
         }
 
@@ -176,6 +201,7 @@ impl Analyzer for GravityAnalyzer {
                 last_price,
                 confluence_gate,
                 &mut dampened_indices,
+                volume_factor,
             );
             self.add_well_source(
                 &WellSourceInput {
@@ -191,6 +217,7 @@ impl Analyzer for GravityAnalyzer {
                 last_price,
                 confluence_gate,
                 &mut dampened_indices,
+                volume_factor,
             );
         }
 
@@ -352,6 +379,7 @@ impl GravityAnalyzer {
         last_price: f64,
         confluence_gate: f64,
         dampened: &mut std::collections::HashSet<usize>,
+        volume_factor: f64,
     ) {
         let dist_raw = match input.dist_opt {
             Some(d) => d,
@@ -377,6 +405,8 @@ impl GravityAnalyzer {
         if ma_converging {
             strength *= cfg.convergence_boost();
         }
+        // 成交量因子生效
+        strength *= volume_factor;
 
         if strength < cfg.min_well_strength() {
             return;

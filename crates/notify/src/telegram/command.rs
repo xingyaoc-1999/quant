@@ -165,7 +165,6 @@ impl MyCommand {
                             )
                         };
 
-                        // 获取当前价格
                         let current_price = ctx_manager
                             .symbol_contexts
                             .get(symbol)
@@ -205,16 +204,6 @@ impl MyCommand {
                         stats.signal_count, stats.reject_count, stats.update_count, avg_rr
                     ));
 
-                    for sym in &subscribed {
-                        if let Some(reason) = stats.reject_reasons.get(sym) {
-                            msg.push_str(&format!(
-                                "`{}`  ⚠️ 上次拒绝: {}\n",
-                                escape(sym.as_str()),
-                                escape(reason)
-                            ));
-                        }
-                    }
-
                     msg.push_str(&format!("📡 当前订阅交易对: {}", subscribed.len()));
 
                     bot.send_message(chat_id, &msg)
@@ -228,6 +217,32 @@ impl MyCommand {
             }
 
             Self::Check(input) => {
+                // 如果未输入交易对，弹出选择菜单
+                if input.trim().is_empty() {
+                    let all_symbols = Symbol::all();
+                    let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
+
+                    for chunk in all_symbols.chunks(3) {
+                        let row = chunk
+                            .iter()
+                            .map(|s| {
+                                InlineKeyboardButton::callback(
+                                    s.as_str(),
+                                    format!("check_{}", s.as_str()), // 使用 check_ 前缀
+                                )
+                            })
+                            .collect();
+                        buttons.push(row);
+                    }
+
+                    let keyboard = InlineKeyboardMarkup::new(buttons);
+                    bot.send_message(chat_id, "📊 请选择要查询的交易对：")
+                        .reply_markup(keyboard)
+                        .await?;
+                    return Ok(());
+                }
+
+                // 以下为原有逻辑：带参数查询
                 let symbol = match Symbol::from_str(&input) {
                     Ok(s) => s,
                     Err(_) => {

@@ -8,7 +8,7 @@ use quant::{
     stats::SignalStats,
     types::{
         futures::{OIData, Role, RoleData, TakerFlowData},
-        gravity::{PriceGravityWell, WellSide},
+        gravity::{ConversionState, PriceGravityWell, WellSide},
         market::{DerivativeSnapshot, TradeDirection},
     },
 };
