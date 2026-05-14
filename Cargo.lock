@@ -506,6 +506,10 @@ dependencies = [
  "binance-sdk",
  "common",
  "quant",
+ "rust_decimal",
+ "service",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

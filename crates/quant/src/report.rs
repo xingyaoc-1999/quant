@@ -151,9 +151,9 @@ impl AnalysisAudit {
         let session = TradingSession::from_timestamp(ctx.global.timestamp);
         let session_str = escape_markdown_v2(session.as_str());
 
-        let dir_icon = if signal.net_score > 0.0 {
+        let dir_icon = if signal.raw_adjusted_score > 0.0 {
             "📈"
-        } else if signal.net_score < 0.0 {
+        } else if signal.raw_adjusted_score < 0.0 {
             "📉"
         } else {
             "➖"
@@ -185,7 +185,7 @@ impl AnalysisAudit {
             "─────────\n\
              🎯 Score: `{score}` {status} \\| 💧 OI Δ: `{oi}%`\n\
              💵 Price: `${price}`",
-            score = ReportFormatter::raw(signal.net_score, 0),
+            score = ReportFormatter::raw(signal.raw_adjusted_score, 0),
             status = status_icon,
             oi = escape_markdown_v2(&oi_str),
             price = ReportFormatter::price(snapshot.price)

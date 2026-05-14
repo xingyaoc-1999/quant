@@ -457,7 +457,6 @@ impl FeatureContextManager {
         );
         state.current_direction = raw_direction;
 
-        // 情况1：已锁存方向
         if let Some(current_dir) = state.last_direction {
             match raw_direction {
                 Some(dir) if dir == current_dir => {

@@ -10,6 +10,10 @@ binance-sdk = { version = "49.0.0", features = [
     "derivatives_trading_usds_futures",
     "rustls-tls",
 ], default-features = false }
+rust_decimal = { version = "1", features = ["serde"] }
 
+tokio.workspace = true
+tracing.workspace = true
 common = { path = "../common" }
 quant = { path = "../quant" }
+service = { path = "../service" }

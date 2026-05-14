@@ -50,7 +50,7 @@ impl RiskManager {
         is_tsunami: bool,
         taker_ratio: f64,
         ma20_dist: Option<f64>,
-        net_score: f64,
+        raw_score: f64,
         max_loss_pct: Option<f64>,
         funding_rate: Option<f64>,
         leverage: f64,
@@ -59,7 +59,6 @@ impl RiskManager {
         let dir = direction?;
         let is_long = dir == TradeDirection::Long;
 
-        // 资金费率硬拒绝
         if let Some(rate) = funding_rate {
             let cfg = &self.config.risk;
             if cfg.enable_funding_rate {
@@ -94,7 +93,6 @@ impl RiskManager {
             return None;
         }
 
-        // 3. 贝叶斯置信度计算（需要 wrr）
         let likelihoods = self.compute_likelihoods(
             is_long,
             &regime,
@@ -103,7 +101,7 @@ impl RiskManager {
             wrr,
             ma20_dist,
             atr_ratio,
-            net_score,
+            raw_score,
             is_tsunami,
             funding_rate,
             &mut tags,
@@ -182,7 +180,6 @@ impl RiskManager {
             }
         }
 
-        // 9. 重新计算加权盈亏比（使用真实入场价）
         let real_entry = entry_levels.first().copied().unwrap_or(last_price);
         let final_wrr = self.calculate_weighted_rr(
             last_price, real_entry, &sl_levels, &sl_alloc, &tp_levels, &tp_alloc,
@@ -193,7 +190,6 @@ impl RiskManager {
             return None;
         }
 
-        // 10. 最终仓位计算（传入真实入场价以修正风险计算）
         let def_strength = self.get_defense_strength(wells, last_price, is_long);
         let dynamic_max_loss = dynamic_max_loss_pct(vol_p, max_loss_pct);
 
@@ -272,7 +268,7 @@ impl RiskManager {
         vol_p: f64,
         ma20_dist: Option<f64>,
         atr_ratio: f64,
-        net_score: f64,
+        raw_score: f64,
         is_tsunami: bool,
         funding_rate: Option<f64>,
     ) -> f64 {
@@ -283,7 +279,7 @@ impl RiskManager {
             vol_p,
             ma20_dist,
             atr_ratio,
-            net_score,
+            raw_score,
             is_tsunami,
             funding_rate,
         );
@@ -301,7 +297,7 @@ impl RiskManager {
         vol_p: f64,
         ma_dist: Option<f64>,
         atr_r: f64,
-        net_score: f64,
+        raw_score: f64,
         is_tsunami: bool,
         funding_rate: Option<f64>,
     ) -> [f64; 8] {
@@ -313,7 +309,7 @@ impl RiskManager {
             vol_p,
             ma_dist,
             atr_r,
-            net_score,
+            raw_score,
             is_tsunami,
             funding_rate,
             &mut dummy,
@@ -891,10 +887,9 @@ impl RiskManager {
                 .unwrap_or_else(|| last_price + dir_sign * atr_v * 3.0)
         };
 
-        let mut tp_levels = [tp1, tp2];
-        let mut tp_alloc = self.dynamic_allocation(&targets, last_price, tags);
+        let tp_levels = [tp1, tp2];
+        let tp_alloc = self.dynamic_allocation(&targets, last_price, tags);
 
-        // 只对止损排序
         let n = sl_levels.len().min(2);
         if n > 0 {
             let mut sl_pairs: Vec<(f64, f64)> = sl_levels

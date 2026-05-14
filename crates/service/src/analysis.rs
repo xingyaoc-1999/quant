@@ -80,8 +80,6 @@ impl AnalysisService {
 
         let audit = self.engine.run(&mut ctx);
 
-        let net_score = audit.signal.net_score;
-
         let vol_p = ctx
             .get_cached::<f64>(ContextKey::VolPercentile)
             .copied()
@@ -117,7 +115,7 @@ impl AnalysisService {
 
         let risk_mgr = RiskManager::new(self.config.clone());
 
-        let is_long_hint = net_score > 0.0;
+        let is_long_hint = audit.signal.raw_adjusted_score > 0.0;
         let estimated_confidence = risk_mgr.estimate_confidence(
             is_long_hint,
             regime,
@@ -141,7 +139,7 @@ impl AnalysisService {
         info!(
             "[ANALYZE] {} | net_score={:.2} | raw_direction={:?}",
             symbol.as_str(),
-            net_score,
+            audit.signal.raw_adjusted_score,
             raw_direction,
         );
 
@@ -258,7 +256,7 @@ impl AnalysisService {
                 is_tsunami,
                 taker_ratio,
                 ma_dist,
-                net_score,
+                audit.signal.raw_adjusted_score,
                 Some(self.config.risk.max_loss_per_trade),
                 funding_rate,
                 10.0,

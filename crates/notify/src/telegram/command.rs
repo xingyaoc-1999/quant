@@ -257,7 +257,6 @@ impl MyCommand {
 
                 let mut final_text = format!("📊 *{}* 分析器评分\n\n", escape(symbol.as_str()));
                 final_text.push_str(&analysis_text);
-                final_text.push_str(&format!("\n\n🎯 净得分: {:.1}", audit.signal.net_score));
                 final_text.push_str(&format!(
                     "\n📈 原始调整得分: {:.1}",
                     audit.signal.raw_adjusted_score

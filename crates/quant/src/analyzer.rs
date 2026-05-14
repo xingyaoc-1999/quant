@@ -223,7 +223,6 @@ pub struct Config {
     pub weights: HashMap<AnalyzerKind, f64>,
     pub sensitivity: f64,
     pub divergence_threshold: f64,
-    pub min_signal_threshold: f64,
 }
 
 impl Default for Config {
@@ -240,7 +239,6 @@ impl Default for Config {
             weights,
             sensitivity: 0.02,
             divergence_threshold: 0.2,
-            min_signal_threshold: 2.4,
         }
     }
 }
@@ -248,7 +246,6 @@ impl Default for Config {
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct FinalSignal {
     pub symbol: Symbol,
-    pub net_score: f64,
     pub raw_adjusted_score: f64,
 
     pub is_rejected: bool,
@@ -259,13 +256,11 @@ pub struct FinalSignal {
 impl FinalSignal {
     pub fn new_with_reports(
         symbol: Symbol,
-        score: f64,
         raw_adjusted_score: f64,
         reports: Vec<ErasedAnalysisResult>,
     ) -> Self {
         Self {
             symbol,
-            net_score: score,
             is_rejected: false,
             reason: "OK".to_string(),
             sub_reports: reports,
@@ -284,7 +279,6 @@ impl FinalSignal {
 
         Self {
             symbol,
-            net_score: 0.0,
             raw_adjusted_score: 0.0,
 
             is_rejected: true,
@@ -300,7 +294,6 @@ impl FinalSignal {
     ) -> Self {
         Self {
             symbol,
-            net_score: 0.0,
             raw_adjusted_score: 0.0,
 
             is_rejected: true,
@@ -406,20 +399,7 @@ impl AnalysisEngine {
         };
 
         let adjusted_score = raw_score * volatility_mult;
-        let final_score = self.normalize_to_standard_range(adjusted_score);
 
-        if final_score.abs() < self.config.min_signal_threshold {
-            return FinalSignal::rejected_with_reason(
-                ctx.symbol,
-                format!("WEAK_SIGNAL({:.1})", final_score),
-                results,
-            );
-        }
-
-        FinalSignal::new_with_reports(ctx.symbol, final_score, adjusted_score, results)
-    }
-    fn normalize_to_standard_range(&self, score: f64) -> f64 {
-        let normalized = (score * self.config.sensitivity).tanh();
-        (normalized * 100.0).round() / 10.0
+        FinalSignal::new_with_reports(ctx.symbol, adjusted_score, results)
     }
 }
