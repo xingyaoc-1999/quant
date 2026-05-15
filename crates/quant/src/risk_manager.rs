@@ -128,7 +128,6 @@ impl RiskManager {
             tags.push("DYNAMIC_TP".into());
         }
 
-        // 5. 检查有效目标并拒绝危险的海啸无目标信号
         let has_valid_targets = wells.iter().any(|w| {
             w.is_active
                 && if is_long {

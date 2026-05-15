@@ -216,8 +216,8 @@ impl MyCommand {
                     .await?;
             }
 
+            // 修改 Self::Check 分支
             Self::Check(input) => {
-                // 如果未输入交易对，弹出选择菜单
                 if input.trim().is_empty() {
                     let all_symbols = Symbol::all();
                     let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
@@ -242,10 +242,10 @@ impl MyCommand {
                     return Ok(());
                 }
 
-                // 以下为原有逻辑：带参数查询
                 let symbol = match Symbol::from_str(&input) {
                     Ok(s) => s,
                     Err(_) => {
+                        // 用户输入的 input 也需要转义
                         bot.send_message(chat_id, format!("❌ 无效交易对: {}", escape(&input)))
                             .await?;
                         return Ok(());
@@ -266,16 +266,17 @@ impl MyCommand {
                 let mut analysis_lines = Vec::new();
                 for r in &audit.signal.sub_reports {
                     let score_str = format!("{:+.1}", r.score);
-                    analysis_lines.push(format!("`{:?}` {}", r.kind, score_str));
+                    let kind_escaped = escape(&format!("{:?}", r.kind));
+                    let score_escaped = escape(&score_str);
+                    analysis_lines.push(format!("`{}` {}", kind_escaped, score_escaped));
                 }
                 let analysis_text = analysis_lines.join("\n");
 
-                let mut final_text = format!("📊 *{}* 分析器评分\n\n", escape(symbol.as_str()));
+                let symbol_escaped = escape(symbol.as_str());
+                let mut final_text = format!("📊 *{}* 分析器评分\n\n", symbol_escaped);
                 final_text.push_str(&analysis_text);
-                final_text.push_str(&format!(
-                    "\n📈 原始调整得分: {:.1}",
-                    audit.signal.raw_adjusted_score
-                ));
+                let score_escaped = escape(&format!("{:.1}", audit.signal.raw_adjusted_score));
+                final_text.push_str(&format!("\n📈 得分: {}", score_escaped));
 
                 bot.send_message(chat_id, &final_text)
                     .parse_mode(ParseMode::MarkdownV2)

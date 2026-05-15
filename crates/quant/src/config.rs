@@ -49,10 +49,10 @@ pub struct GravityConfig {
     pub wear_scales: WearScales,
     pub conversion_confirm_bars: usize,
     pub conversion_cooldown_bars: usize,
-    pub volume_boost_threshold: f64,   // 成交量放大阈值，如 1.5
-    pub volume_boost_mult: f64,        // 成交量放大时的强度乘数，如 1.3
-    pub volume_penalty_threshold: f64, // 成交量萎缩阈值，如 0.5
-    pub volume_penalty_mult: f64,      // 成交量萎缩时的强度乘数，如 0.7
+    pub volume_boost_threshold: f64,
+    pub volume_boost_mult: f64,
+    pub volume_penalty_threshold: f64,
+    pub volume_penalty_mult: f64,
 }
 
 impl Default for GravityConfig {
@@ -139,7 +139,6 @@ impl Default for WearScales {
     }
 }
 
-// ==================== VolatilityConfig ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolatilityConfig {
     pub extreme_low_ratio: f64,
@@ -281,7 +280,6 @@ impl VolumeConfig {
     }
 }
 
-// ==================== RegimeConfig ====================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegimeConfig {
     pub trend_bias: f64,

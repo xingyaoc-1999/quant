@@ -82,12 +82,10 @@ async fn handle_check_callback(
         }
     };
 
-    // 通知用户正在查询
     bot.answer_callback_query(q.id.clone())
-        .text(format!("正在查询 {} …", symbol_str))
+        .text(format!("正在查询 {} …", escape(symbol_str))) // 转义显示文本
         .await?;
 
-    // 获取市场上下文
     let mut ctx = match deps.ctx_manager.get_market_context(symbol) {
         Some(c) => c,
         None => {
@@ -97,24 +95,22 @@ async fn handle_check_callback(
         }
     };
 
-    // 运行分析引擎
     let audit = deps.engine.run(&mut ctx);
 
-    // 收集子分析器分数
     let mut analysis_lines = Vec::new();
     for r in &audit.signal.sub_reports {
         let score_str = format!("{:+.1}", r.score);
-        analysis_lines.push(format!("`{:?}` {}", r.kind, score_str));
+        let kind_escaped = escape(&format!("{:?}", r.kind));
+        let score_escaped = escape(&score_str);
+        analysis_lines.push(format!("`{}` {}", kind_escaped, score_escaped));
     }
     let analysis_text = analysis_lines.join("\n");
 
-    // 构造最终消息
-    let mut final_text = format!("📊 *{}* 分析器评分\n\n", escape(symbol.as_str()));
+    let symbol_escaped = escape(symbol.as_str());
+    let mut final_text = format!("📊 *{}* 分析器评分\n\n", symbol_escaped);
     final_text.push_str(&analysis_text);
-    final_text.push_str(&format!(
-        "\n\n📈 原始调整得分: {:.1}",
-        audit.signal.raw_adjusted_score
-    ));
+    let score_escaped = escape(&format!("{:.1}", audit.signal.raw_adjusted_score));
+    final_text.push_str(&format!("\n\n📈 得分: {}", score_escaped));
 
     bot.send_message(chat_id, &final_text)
         .parse_mode(ParseMode::MarkdownV2)
@@ -122,7 +118,6 @@ async fn handle_check_callback(
 
     Ok(())
 }
-
 async fn handle_subscribe_callback(
     bot: &Bot,
     q: &CallbackQuery,

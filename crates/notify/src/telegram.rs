@@ -252,7 +252,6 @@ impl BotApp {
                                                 .await
                                             {
                                                 Ok(_) => {
-                                                    // 更新文本缓存
                                                     msg_cache.lock().await.insert(key, (msg_id, text.clone()));
                                                     return;
                                                 }
@@ -267,7 +266,6 @@ impl BotApp {
                                             }
                                         }
 
-                                        // 发送新消息
                                         match bot.send_message(chat_id, &text)
                                             .parse_mode(ParseMode::MarkdownV2)
                                             .reply_markup(keyboard)
@@ -303,34 +301,28 @@ impl BotApp {
                                         let entry = msg_cache.lock().await.get(&key).cloned();
 
                                         if let Some((msg_id, original_text)) = entry {
+                                            if original_text.contains("⚠️ *信号已失效*") {
+                                                info!("Message for {} already marked as expired, skipping.", sym);
+                                                return;
+                                            }
                                             let edited = format!("{}\n\n⚠️ *信号已失效*", original_text);
                                             match bot.edit_message_text(chat_id, msg_id, &edited)
                                                 .parse_mode(ParseMode::MarkdownV2)
                                                 .await
                                             {
                                                 Ok(_) => {
-                                                    // 更新缓存文本
                                                     msg_cache.lock().await.insert(key, (msg_id, edited));
                                                     info!("Expired mark added for [{}].", key.0);
                                                 }
                                                 Err(RequestError::Api(teloxide::ApiError::MessageToEditNotFound)) => {
                                                     msg_cache.lock().await.remove(&key);
-                                                    // 原消息已删除，发送一条独立通知
-                                                    let fallback = format!("⚠️ `{}` 信号已失效", sym);
-                                                    let _ = bot.send_message(chat_id, &fallback)
-                                                        .parse_mode(ParseMode::MarkdownV2)
-                                                        .await;
                                                 }
                                                 Err(e) => {
                                                     error!("Failed to edit expired for [{}]: {:?}", key.0, e);
                                                 }
                                             }
                                         } else {
-
-                                            let msg = format!("⚠️ `{}` 信号已失效", sym);
-                                            let _ = bot.send_message(chat_id, &msg)
-                                                .parse_mode(ParseMode::MarkdownV2)
-                                                .await;
+                                            info!("No original message for {}, skip expired notification.", sym);
                                         }
                                     });
                                 }

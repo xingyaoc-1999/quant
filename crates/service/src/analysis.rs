@@ -136,13 +136,6 @@ impl AnalysisService {
             self.config.risk.direction_base_threshold,
         );
 
-        info!(
-            "[ANALYZE] {} | net_score={:.2} | raw_direction={:?}",
-            symbol.as_str(),
-            audit.signal.raw_adjusted_score,
-            raw_direction,
-        );
-
         let has_valid_targets = audit.gravity_wells.iter().any(|w| {
             w.is_active
                 && if is_long_hint {
