@@ -277,10 +277,8 @@ impl FeatureCalculator {
             );
         }
 
-        // 6. 相关性计算
         let correlation = self.calculate_correlation_stable();
 
-        // 7. 信号与斜率
         let slope = self.update_ma20_slope(m20_v, atr_v);
         let macd_cross = if is_warmed {
             self.check_macd_cross(macd_out.macd, macd_out.signal)

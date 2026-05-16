@@ -45,6 +45,7 @@ pub struct AnalysisService {
     audit_cache: Arc<TokioMutex<HashMap<Symbol, AnalysisAudit>>>,
     stats: Arc<TokioMutex<SignalStats>>,
     last_confirmed: TokioMutex<HashMap<Symbol, Option<TradeDirection>>>,
+    last_btc_direction: TokioMutex<Option<TradeDirection>>,
 }
 
 impl AnalysisService {
@@ -65,6 +66,7 @@ impl AnalysisService {
             audit_cache: Arc::new(TokioMutex::new(HashMap::new())),
             stats,
             last_confirmed: TokioMutex::new(HashMap::new()),
+            last_btc_direction: TokioMutex::new(None),
         }
     }
 
@@ -165,6 +167,40 @@ impl AnalysisService {
 
         self.manager.save_cross_cycle_state(symbol, &ctx);
 
+        if self.config.risk.enable_btc_correlation_filter && symbol != Symbol::BTCUSDT {
+            if let Some(btc_dir) = self.manager.get_btc_direction() {
+                if let Some(my_dir) = confirmed_direction {
+                    if my_dir != btc_dir {
+                        let reason = format!(
+                            "counter_btc: signal={:?}, btc_direction={:?}",
+                            my_dir, btc_dir
+                        );
+                        warn!("[BTC FILTER] {} {}", symbol, reason);
+
+                        let _ = self.event_tx.send(AnalysisEvent::SignalExpired {
+                            symbol,
+                            reason: reason.clone(),
+                        });
+
+                        let analysis = build_analysis_details(&audit.signal.sub_reports);
+                        let record = AuditRecord {
+                            timestamp: Utc::now().timestamp_millis(),
+                            event: AuditEvent::Reject,
+                            symbol: symbol.as_str().to_string(),
+                            signal: None,
+                            market_snapshot: Some(audit.snapshot.clone()),
+                            analysis,
+                            reject_reason: Some(reason.clone()),
+                        };
+                        write_audit_log(&record).await;
+                        self.stats.lock().await.add_reject(symbol, reason);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // === 逆大周期过滤 ===
         let higher_tf_trend = ctx
             .get_role(Role::Filter)
             .or_else(|_| ctx.get_role(Role::Trend))
@@ -205,6 +241,7 @@ impl AnalysisService {
             }
         }
 
+        // === 信号失效检测（该币种自身的反向） ===
         {
             let mut last_dir_map = self.last_confirmed.lock().await;
             let old_dir = last_dir_map.get(&symbol).copied().flatten();
@@ -226,6 +263,44 @@ impl AnalysisService {
                 }
             }
             last_dir_map.insert(symbol, new_dir);
+        }
+
+        // === BTC 方向变化监听：自动失效与 BTC 新方向相反的所有山寨已推送信号 ===
+        if symbol == Symbol::BTCUSDT {
+            let mut last_btc = self.last_btc_direction.lock().await;
+            let old_btc = *last_btc;
+            let new_btc = confirmed_direction;
+
+            // 当 BTC 方向发生变化（None → Some，或 Long ↔ Short）
+            let btc_changed = match (old_btc, new_btc) {
+                (None, Some(_)) => true,
+                (Some(old), Some(new)) => old != new,
+                _ => false,
+            };
+
+            if btc_changed {
+                if let Some(new_dir) = new_btc {
+                    let last_confirmed_map = self.last_confirmed.lock().await;
+                    for (&sym, &dir) in last_confirmed_map.iter() {
+                        if sym == Symbol::BTCUSDT {
+                            continue;
+                        }
+                        if let Some(sym_dir) = dir {
+                            if sym_dir != new_dir {
+                                let reason = format!(
+                                    "BTC方向变化后逆向失效: signal={:?}, btc_direction={:?}",
+                                    sym_dir, new_dir
+                                );
+                                let _ = self.event_tx.send(AnalysisEvent::SignalExpired {
+                                    symbol: sym,
+                                    reason,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            *last_btc = new_btc;
         }
 
         let average_atr = ctx

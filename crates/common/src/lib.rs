@@ -24,20 +24,15 @@ pub enum Symbol {
     BNBUSDT,
     SOLUSDT,
     XRPUSDT,
-    DOGEUSDT,
     ADAUSDT,
     LINKUSDT,
     SUIUSDT,
-    DOTUSDT,
     AVAXUSDT,
-    ARBUSDT,
+
     OPUSDT,
     NEARUSDT,
-    INJUSDT,
-    APTUSDT,
-    LDOUSDT,
+
     ONDOUSDT,
-    HYPEUSDT,
 }
 
 impl Symbol {
@@ -48,9 +43,8 @@ impl Symbol {
     pub fn all() -> Vec<Self> {
         use Symbol::*;
         vec![
-            BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT, XRPUSDT, DOGEUSDT, ADAUSDT, LINKUSDT, SUIUSDT,
-            DOTUSDT, AVAXUSDT, ARBUSDT, OPUSDT, NEARUSDT, INJUSDT, APTUSDT, LDOUSDT, ONDOUSDT,
-            HYPEUSDT,
+            BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT, XRPUSDT, ADAUSDT, LINKUSDT, SUIUSDT, AVAXUSDT,
+            OPUSDT, NEARUSDT,
         ]
     }
 
@@ -61,20 +55,14 @@ impl Symbol {
             Symbol::BNBUSDT => "BNBUSDT",
             Symbol::SOLUSDT => "SOLUSDT",
             Symbol::XRPUSDT => "XRPUSDT",
-            Symbol::DOGEUSDT => "DOGEUSDT",
             Symbol::ADAUSDT => "ADAUSDT",
             Symbol::LINKUSDT => "LINKUSDT",
             Symbol::SUIUSDT => "SUIUSDT",
-            Symbol::DOTUSDT => "DOTUSDT",
             Symbol::AVAXUSDT => "AVAXUSDT",
-            Symbol::ARBUSDT => "ARBUSDT",
             Symbol::OPUSDT => "OPUSDT",
             Symbol::NEARUSDT => "NEARUSDT",
-            Symbol::INJUSDT => "INJUSDT",
-            Symbol::APTUSDT => "APTUSDT",
-            Symbol::LDOUSDT => "LDOUSDT",
+
             Symbol::ONDOUSDT => "ONDOUSDT",
-            Symbol::HYPEUSDT => "HYPEUSDT",
         }
     }
 }
@@ -89,20 +77,13 @@ impl FromStr for Symbol {
             "BNBUSDT" | "BNB" => Ok(Symbol::BNBUSDT),
             "SOLUSDT" | "SOL" => Ok(Symbol::SOLUSDT),
             "XRPUSDT" | "XRP" => Ok(Symbol::XRPUSDT),
-            "DOGEUSDT" | "DOGE" => Ok(Symbol::DOGEUSDT),
             "ADAUSDT" | "ADA" => Ok(Symbol::ADAUSDT),
             "LINKUSDT" | "LINK" => Ok(Symbol::LINKUSDT),
             "SUIUSDT" | "SUI" => Ok(Symbol::SUIUSDT),
-            "DOTUSDT" | "DOT" => Ok(Symbol::DOTUSDT),
-            "AVAXUSDT" | "AVAX" => Ok(Symbol::AVAXUSDT),
-            "ARBUSDT" | "ARB" => Ok(Symbol::ARBUSDT),
             "OPUSDT" | "OP" => Ok(Symbol::OPUSDT),
             "NEARUSDT" | "NEAR" => Ok(Symbol::NEARUSDT),
-            "INJUSDT" | "INJ" => Ok(Symbol::INJUSDT),
-            "APTUSDT" | "APT" => Ok(Symbol::APTUSDT),
-            "LDOUSDT" | "LDO" => Ok(Symbol::LDOUSDT),
+
             "ONDOUSDT" | "ONDO" => Ok(Symbol::ONDOUSDT),
-            "HYPEUSDT" | "HYPE" => Ok(Symbol::HYPEUSDT),
             _ => Err(format!("Unsupported symbol: {}", s)),
         }
     }

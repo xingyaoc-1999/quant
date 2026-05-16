@@ -5,11 +5,7 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
-binance-sdk = { version = "49.0.0", features = [
-    "spot",
-    "derivatives_trading_usds_futures",
-    "rustls-tls",
-], default-features = false }
+
 rust_decimal = { version = "1", features = ["serde"] }
 
 tokio.workspace = true

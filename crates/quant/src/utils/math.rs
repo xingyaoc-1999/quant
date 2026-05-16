@@ -68,7 +68,7 @@ mod tests {
 }
 
 pub fn dynamic_direction_threshold(
-    net_score: f64,
+    score: f64,
     vol_p: f64,
     regime: TrendStructure,
     confidence_mult: f64,
@@ -91,9 +91,9 @@ pub fn dynamic_direction_threshold(
     let confidence_factor = 1.0 / confidence_mult.clamp(0.5, 2.0).sqrt();
     let threshold = base_threshold * vol_factor * regime_factor * confidence_factor;
 
-    if net_score > threshold {
+    if score > threshold {
         Some(TradeDirection::Long)
-    } else if net_score < -threshold {
+    } else if score < -threshold {
         Some(TradeDirection::Short)
     } else {
         None

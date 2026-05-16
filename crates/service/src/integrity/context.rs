@@ -450,7 +450,11 @@ impl FeatureContextManager {
             }
         }
     }
-
+    pub fn get_btc_direction(&self) -> Option<TradeDirection> {
+        self.signal_states
+            .get(&Symbol::BTCUSDT)
+            .and_then(|state| state.last_direction)
+    }
     pub fn filter_direction(
         &self,
         symbol: Symbol,

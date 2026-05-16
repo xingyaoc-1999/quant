@@ -810,7 +810,7 @@ impl RiskManager {
         let base_def = defenses
             .first()
             .map(|w| w.level)
-            .unwrap_or_else(|| last_price * (1.0 - dir_sign * 0.015));
+            .unwrap_or_else(|| last_price - dir_sign * atr_v * 1.0);
 
         let sl_scale = dynamic_atr_sl_scale(vol_p);
         let mut buffers = cfg
@@ -863,7 +863,7 @@ impl RiskManager {
         let tp1 = targets
             .first()
             .map(|w| w.level)
-            .unwrap_or_else(|| last_price * (1.0 + dir_sign * 0.015));
+            .unwrap_or_else(|| last_price + dir_sign * atr_v * 2.0);
 
         let tp2 = if is_tsunami {
             let base_atr = average_atr.max(atr_v);
@@ -904,7 +904,6 @@ impl RiskManager {
                 sl_alloc[i] = a;
             }
         }
-        // 止盈不再排序，避免分配错乱
         (sl_levels, tp_levels.to_vec(), tp_alloc, sl_alloc)
     }
 
