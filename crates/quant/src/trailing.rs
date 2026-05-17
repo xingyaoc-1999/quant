@@ -113,15 +113,26 @@ pub fn refresh_take_profits(
     );
 
     let new_tp_array = [new_tp[0], new_tp[1]];
-    let better = match (is_long, new_tp_array, current_tps) {
-        (true, nt, ct) if nt[0] > ct[0] => true,
-        (false, nt, ct) if nt[0] < ct[0] => true,
-        _ => false,
-    };
+    let current_tp1 = current_tps[0];
+    let current_tp2 = current_tps[1];
+    let new_tp1 = new_tp_array[0];
+    let new_tp2 = new_tp_array[1];
 
-    if better {
-        Some((new_tp_array, tp_alloc))
-    } else {
-        None
+    // 检查是否都更优（做多时更高，做空时更低）
+    let tp1_better = (is_long && new_tp1 > current_tp1) || (!is_long && new_tp1 < current_tp1);
+    let tp2_better = (is_long && new_tp2 > current_tp2) || (!is_long && new_tp2 < current_tp2);
+
+    if !tp1_better || !tp2_better {
+        return None;
     }
+
+    let min_move_pct = 0.002;
+    let move_ratio1 = (new_tp1 - current_tp1).abs() / current_tp1;
+    let move_ratio2 = (new_tp2 - current_tp2).abs() / current_tp2;
+
+    if move_ratio1 < min_move_pct && move_ratio2 < min_move_pct {
+        return None;
+    }
+
+    Some((new_tp_array, tp_alloc))
 }

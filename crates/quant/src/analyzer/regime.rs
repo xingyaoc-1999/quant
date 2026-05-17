@@ -51,6 +51,8 @@ impl Analyzer for MarketRegimeAnalyzer {
             ContextKey::VolPercentile,
             ContextKey::VolIsCompressed,
             ContextKey::SpaceGravityWells,
+            ContextKey::LastRVol,
+            ContextKey::LastEfficiency,
         ]
     }
 
@@ -92,6 +94,20 @@ impl Analyzer for MarketRegimeAnalyzer {
         let taker_ratio = trend_role.taker_flow.taker_buy_ratio;
         let ma20_slope = struct_feat.ma20_slope;
         let ma20_slope_bars = struct_feat.ma20_slope_bars;
+
+        let rvol = ctx
+            .get_cached::<f64>(ContextKey::LastRVol)
+            .copied()
+            .unwrap_or(1.0);
+        let eff = ctx
+            .get_cached::<f64>(ContextKey::LastEfficiency)
+            .copied()
+            .unwrap_or(0.5);
+        let ma20_dist = t_feat.space.ma20_dist_ratio.unwrap_or(0.0);
+        let atr_ratio = ctx
+            .get_cached::<f64>(ContextKey::VolAtrRatio)
+            .copied()
+            .unwrap_or(0.005);
 
         let btc_corr = struct_feat.correlation_with_global.unwrap_or(1.0);
         let corr_factor = match btc_corr {
@@ -191,28 +207,48 @@ impl Analyzer for MarketRegimeAnalyzer {
         let base_tsunami_oi = cfg.tsunami_base_oi_delta();
         let tsunami_oi_threshold = dynamic_tsunami_oi_threshold(vol_p, base_tsunami_oi);
 
+        // ========== 海啸判定：增加量价确认 + 过度延伸检查 ==========
         let (is_tsunami, oi_state) = match oi_delta {
             Some(delta) => {
                 let price_pct = (close_price - open_price) / open_price.max(f64::EPSILON);
                 let state = OIPositionState::determine(price_pct, delta);
-                let tsunami = (matches!(state, OIPositionState::LongBuildUp)
+                let oi_condition = (matches!(state, OIPositionState::LongBuildUp)
                     && is_bullish
                     && delta > tsunami_oi_threshold)
                     || (matches!(state, OIPositionState::ShortBuildUp)
                         && is_bearish
                         && delta > tsunami_oi_threshold);
-                (tsunami, state)
+                if !oi_condition {
+                    (false, state)
+                } else {
+                    // 量价确认：放量 + 高效
+                    let volume_ok = rvol > 1.5 && eff > 0.6;
+                    // 过度延伸：价格远离 MA20 > 3% 或 ATR 比率 > 2%
+                    let overextended = ma20_dist.abs() > 0.03 || atr_ratio > 0.02;
+                    let rsi_extreme = match (is_bullish, &rsi_state) {
+                        (true, Some(RsiState::Overbought)) => true,
+                        (false, Some(RsiState::Oversold)) => true,
+                        _ => false,
+                    };
+                    let extreme_ok = !overextended && !rsi_extreme;
+                    let tsunami = volume_ok && extreme_ok;
+                    (tsunami, state)
+                }
             }
             None => (false, OIPositionState::Neutral),
         };
+        // ========== 海啸判定结束 ==========
 
         ctx.set_cached(ContextKey::IsMomentumTsunami, is_tsunami);
         ctx.set_cached(ContextKey::OiPositionState, oi_state);
         ctx.set_cached(ContextKey::RegimeStructure, structure.clone());
 
         if is_tsunami {
-            res = res.because("TSUNAMI: 动能海啸触发");
-            m_momentum *= 1.8;
+            res = res.because("TSUNAMI: 动能海啸触发（量价确认+非过度延伸）");
+            // 动态乘数：基础 1.3，随 rvol 和 eff 增加，上限 2.0
+            let tsunami_mult = 1.3 + (rvol - 1.5).min(0.8) * 0.5 + (eff - 0.6).min(0.4) * 0.5;
+            let tsunami_mult = tsunami_mult.clamp(1.3, 2.0);
+            m_momentum *= tsunami_mult;
         }
 
         let m_game = self.calc_game_mult(taker_ratio, structure);

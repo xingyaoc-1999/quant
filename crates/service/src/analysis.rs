@@ -84,13 +84,11 @@ impl AnalysisService {
 
         let audit = self.engine.run(&mut ctx);
 
-        // 引擎明确拒绝 -> 失效旧信号并返回
         if audit.signal.is_rejected {
             let reason = format!("引擎拒绝: {}", audit.signal.reason);
             let _ = self
                 .event_tx
                 .send(AnalysisEvent::SignalExpired { symbol, reason });
-            // [宽松修改] 冷却时间 5 -> 2
             self.close_cooldown.lock().await.insert(symbol, 2);
             return;
         }
@@ -131,7 +129,7 @@ impl AnalysisService {
         let risk_mgr = RiskManager::new(self.config.clone());
 
         let is_long_hint = audit.signal.raw_adjusted_score > 0.0;
-        let estimated_confidence = risk_mgr.estimate_confidence(
+        let mut estimated_confidence = risk_mgr.estimate_confidence(
             is_long_hint,
             regime,
             taker_ratio,
@@ -151,14 +149,24 @@ impl AnalysisService {
             self.config.risk.direction_base_threshold,
         );
 
-        let has_valid_targets = audit.gravity_wells.iter().any(|w| {
-            w.is_active
-                && if is_long_hint {
-                    w.level > audit.snapshot.price
-                } else {
-                    w.level < audit.snapshot.price
-                }
-        });
+        // ===== 修改：强趋势或海啸时，无需重力井目标 =====
+        let has_valid_targets = if is_tsunami
+            || matches!(
+                regime,
+                TrendStructure::StrongBullish | TrendStructure::StrongBearish
+            ) {
+            true
+        } else {
+            audit.gravity_wells.iter().any(|w| {
+                w.is_active
+                    && if is_long_hint {
+                        w.level > audit.snapshot.price
+                    } else {
+                        w.level < audit.snapshot.price
+                    }
+            })
+        };
+        // ===== 结束修改 =====
 
         let likely_stop = is_tsunami
             || (estimated_confidence > 1.2 && has_valid_targets)
@@ -206,7 +214,6 @@ impl AnalysisService {
                         };
                         write_audit_log(&record).await;
                         self.stats.lock().await.add_reject(symbol, reason);
-                        // [宽松修改] 冷却时间 5 -> 2
                         self.close_cooldown.lock().await.insert(symbol, 2);
                         return;
                     }
@@ -214,7 +221,7 @@ impl AnalysisService {
             }
         }
 
-        // --- 逆大周期过滤 ---
+        // --- 逆大周期过滤（适度宽松：仅强趋势拦截）---
         let higher_tf_trend = ctx
             .get_role(Role::Filter)
             .or_else(|_| ctx.get_role(Role::Trend))
@@ -223,17 +230,11 @@ impl AnalysisService {
 
         if let (Some(confirmed_dir), Some(htf_trend)) = (confirmed_direction, higher_tf_trend) {
             let signal_long = confirmed_dir == TradeDirection::Long;
-            let htf_bullish = matches!(
-                htf_trend,
-                TrendStructure::StrongBullish | TrendStructure::Bullish
-            );
-            let htf_bearish = matches!(
-                htf_trend,
-                TrendStructure::StrongBearish | TrendStructure::Bearish
-            );
-            if (signal_long && htf_bearish) || (!signal_long && htf_bullish) {
+            let htf_strong_bull = matches!(htf_trend, TrendStructure::StrongBullish);
+            let htf_strong_bear = matches!(htf_trend, TrendStructure::StrongBearish);
+            if (signal_long && htf_strong_bear) || (!signal_long && htf_strong_bull) {
                 let reason = format!(
-                    "counter_htf: signal={:?}, htf_trend={:?}",
+                    "counter_htf: signal={:?}, htf_trend={:?} (strong only)",
                     confirmed_dir, htf_trend
                 );
                 warn!("[HTF REJECT] {} {}", symbol, reason);
@@ -271,7 +272,6 @@ impl AnalysisService {
                     let _ = self
                         .event_tx
                         .send(AnalysisEvent::SignalExpired { symbol, reason });
-                    // [宽松修改] 冷却时间 5 -> 2
                     self.close_cooldown.lock().await.insert(symbol, 2);
                 }
             }
@@ -305,7 +305,6 @@ impl AnalysisService {
                                     symbol: sym,
                                     reason,
                                 });
-                                // [宽松修改] 冷却时间 5 -> 2
                                 self.close_cooldown.lock().await.insert(sym, 2);
                             }
                         }
@@ -313,6 +312,61 @@ impl AnalysisService {
                 }
             }
             *last_btc = new_btc;
+        }
+
+        // ===== RSI + 缩量过滤 =====
+        if let Some(dir) = confirmed_direction {
+            let rsi = ctx
+                .get_role(Role::Trend)
+                .ok()
+                .and_then(|r| r.feature_set.indicators.rsi_14)
+                .or_else(|| {
+                    ctx.get_role(Role::Entry)
+                        .ok()
+                        .and_then(|r| r.feature_set.indicators.rsi_14)
+                })
+                .unwrap_or(50.0);
+            let rvol = ctx
+                .get_cached::<f64>(ContextKey::LastRVol)
+                .copied()
+                .unwrap_or(1.0);
+
+            let is_short = dir == TradeDirection::Short;
+            let is_long = dir == TradeDirection::Long;
+
+            let rsi_penalty = (is_short && rsi < 40.0) || (is_long && rsi > 60.0);
+            let low_volume = rvol < 1.0;
+
+            if rsi_penalty {
+                if low_volume {
+                    let reason = format!(
+                        "RSI={:.1} 且缩量(rvol={:.2})，{}空间有限",
+                        rsi,
+                        rvol,
+                        if is_short { "做空" } else { "做多" }
+                    );
+                    warn!("[RSI+VOL REJECT] {} {}", symbol, reason);
+                    let analysis = build_analysis_details(&audit.signal.sub_reports);
+                    let record = AuditRecord {
+                        timestamp: Utc::now().timestamp_millis(),
+                        event: AuditEvent::Reject,
+                        symbol: symbol.as_str().to_string(),
+                        signal: None,
+                        market_snapshot: Some(audit.snapshot.clone()),
+                        analysis,
+                        reject_reason: Some(reason.clone()),
+                    };
+                    write_audit_log(&record).await;
+                    self.stats.lock().await.add_reject(symbol, reason);
+                    return;
+                } else {
+                    estimated_confidence *= 0.7;
+                    info!(
+                        "[RSI+VOL] 降低置信度: rsi={:.1} rvol={:.2} 新置信度={:.2}",
+                        rsi, rvol, estimated_confidence
+                    );
+                }
+            }
         }
 
         let average_atr = ctx
@@ -325,7 +379,7 @@ impl AnalysisService {
         let mut reject_reason: Option<String> = None;
 
         if let Some(confirmed_dir) = confirmed_direction {
-            // ---------- 平仓后冷却检查 ----------
+            // 冷却检查
             let mut cooldown_map = self.close_cooldown.lock().await;
             if let Some(remaining) = cooldown_map.get_mut(&symbol) {
                 if *remaining > 0 {
@@ -348,10 +402,10 @@ impl AnalysisService {
                 }
             }
 
-            // ===== 区间边界计算（只需计算一次）=====
+            // 区间边界计算
             let price = audit.snapshot.price;
             let range_high = ctx
-                .get_role(Role::Filter)
+                .get_role(Role::Trend)
                 .ok()
                 .and_then(|r| {
                     r.feature_set
@@ -362,7 +416,7 @@ impl AnalysisService {
                 })
                 .unwrap_or(price);
             let range_low = ctx
-                .get_role(Role::Filter)
+                .get_role(Role::Trend)
                 .ok()
                 .and_then(|r| {
                     r.feature_set
@@ -374,10 +428,9 @@ impl AnalysisService {
                 .unwrap_or(price);
             let range_width = range_high - range_low;
 
-            // --- 盘整区间中部过滤（宽松版：范围放宽至 0.25~0.75）---
             if range_width > 0.0 {
                 let position_in_range = (price - range_low) / range_width;
-                let is_mid_range = position_in_range > 0.25 && position_in_range < 0.75;
+                let is_mid_range = position_in_range > 0.35 && position_in_range < 0.65;
                 if regime == TrendStructure::Range && is_mid_range {
                     let reason = format!(
                         "mid_range_reject: price={:.2} range=[{:.2}, {:.2}] pos={:.2}",
@@ -399,7 +452,6 @@ impl AnalysisService {
                     return;
                 }
 
-                // --- 边界突破量能确认（宽松版：rvol<1.2 && eff<0.4）---
                 let at_boundary = position_in_range > 0.8 || position_in_range < 0.2;
                 if at_boundary && regime == TrendStructure::Range {
                     let rvol = ctx
@@ -410,7 +462,6 @@ impl AnalysisService {
                         .get_cached::<f64>(ContextKey::LastEfficiency)
                         .copied()
                         .unwrap_or(0.5);
-                    // [宽松修改] 原 (rvol < 1.5 || eff < 0.5) 改为 (rvol < 1.2 && eff < 0.4)
                     if rvol < 1.2 && eff < 0.4 {
                         let reason = format!(
                             "breakout_no_volume: rvol={:.2} eff={:.2} at_boundary_pos={:.2}",
@@ -453,7 +504,6 @@ impl AnalysisService {
             );
 
             if let Some(assessment) = risk {
-                
                 let min_conf = self.config.risk.min_confidence_mult;
                 if assessment.confidence_mult < min_conf {
                     let reason = format!(

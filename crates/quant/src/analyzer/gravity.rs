@@ -165,7 +165,8 @@ impl Analyzer for GravityAnalyzer {
             );
         }
 
-        if let Some(ratio) = t_space.ma20_dist_ratio {
+        // MA20 井：使用 Filter 角色的 ma20_dist_ratio
+        if let Some(ratio) = f_space.ma20_dist_ratio {
             self.add_well_source(
                 &WellSourceInput {
                     dist_opt: Some(1.0 / (ratio + 1.0) - 1.0),
@@ -184,9 +185,9 @@ impl Analyzer for GravityAnalyzer {
             );
         }
 
-        // 新增 MA50、MA200 井（使用 Trend 角色，因其周期更高）
-        let t_feat = &trend_role.feature_set;
-        if let Some(ma50) = t_feat.indicators.ma_50 {
+        // MA50、MA200 井：使用 Filter 角色
+        let f_feat = &filter_role.feature_set;
+        if let Some(ma50) = f_feat.indicators.ma_50 {
             let dist = (ma50 - last_price) / last_price;
             self.add_well_source(
                 &WellSourceInput {
@@ -206,7 +207,7 @@ impl Analyzer for GravityAnalyzer {
             );
         }
 
-        if let Some(ma200) = t_feat.indicators.ma_200 {
+        if let Some(ma200) = f_feat.indicators.ma_200 {
             let dist = (ma200 - last_price) / last_price;
             self.add_well_source(
                 &WellSourceInput {
@@ -287,7 +288,6 @@ impl Analyzer for GravityAnalyzer {
             regime,
         );
 
-        // ───── 非海啸模式下的突破后角色转换（支撑↔阻力） ─────
         let confirm_bars = cfg.conversion_confirm_bars;
         let cooldown_bars = cfg.conversion_cooldown_bars;
         let effective_buffer = sigma * 0.5;
@@ -353,7 +353,9 @@ impl Analyzer for GravityAnalyzer {
         pending.retain(|k, _| current_keys.contains(k));
 
         ctx.set_cached(ContextKey::WellConversionState, pending);
-
+        for well in &mut wells {
+            well.is_active = well.strength > cfg.active_well_threshold();
+        }
         let total_res = Self::composite_strength(
             wells
                 .iter()
@@ -405,7 +407,6 @@ impl Analyzer for GravityAnalyzer {
     }
 }
 
-// 以下为原有的辅助函数，保持不变
 impl GravityAnalyzer {
     fn add_well_source(
         &self,

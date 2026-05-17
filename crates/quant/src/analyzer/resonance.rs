@@ -3,6 +3,8 @@ use crate::analyzer::{
     MarketContext, Role,
 };
 use crate::config::AnalyzerConfig;
+use crate::types::gravity::PriceGravityWell;
+use crate::types::gravity::WellSide;
 use crate::types::market::{DivergenceType, MacdCross, MacdMomentum, RsiState, TrendStructure};
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -40,7 +42,7 @@ impl Analyzer for ResonanceAnalyzer {
     }
 
     fn dependencies(&self) -> Vec<ContextKey> {
-        vec![ContextKey::RegimeStructure]
+        vec![ContextKey::RegimeStructure, ContextKey::SpaceGravityWells]
     }
 
     fn analyze(
@@ -92,10 +94,53 @@ impl Analyzer for ResonanceAnalyzer {
                         reason.push_str(" + RSI_CONFIRM");
                     }
                 }
-                let base_score = 15.0 * direction; // 弱共振基础分
+                let base_score = 15.0 * direction;
                 return Ok(AnalysisResult::new(self.kind())
                     .with_score(base_score)
                     .because(reason));
+            }
+
+            // ===== 新增：强趋势且无重力井时，基础追踪分 =====
+            let regime = ctx
+                .get_cached::<TrendStructure>(ContextKey::RegimeStructure)
+                .copied();
+            let wells = ctx
+                .get_cached::<Vec<PriceGravityWell>>(ContextKey::SpaceGravityWells)
+                .cloned()
+                .unwrap_or_default();
+            let is_strong_trend = matches!(
+                regime,
+                Some(TrendStructure::StrongBullish | TrendStructure::StrongBearish)
+            );
+            let has_relevant_well = wells.iter().any(|w| {
+                w.is_active && (w.side == WellSide::Support || w.side == WellSide::Resistance)
+            });
+            if is_strong_trend && !has_relevant_well {
+                let direction = if matches!(regime, Some(TrendStructure::StrongBullish)) {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let mut base_score = 15.0 * direction;
+                if let Some(rsi) = rsi_state {
+                    let rsi_val = match rsi {
+                        RsiState::Strong => 65.0,
+                        RsiState::Weak => 35.0,
+                        RsiState::Overbought => 80.0,
+                        RsiState::Oversold => 20.0,
+                        _ => 50.0,
+                    };
+                    let rsi_factor: f64 = if direction > 0.0 {
+                        (rsi_val - 50.0) / 30.0
+                    } else {
+                        (50.0 - rsi_val) / 30.0
+                    };
+                    base_score *= (0.8 + rsi_factor.clamp(-0.3, 0.5));
+                }
+                let final_score = base_score.clamp(-100.0, 100.0);
+                return Ok(AnalysisResult::new(self.kind())
+                    .with_score(final_score)
+                    .because("TREND_TRACKING_NO_WELL"));
             }
 
             return Ok(AnalysisResult::new(self.kind()).with_score(0.0));

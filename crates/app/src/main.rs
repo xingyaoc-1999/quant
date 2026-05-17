@@ -62,11 +62,11 @@ async fn main() -> Result<()> {
         Box::new(VolatilityEnvironmentAnalyzer::with_config(
             analyzer_config.clone(),
         )),
-        Box::new(GravityAnalyzer::with_config(analyzer_config.clone())),
-        Box::new(MarketRegimeAnalyzer::with_config(analyzer_config.clone())),
         Box::new(VolumeStructureAnalyzer::with_config(
             analyzer_config.clone(),
         )),
+        Box::new(GravityAnalyzer::with_config(analyzer_config.clone())),
+        Box::new(MarketRegimeAnalyzer::with_config(analyzer_config.clone())),
         Box::new(FakeoutDetector::with_config(analyzer_config.clone())),
         Box::new(ResonanceAnalyzer::with_config(analyzer_config.clone())),
     ];

@@ -112,7 +112,6 @@ impl RiskManager {
         let conf_mult = (posterior * 2.4 - 0.4).clamp(mult_min, mult_max);
         tags.push(format!("CONF_MULT:{:.2}", conf_mult));
 
-        // 4. 动态标志
         let trailing = is_tsunami
             || conf_mult > 1.2
             || matches!(
@@ -128,24 +127,32 @@ impl RiskManager {
             tags.push("DYNAMIC_TP".into());
         }
 
-        let has_valid_targets = wells.iter().any(|w| {
-            w.is_active
-                && if is_long {
-                    w.level > last_price
-                } else {
-                    w.level < last_price
-                }
-        });
+        // ===== 修改：强趋势或海啸时，无需重力井目标 =====
+        let has_valid_targets = if is_tsunami
+            || matches!(
+                regime,
+                TrendStructure::StrongBullish | TrendStructure::StrongBearish
+            ) {
+            true
+        } else {
+            wells.iter().any(|w| {
+                w.is_active
+                    && if is_long {
+                        w.level > last_price
+                    } else {
+                        w.level < last_price
+                    }
+            })
+        };
         if is_tsunami && !has_valid_targets {
             *reject_reason = Some("tsunami_no_target".into());
             return None;
         }
+        // ===== 结束修改 =====
 
-        // 6. 确定入场策略
         let entry_strategy =
             self.select_entry_strategy(regime, vol_p, is_tsunami, has_valid_targets, conf_mult);
 
-        // 7. 计算入场价位
         let (entry_levels, entry_allocations, used_offset_pct) = self
             .calculate_entry_levels_with_strategy(
                 wells,
@@ -195,7 +202,7 @@ impl RiskManager {
         let (size, total_loss, margin_loss, violated) = self.calculate_final_position(
             def_strength,
             last_price,
-            real_entry, // 新增参数，用于准确计算风险
+            real_entry,
             &sl_levels,
             &sl_alloc,
             conf_mult,
@@ -559,7 +566,7 @@ impl RiskManager {
         let mut allocs = [0.0; 3];
 
         if count == 0 {
-            tags.push("ENTRY_LIMIT_NO_DEFENSE".into());
+            tags.push("ENTRY_FALLBACK_ATR".into()); // 明确标记后备
             let step = atr_v * cfg.entry_atr_step_mult;
             levels[0] = last_price;
             allocs[0] = cfg.default_entry_allocations[0];
@@ -580,7 +587,6 @@ impl RiskManager {
                 allocs[1] = cfg.default_entry_allocations[1];
                 levels[2] = last_price - dir_sign * step * 2.0;
                 allocs[2] = cfg.default_entry_allocations[2];
-                // 归一化分配，保证和为1.0
                 let sum: f64 = allocs.iter().sum();
                 if sum > 0.0 {
                     for a in &mut allocs {
@@ -664,7 +670,7 @@ impl RiskManager {
         let mut used_offset_pct = base_offset_pct;
 
         if count == 0 {
-            tags.push("ENTRY_STOP_NO_TARGET".into());
+            tags.push("ENTRY_STOP_FALLBACK_ATR".into()); // 明确标记后备
             let step = atr_v * 0.5;
             let dynamic_offset_pct = base_offset_pct + atr_pct * 0.5;
             used_offset_pct = dynamic_offset_pct;
@@ -685,7 +691,7 @@ impl RiskManager {
             .sum();
         for i in 0..count {
             let w = targets[i];
-            let dynamic_offset_pct = base_offset_pct + atr_pct * 0.3; // 移除了强度放大因子
+            let dynamic_offset_pct = base_offset_pct + atr_pct * 0.3;
             if i == 0 {
                 used_offset_pct = dynamic_offset_pct;
             }
@@ -711,14 +717,12 @@ impl RiskManager {
             tags.push(format!("ENTRY_STOP_DYN_OFFSET:{:.4}", used_offset_pct));
         }
 
-        // 海啸模式：重置分配，并同步调整价格
         if is_tsunami {
             let dynamic_offset_pct = base_offset_pct + atr_pct * 0.5;
             used_offset_pct = dynamic_offset_pct;
             let offset_abs = last_price * dynamic_offset_pct;
             let new_level = last_price + dir_sign * offset_abs;
 
-            // 重新生成分配：海啸追单使用固定分配，不再沿用目标井分配
             levels[0] = new_level;
             allocs[0] = 0.5;
             if count >= 2 {
@@ -728,20 +732,17 @@ impl RiskManager {
                     levels[2] = targets[2].level + dir_sign * offset_abs;
                     allocs[2] = 0.2;
                 } else {
-                    // 补足第三个价位
                     let step = atr_v * 0.5;
                     levels[2] = new_level + dir_sign * (step * 2.0 + offset_abs);
                     allocs[2] = 0.2;
                 }
             } else {
-                // count == 1，只有一个目标井
                 let step = atr_v * 0.5;
                 levels[1] = new_level + dir_sign * (step + offset_abs);
                 allocs[1] = 0.3;
                 levels[2] = new_level + dir_sign * (step * 2.0 + offset_abs);
                 allocs[2] = 0.2;
             }
-            // 确保归一化
             let sum: f64 = allocs.iter().sum();
             if sum > 0.0 {
                 for a in &mut allocs {
@@ -787,7 +788,7 @@ impl RiskManager {
                 .total_cmp(&(b.level - last_price).abs())
         });
 
-        let max_defense_distance = last_price * 0.04; // 暂定 4%，可后续移入 RiskConfig
+        let max_defense_distance = last_price * 0.04;
         let mut defenses: Vec<_> = wells
             .iter()
             .filter(|w| {
@@ -812,8 +813,7 @@ impl RiskManager {
         let base_def = defenses
             .first()
             .map(|w| w.level)
-            .unwrap_or_else(|| last_price - dir_sign * atr_v * 1.0); // 无防御井时默认
-
+            .unwrap_or_else(|| last_price - dir_sign * atr_v * 1.0);
         let sl_scale = dynamic_atr_sl_scale(vol_p);
         let mut buffers = cfg
             .atr_sl_buffers
@@ -862,11 +862,17 @@ impl RiskManager {
             sl_alloc = vec![0.5, 0.5];
         }
 
+        // 止损后备标记
+        if defenses.is_empty() {
+            tags.push("SL_FALLBACK_ATR".into());
+        } else {
+            tags.push("SL_FROM_WELL".into());
+        }
+
         let tp1 = targets
             .first()
             .map(|w| w.level)
             .unwrap_or_else(|| last_price + dir_sign * atr_v * 3.0);
-
         let tp2 = if is_tsunami {
             let base_atr = average_atr.max(atr_v);
             let atr_target = last_price + dir_sign * base_atr * cfg.tsunami_tp2_atr_mult;
@@ -885,13 +891,17 @@ impl RiskManager {
             targets
                 .get(1)
                 .map(|w| w.level)
-                .unwrap_or_else(|| last_price + dir_sign * atr_v * 5.0) // 无目标时默认 3ATR
+                .unwrap_or_else(|| last_price + dir_sign * atr_v * 5.0)
         };
 
         let tp_levels = [tp1, tp2];
         let tp_alloc = self.dynamic_allocation(&targets, last_price, tags);
+        if targets.is_empty() {
+            tags.push("TP_FALLBACK_ATR".into());
+        } else {
+            tags.push("TP_FROM_WELL".into());
+        }
 
-        // ---------- 止损排序（仅保留顺序） ----------
         let n = sl_levels.len().min(2);
         if n > 0 {
             let mut sl_pairs: Vec<(f64, f64)> = sl_levels
@@ -910,6 +920,7 @@ impl RiskManager {
 
         (sl_levels, tp_levels.to_vec(), tp_alloc, sl_alloc)
     }
+
     fn dynamic_allocation(
         &self,
         targets: &[&PriceGravityWell],
@@ -921,18 +932,15 @@ impl RiskManager {
             tags.push("ALLOC_NO_TARGETS".into());
             return [0.5, 0.5];
         }
-
         let mut attractions = [0.0; 2];
         for (i, w) in targets.iter().take(2).enumerate() {
             let dist_pct = ((w.level - last_price).abs() / last_price).max(0.001);
             attractions[i] = w.strength.clamp(0.2, 3.0) / dist_pct;
         }
-
         if n == 1 {
             tags.push("ALLOC_SINGLE".into());
             return [1.0, 0.0];
         }
-
         let squared = [attractions[0].powi(2), attractions[1].powi(2)];
         let sum_sq: f64 = squared.iter().sum();
         if sum_sq > f64::EPSILON {
@@ -944,8 +952,8 @@ impl RiskManager {
 
     fn calculate_weighted_rr(
         &self,
-        price: f64,       // 当前价（仅用于最小距离限制）
-        entry_price: f64, // 实际成交参考价
+        price: f64,
+        entry_price: f64,
         sl: &[f64],
         sl_alloc: &[f64],
         tp: &[f64],
@@ -965,7 +973,6 @@ impl RiskManager {
             .take(2)
             .map(|&t| (t - entry_price).abs())
             .collect();
-
         let w_risk: f64 = risks.iter().zip(sl_alloc.iter()).map(|(r, a)| r * a).sum();
         let w_reward: f64 = rewards
             .iter()
@@ -1004,7 +1011,7 @@ impl RiskManager {
         &self,
         def_strength: f64,
         last_price: f64,
-        entry_price: f64, // 新增：真实入场价，用于止损距离计算
+        entry_price: f64,
         sl_levels: &[f64],
         sl_alloc: &[f64],
         conf_mult: f64,
@@ -1033,7 +1040,7 @@ impl RiskManager {
             if i >= sl_alloc.len() {
                 break;
             }
-            let sl_pct = (entry_price - sl).abs() / entry_price; // 用真实入场价
+            let sl_pct = (entry_price - sl).abs() / entry_price;
             weighted_sl_pct += sl_pct * sl_alloc[i];
             total_alloc += sl_alloc[i];
         }
@@ -1090,6 +1097,7 @@ impl RiskManager {
     }
 }
 
+// ---------- 辅助函数 ----------
 fn sort_entry_levels(
     levels: &mut [f64; 3],
     allocs: &mut [f64; 3],
@@ -1101,7 +1109,6 @@ fn sort_entry_levels(
         .zip(allocs.iter())
         .map(|(&l, &a)| (l, a))
         .collect();
-
     let cmp: fn(&(f64, f64), &(f64, f64)) -> std::cmp::Ordering = match strategy {
         EntryStrategy::Limit => {
             if is_long {
@@ -1118,9 +1125,7 @@ fn sort_entry_levels(
             }
         }
     };
-
     pairs.sort_by(cmp);
-
     for (i, (l, a)) in pairs.into_iter().enumerate() {
         levels[i] = l;
         allocs[i] = a;
@@ -1169,8 +1174,7 @@ fn dynamic_confidence_prior(vol_p: f64, regime: TrendStructure, base_prior: f64)
         TrendStructure::Range => 0.9,
         _ => 1.0,
     };
-
-    let mut prior = (base_prior * vol_factor * regime_factor);
+    let mut prior = base_prior * vol_factor * regime_factor;
     let (min_prior, max_prior) = if matches!(
         regime,
         TrendStructure::StrongBullish | TrendStructure::StrongBearish
@@ -1180,26 +1184,22 @@ fn dynamic_confidence_prior(vol_p: f64, regime: TrendStructure, base_prior: f64)
     } else {
         (0.3, 0.7)
     };
-
-    prior = prior.clamp(min_prior, max_prior);
-    prior
+    prior.clamp(min_prior, max_prior)
 }
 
 fn dynamic_confidence_range(vol_p: f64, regime: TrendStructure) -> (f64, f64) {
-    let (min_base, max_base): (f64, f64) = if vol_p > 70.0 {
+    let (min_base, max_base) = if vol_p > 70.0 {
         (0.3, 1.4)
     } else if vol_p < 25.0 {
         (0.5, 1.8)
     } else {
         (0.4, 1.6)
     };
-
     let (regime_mult_min, regime_mult_max): (f64, f64) = match regime {
         TrendStructure::StrongBullish | TrendStructure::StrongBearish => (1.1, 1.1),
         TrendStructure::Range => (0.9, 0.9),
         _ => (1.0, 1.0),
     };
-
     let min = (min_base * regime_mult_min).max(0.2);
     let max = (max_base * regime_mult_max).min(2.0);
     (min, max)
