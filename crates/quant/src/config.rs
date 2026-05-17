@@ -59,11 +59,11 @@ impl Default for GravityConfig {
     fn default() -> Self {
         Self {
             gravity_range: 0.8,
-            min_well_strength: 0.08,
+            min_well_strength: 0.04,
             merge_sensitivity: 0.5,
             wear_sensitivity: 0.6,
             wear_recovery_rate: 0.5,
-            active_well_threshold: 0.08,
+            active_well_threshold: 0.04,
             conversion_confirm_bars: 2,
             conversion_cooldown_bars: 5,
             wear_scales: WearScales::default(),
@@ -514,6 +514,7 @@ pub struct RiskConfig {
     pub min_reliable_defense_strength: f64,
     pub min_stop_dist_pct: f64,
     pub initial_protection_bars: usize,
+    pub min_confidence_mult: f64,
 }
 
 impl Default for RiskConfig {
@@ -550,6 +551,7 @@ impl Default for RiskConfig {
             min_reliable_defense_strength: 0.3,
             min_stop_dist_pct: 0.0002,
             initial_protection_bars: 3,
+            min_confidence_mult: 0.6,
         }
     }
 }

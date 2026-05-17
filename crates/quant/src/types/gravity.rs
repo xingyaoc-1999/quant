@@ -50,6 +50,8 @@ pub enum WellSource {
     EntryResistance,
     EntrySupport,
     Ma20,
+    Ma50,  // 新增
+    Ma200, // 新增
 }
 
 impl WellSource {
@@ -62,6 +64,8 @@ impl WellSource {
             Self::EntryResistance => "ENTRY_R",
             Self::EntrySupport => "ENTRY_S",
             Self::Ma20 => "MA20",
+            Self::Ma50 => "MA50",
+            Self::Ma200 => "MA200",
         }
     }
 
@@ -71,14 +75,19 @@ impl WellSource {
             Self::FilterResistance | Self::FilterSupport => 0.8,
             Self::EntryResistance | Self::EntrySupport => 0.6,
             Self::Ma20 => 1.0,
+            Self::Ma50 => 0.9,
+            Self::Ma200 => 0.7,
         }
     }
+
     pub fn wear_scale(&self, cfg: &crate::config::GravityConfig) -> f64 {
         match self {
             Self::TrendResistance | Self::TrendSupport => cfg.wear_scales.trend,
             Self::FilterResistance | Self::FilterSupport => cfg.wear_scales.filter,
             Self::EntryResistance | Self::EntrySupport => cfg.wear_scales.entry,
             Self::Ma20 => cfg.wear_scales.ma20,
+            Self::Ma50 => cfg.wear_scales.ma20,
+            Self::Ma200 => cfg.wear_scales.ma20,
         }
     }
 }

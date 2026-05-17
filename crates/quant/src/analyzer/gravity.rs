@@ -108,7 +108,6 @@ impl Analyzer for GravityAnalyzer {
             .copied()
             .unwrap_or(0.5);
 
-        // 可配置的阈值与乘数（后续可移入 GravityConfig）
         let volume_boost_threshold = 1.5;
         let volume_boost_mult = 1.3;
         let volume_penalty_threshold = 0.5;
@@ -171,6 +170,48 @@ impl Analyzer for GravityAnalyzer {
                 &WellSourceInput {
                     dist_opt: Some(1.0 / (ratio + 1.0) - 1.0),
                     source: WellSource::Ma20,
+                    hits: 0,
+                    last_ts: 0,
+                },
+                &mut wells,
+                sigma,
+                ma_converging,
+                now,
+                last_price,
+                confluence_gate,
+                &mut dampened_indices,
+                volume_factor,
+            );
+        }
+
+        // 新增 MA50、MA200 井（使用 Trend 角色，因其周期更高）
+        let t_feat = &trend_role.feature_set;
+        if let Some(ma50) = t_feat.indicators.ma_50 {
+            let dist = (ma50 - last_price) / last_price;
+            self.add_well_source(
+                &WellSourceInput {
+                    dist_opt: Some(dist),
+                    source: WellSource::Ma50,
+                    hits: 0,
+                    last_ts: 0,
+                },
+                &mut wells,
+                sigma,
+                ma_converging,
+                now,
+                last_price,
+                confluence_gate,
+                &mut dampened_indices,
+                volume_factor,
+            );
+        }
+
+        if let Some(ma200) = t_feat.indicators.ma_200 {
+            let dist = (ma200 - last_price) / last_price;
+            self.add_well_source(
+                &WellSourceInput {
+                    dist_opt: Some(dist),
+                    source: WellSource::Ma200,
                     hits: 0,
                     last_ts: 0,
                 },
@@ -272,11 +313,10 @@ impl Analyzer for GravityAnalyzer {
             let dist_pct = (well.level - last_price) / last_price;
             let key = (well.side, price_to_key(well.level));
 
-            // 冷却处理
             if let Some(state) = pending.get_mut(&key) {
                 if state.cooldown_remaining > 0 {
                     state.cooldown_remaining -= 1;
-                    continue; // 冷却期内不检查突破
+                    continue;
                 }
             }
 
@@ -294,7 +334,6 @@ impl Analyzer for GravityAnalyzer {
                 });
                 entry.consecutive_bars += 1;
                 if entry.consecutive_bars >= confirm_bars {
-                    // 确认转换
                     well.side = entry.target_side;
                     entry.cooldown_remaining = cooldown_bars;
                     entry.consecutive_bars = 0;
@@ -306,7 +345,6 @@ impl Analyzer for GravityAnalyzer {
             }
         }
 
-        // 清理已经不存在的井的待定状态
         let current_keys: Vec<(WellSide, i64)> = wells
             .iter()
             .filter(|w| w.is_active && w.side != WellSide::Magnet)
@@ -316,7 +354,6 @@ impl Analyzer for GravityAnalyzer {
 
         ctx.set_cached(ContextKey::WellConversionState, pending);
 
-        // 继续计算总分
         let total_res = Self::composite_strength(
             wells
                 .iter()
@@ -368,6 +405,7 @@ impl Analyzer for GravityAnalyzer {
     }
 }
 
+// 以下为原有的辅助函数，保持不变
 impl GravityAnalyzer {
     fn add_well_source(
         &self,
@@ -405,7 +443,6 @@ impl GravityAnalyzer {
         if ma_converging {
             strength *= cfg.convergence_boost();
         }
-        // 成交量因子生效
         strength *= volume_factor;
 
         if strength < cfg.min_well_strength() {

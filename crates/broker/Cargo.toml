@@ -13,3 +13,5 @@ tracing.workspace = true
 common = { path = "../common" }
 quant = { path = "../quant" }
 service = { path = "../service" }
+hypersdk = "0.2.11"
+anyhow.workspace = true

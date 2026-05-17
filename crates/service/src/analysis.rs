@@ -82,6 +82,15 @@ impl AnalysisService {
 
         let audit = self.engine.run(&mut ctx);
 
+        // 引擎明确拒绝（高分歧、违规等） -> 失效旧信号并返回
+        if audit.signal.is_rejected {
+            let reason = format!("引擎拒绝: {}", audit.signal.reason);
+            let _ = self
+                .event_tx
+                .send(AnalysisEvent::SignalExpired { symbol, reason });
+            return;
+        }
+
         let vol_p = ctx
             .get_cached::<f64>(ContextKey::VolPercentile)
             .copied()
@@ -167,6 +176,7 @@ impl AnalysisService {
 
         self.manager.save_cross_cycle_state(symbol, &ctx);
 
+        // --- BTC 方向过滤：拦截与 BTC 锁存方向相反的山寨新信号 ---
         if self.config.risk.enable_btc_correlation_filter && symbol != Symbol::BTCUSDT {
             if let Some(btc_dir) = self.manager.get_btc_direction() {
                 if let Some(my_dir) = confirmed_direction {
@@ -177,6 +187,7 @@ impl AnalysisService {
                         );
                         warn!("[BTC FILTER] {} {}", symbol, reason);
 
+                        // 发送失效通知，清理可能存在的旧信号
                         let _ = self.event_tx.send(AnalysisEvent::SignalExpired {
                             symbol,
                             reason: reason.clone(),
@@ -200,7 +211,7 @@ impl AnalysisService {
             }
         }
 
-        // === 逆大周期过滤 ===
+        // --- 逆大周期过滤 ---
         let higher_tf_trend = ctx
             .get_role(Role::Filter)
             .or_else(|_| ctx.get_role(Role::Trend))
@@ -241,7 +252,7 @@ impl AnalysisService {
             }
         }
 
-        // === 信号失效检测（该币种自身的反向） ===
+        // --- 信号失效检测（该币种自己的方向变化）---
         {
             let mut last_dir_map = self.last_confirmed.lock().await;
             let old_dir = last_dir_map.get(&symbol).copied().flatten();
@@ -265,13 +276,12 @@ impl AnalysisService {
             last_dir_map.insert(symbol, new_dir);
         }
 
-        // === BTC 方向变化监听：自动失效与 BTC 新方向相反的所有山寨已推送信号 ===
+        // --- BTC 方向变化监听：自动失效与 BTC 新方向相反的所有山寨已推送信号 ---
         if symbol == Symbol::BTCUSDT {
             let mut last_btc = self.last_btc_direction.lock().await;
             let old_btc = *last_btc;
             let new_btc = confirmed_direction;
 
-            // 当 BTC 方向发生变化（None → Some，或 Long ↔ Short）
             let btc_changed = match (old_btc, new_btc) {
                 (None, Some(_)) => true,
                 (Some(old), Some(new)) => old != new,
@@ -332,6 +342,31 @@ impl AnalysisService {
             );
 
             if let Some(assessment) = risk {
+                // ========== 低置信度过滤 ==========
+                let min_conf = self.config.risk.min_confidence_mult;
+                if assessment.confidence_mult < min_conf {
+                    let reason = format!(
+                        "low_confidence: conf_mult={:.2} < {:.2}",
+                        assessment.confidence_mult, min_conf
+                    );
+                    warn!("[LOW CONFIDENCE] {} {}", symbol, reason);
+
+                    let analysis = build_analysis_details(&audit.signal.sub_reports);
+                    let record = AuditRecord {
+                        timestamp: Utc::now().timestamp_millis(),
+                        event: AuditEvent::Reject,
+                        symbol: symbol.as_str().to_string(),
+                        signal: None,
+                        market_snapshot: Some(audit.snapshot.clone()),
+                        analysis,
+                        reject_reason: Some(reason.clone()),
+                    };
+                    write_audit_log(&record).await;
+                    self.stats.lock().await.add_reject(symbol, reason);
+                    return; // 跳过推送
+                }
+                // ===================================
+
                 let mut audit = audit;
                 audit.risk_assessment = Some(assessment.clone());
                 let message = audit.to_markdown_v2(&ctx);

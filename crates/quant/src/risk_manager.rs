@@ -769,14 +769,15 @@ impl RiskManager {
         let dir_sign = if is_long { 1.0 } else { -1.0 };
         let cfg = &self.config.risk;
 
+        let max_target_distance = last_price * 0.05;
         let mut targets: Vec<_> = wells
             .iter()
             .filter(|w| {
                 w.is_active
                     && if is_long {
-                        w.level > last_price
+                        w.level > last_price && (w.level - last_price).abs() < max_target_distance
                     } else {
-                        w.level < last_price
+                        w.level < last_price && (w.level - last_price).abs() < max_target_distance
                     }
             })
             .collect();
@@ -786,14 +787,15 @@ impl RiskManager {
                 .total_cmp(&(b.level - last_price).abs())
         });
 
+        let max_defense_distance = last_price * 0.04; // 暂定 4%，可后续移入 RiskConfig
         let mut defenses: Vec<_> = wells
             .iter()
             .filter(|w| {
                 w.is_active
                     && if is_long {
-                        w.level < last_price
+                        w.level < last_price && (last_price - w.level).abs() < max_defense_distance
                     } else {
-                        w.level > last_price
+                        w.level > last_price && (w.level - last_price).abs() < max_defense_distance
                     }
             })
             .collect();
@@ -810,7 +812,7 @@ impl RiskManager {
         let base_def = defenses
             .first()
             .map(|w| w.level)
-            .unwrap_or_else(|| last_price - dir_sign * atr_v * 1.0);
+            .unwrap_or_else(|| last_price - dir_sign * atr_v * 1.0); // 无防御井时默认
 
         let sl_scale = dynamic_atr_sl_scale(vol_p);
         let mut buffers = cfg
@@ -824,7 +826,7 @@ impl RiskManager {
         }
         buffers.iter_mut().for_each(|b| *b *= sl_scale);
 
-        for (i, &buf) in buffers.iter().enumerate() {
+        for (_i, &buf) in buffers.iter().enumerate() {
             let raw = base_def - dir_sign * atr_v * buf;
             let sl = if is_long {
                 raw.min(last_price - atr_v * cfg.min_sl_atr_mult)
@@ -860,10 +862,11 @@ impl RiskManager {
             sl_alloc = vec![0.5, 0.5];
         }
 
+        // ---------- 止盈计算 ----------
         let tp1 = targets
             .first()
             .map(|w| w.level)
-            .unwrap_or_else(|| last_price + dir_sign * atr_v * 2.0);
+            .unwrap_or_else(|| last_price + dir_sign * atr_v * 3.0); // 无目标时默认 2ATR
 
         let tp2 = if is_tsunami {
             let base_atr = average_atr.max(atr_v);
@@ -883,12 +886,13 @@ impl RiskManager {
             targets
                 .get(1)
                 .map(|w| w.level)
-                .unwrap_or_else(|| last_price + dir_sign * atr_v * 3.0)
+                .unwrap_or_else(|| last_price + dir_sign * atr_v * 5.0) // 无目标时默认 3ATR
         };
 
         let tp_levels = [tp1, tp2];
         let tp_alloc = self.dynamic_allocation(&targets, last_price, tags);
 
+        // ---------- 止损排序（仅保留顺序） ----------
         let n = sl_levels.len().min(2);
         if n > 0 {
             let mut sl_pairs: Vec<(f64, f64)> = sl_levels
@@ -904,9 +908,9 @@ impl RiskManager {
                 sl_alloc[i] = a;
             }
         }
+
         (sl_levels, tp_levels.to_vec(), tp_alloc, sl_alloc)
     }
-
     fn dynamic_allocation(
         &self,
         targets: &[&PriceGravityWell],
