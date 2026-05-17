@@ -551,7 +551,7 @@ impl Default for RiskConfig {
             min_reliable_defense_strength: 0.3,
             min_stop_dist_pct: 0.0002,
             initial_protection_bars: 3,
-            min_confidence_mult: 0.6,
+            min_confidence_mult: 0.65,
         }
     }
 }
@@ -568,7 +568,7 @@ impl Default for SignalStabilityConfig {
         Self {
             confirm_bars: 2,
             confirm_bars_stop: 1,
-            reversal_confirm_bars: 2,
+            reversal_confirm_bars: 3,
         }
     }
 }

@@ -421,7 +421,9 @@ impl FeatureCalculator {
                 volume_shrink_3: Some(self.is_volume_shrinking()),
                 extreme_candle: Some(self.is_extreme_candle(candle, atr_v)),
             },
-            recent_closes: rec_closes, // 新增字段
+            recent_closes: rec_closes,
+            recent_highs: self.recent_highs.iter().cloned().collect(),
+            recent_lows: self.recent_lows.iter().cloned().collect(),
         }
     }
     fn calculate_correlation_stable(&self) -> Option<f64> {

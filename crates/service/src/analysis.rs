@@ -46,6 +46,7 @@ pub struct AnalysisService {
     stats: Arc<TokioMutex<SignalStats>>,
     last_confirmed: TokioMutex<HashMap<Symbol, Option<TradeDirection>>>,
     last_btc_direction: TokioMutex<Option<TradeDirection>>,
+    close_cooldown: TokioMutex<HashMap<Symbol, usize>>,
 }
 
 impl AnalysisService {
@@ -67,6 +68,7 @@ impl AnalysisService {
             stats,
             last_confirmed: TokioMutex::new(HashMap::new()),
             last_btc_direction: TokioMutex::new(None),
+            close_cooldown: TokioMutex::new(HashMap::new()),
         }
     }
 
@@ -82,12 +84,14 @@ impl AnalysisService {
 
         let audit = self.engine.run(&mut ctx);
 
-        // 引擎明确拒绝（高分歧、违规等） -> 失效旧信号并返回
+        // 引擎明确拒绝 -> 失效旧信号并返回
         if audit.signal.is_rejected {
             let reason = format!("引擎拒绝: {}", audit.signal.reason);
             let _ = self
                 .event_tx
                 .send(AnalysisEvent::SignalExpired { symbol, reason });
+            // [宽松修改] 冷却时间 5 -> 2
+            self.close_cooldown.lock().await.insert(symbol, 2);
             return;
         }
 
@@ -176,7 +180,7 @@ impl AnalysisService {
 
         self.manager.save_cross_cycle_state(symbol, &ctx);
 
-        // --- BTC 方向过滤：拦截与 BTC 锁存方向相反的山寨新信号 ---
+        // --- BTC 方向过滤 ---
         if self.config.risk.enable_btc_correlation_filter && symbol != Symbol::BTCUSDT {
             if let Some(btc_dir) = self.manager.get_btc_direction() {
                 if let Some(my_dir) = confirmed_direction {
@@ -186,13 +190,10 @@ impl AnalysisService {
                             my_dir, btc_dir
                         );
                         warn!("[BTC FILTER] {} {}", symbol, reason);
-
-                        // 发送失效通知，清理可能存在的旧信号
                         let _ = self.event_tx.send(AnalysisEvent::SignalExpired {
                             symbol,
                             reason: reason.clone(),
                         });
-
                         let analysis = build_analysis_details(&audit.signal.sub_reports);
                         let record = AuditRecord {
                             timestamp: Utc::now().timestamp_millis(),
@@ -205,6 +206,8 @@ impl AnalysisService {
                         };
                         write_audit_log(&record).await;
                         self.stats.lock().await.add_reject(symbol, reason);
+                        // [宽松修改] 冷却时间 5 -> 2
+                        self.close_cooldown.lock().await.insert(symbol, 2);
                         return;
                     }
                 }
@@ -228,14 +231,12 @@ impl AnalysisService {
                 htf_trend,
                 TrendStructure::StrongBearish | TrendStructure::Bearish
             );
-
             if (signal_long && htf_bearish) || (!signal_long && htf_bullish) {
                 let reason = format!(
                     "counter_htf: signal={:?}, htf_trend={:?}",
                     confirmed_dir, htf_trend
                 );
                 warn!("[HTF REJECT] {} {}", symbol, reason);
-
                 let analysis = build_analysis_details(&audit.signal.sub_reports);
                 let record = AuditRecord {
                     timestamp: Utc::now().timestamp_millis(),
@@ -252,12 +253,11 @@ impl AnalysisService {
             }
         }
 
-        // --- 信号失效检测（该币种自己的方向变化）---
+        // --- 信号失效检测 ---
         {
             let mut last_dir_map = self.last_confirmed.lock().await;
             let old_dir = last_dir_map.get(&symbol).copied().flatten();
             let new_dir = confirmed_direction;
-
             if let Some(old) = old_dir {
                 let expired = match new_dir {
                     Some(new) => new != old,
@@ -271,23 +271,23 @@ impl AnalysisService {
                     let _ = self
                         .event_tx
                         .send(AnalysisEvent::SignalExpired { symbol, reason });
+                    // [宽松修改] 冷却时间 5 -> 2
+                    self.close_cooldown.lock().await.insert(symbol, 2);
                 }
             }
             last_dir_map.insert(symbol, new_dir);
         }
 
-        // --- BTC 方向变化监听：自动失效与 BTC 新方向相反的所有山寨已推送信号 ---
+        // --- BTC 方向变化监听 ---
         if symbol == Symbol::BTCUSDT {
             let mut last_btc = self.last_btc_direction.lock().await;
             let old_btc = *last_btc;
             let new_btc = confirmed_direction;
-
             let btc_changed = match (old_btc, new_btc) {
                 (None, Some(_)) => true,
                 (Some(old), Some(new)) => old != new,
                 _ => false,
             };
-
             if btc_changed {
                 if let Some(new_dir) = new_btc {
                     let last_confirmed_map = self.last_confirmed.lock().await;
@@ -305,6 +305,8 @@ impl AnalysisService {
                                     symbol: sym,
                                     reason,
                                 });
+                                // [宽松修改] 冷却时间 5 -> 2
+                                self.close_cooldown.lock().await.insert(sym, 2);
                             }
                         }
                     }
@@ -323,6 +325,115 @@ impl AnalysisService {
         let mut reject_reason: Option<String> = None;
 
         if let Some(confirmed_dir) = confirmed_direction {
+            // ---------- 平仓后冷却检查 ----------
+            let mut cooldown_map = self.close_cooldown.lock().await;
+            if let Some(remaining) = cooldown_map.get_mut(&symbol) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    let reason = format!("cooldown_after_close: remaining={}", *remaining);
+                    warn!("[COOLDOWN] {} {}", symbol, reason);
+                    let analysis = build_analysis_details(&audit.signal.sub_reports);
+                    let record = AuditRecord {
+                        timestamp: Utc::now().timestamp_millis(),
+                        event: AuditEvent::Reject,
+                        symbol: symbol.as_str().to_string(),
+                        signal: None,
+                        market_snapshot: Some(audit.snapshot.clone()),
+                        analysis,
+                        reject_reason: Some(reason.clone()),
+                    };
+                    write_audit_log(&record).await;
+                    self.stats.lock().await.add_reject(symbol, reason);
+                    return;
+                }
+            }
+
+            // ===== 区间边界计算（只需计算一次）=====
+            let price = audit.snapshot.price;
+            let range_high = ctx
+                .get_role(Role::Filter)
+                .ok()
+                .and_then(|r| {
+                    r.feature_set
+                        .recent_highs
+                        .iter()
+                        .cloned()
+                        .max_by(|a, b| a.partial_cmp(b).unwrap())
+                })
+                .unwrap_or(price);
+            let range_low = ctx
+                .get_role(Role::Filter)
+                .ok()
+                .and_then(|r| {
+                    r.feature_set
+                        .recent_lows
+                        .iter()
+                        .cloned()
+                        .min_by(|a, b| a.partial_cmp(b).unwrap())
+                })
+                .unwrap_or(price);
+            let range_width = range_high - range_low;
+
+            // --- 盘整区间中部过滤（宽松版：范围放宽至 0.25~0.75）---
+            if range_width > 0.0 {
+                let position_in_range = (price - range_low) / range_width;
+                let is_mid_range = position_in_range > 0.25 && position_in_range < 0.75;
+                if regime == TrendStructure::Range && is_mid_range {
+                    let reason = format!(
+                        "mid_range_reject: price={:.2} range=[{:.2}, {:.2}] pos={:.2}",
+                        price, range_low, range_high, position_in_range
+                    );
+                    warn!("[MID RANGE] {} {}", symbol, reason);
+                    let analysis = build_analysis_details(&audit.signal.sub_reports);
+                    let record = AuditRecord {
+                        timestamp: Utc::now().timestamp_millis(),
+                        event: AuditEvent::Reject,
+                        symbol: symbol.as_str().to_string(),
+                        signal: None,
+                        market_snapshot: Some(audit.snapshot.clone()),
+                        analysis,
+                        reject_reason: Some(reason.clone()),
+                    };
+                    write_audit_log(&record).await;
+                    self.stats.lock().await.add_reject(symbol, reason);
+                    return;
+                }
+
+                // --- 边界突破量能确认（宽松版：rvol<1.2 && eff<0.4）---
+                let at_boundary = position_in_range > 0.8 || position_in_range < 0.2;
+                if at_boundary && regime == TrendStructure::Range {
+                    let rvol = ctx
+                        .get_cached::<f64>(ContextKey::LastRVol)
+                        .copied()
+                        .unwrap_or(1.0);
+                    let eff = ctx
+                        .get_cached::<f64>(ContextKey::LastEfficiency)
+                        .copied()
+                        .unwrap_or(0.5);
+                    // [宽松修改] 原 (rvol < 1.5 || eff < 0.5) 改为 (rvol < 1.2 && eff < 0.4)
+                    if rvol < 1.2 && eff < 0.4 {
+                        let reason = format!(
+                            "breakout_no_volume: rvol={:.2} eff={:.2} at_boundary_pos={:.2}",
+                            rvol, eff, position_in_range
+                        );
+                        warn!("[BREAKOUT REJECT] {} {}", symbol, reason);
+                        let analysis = build_analysis_details(&audit.signal.sub_reports);
+                        let record = AuditRecord {
+                            timestamp: Utc::now().timestamp_millis(),
+                            event: AuditEvent::Reject,
+                            symbol: symbol.as_str().to_string(),
+                            signal: None,
+                            market_snapshot: Some(audit.snapshot.clone()),
+                            analysis,
+                            reject_reason: Some(reason.clone()),
+                        };
+                        write_audit_log(&record).await;
+                        self.stats.lock().await.add_reject(symbol, reason);
+                        return;
+                    }
+                }
+            }
+
             let risk = risk_mgr.assess(
                 Some(confirmed_dir),
                 &audit.gravity_wells,
@@ -342,7 +453,7 @@ impl AnalysisService {
             );
 
             if let Some(assessment) = risk {
-                // ========== 低置信度过滤 ==========
+                
                 let min_conf = self.config.risk.min_confidence_mult;
                 if assessment.confidence_mult < min_conf {
                     let reason = format!(
@@ -350,7 +461,6 @@ impl AnalysisService {
                         assessment.confidence_mult, min_conf
                     );
                     warn!("[LOW CONFIDENCE] {} {}", symbol, reason);
-
                     let analysis = build_analysis_details(&audit.signal.sub_reports);
                     let record = AuditRecord {
                         timestamp: Utc::now().timestamp_millis(),
@@ -363,9 +473,8 @@ impl AnalysisService {
                     };
                     write_audit_log(&record).await;
                     self.stats.lock().await.add_reject(symbol, reason);
-                    return; // 跳过推送
+                    return;
                 }
-                // ===================================
 
                 let mut audit = audit;
                 audit.risk_assessment = Some(assessment.clone());
@@ -397,13 +506,11 @@ impl AnalysisService {
                     reject_reason: None,
                 };
                 write_audit_log(&record).await;
-
                 self.stats.lock().await.add_signal(assessment.weighted_rr);
                 self.audit_cache.lock().await.insert(symbol, audit);
             } else {
                 let reason = reject_reason.unwrap_or_else(|| "unknown".into());
                 warn!("Risk rejected for {}: {:?}", symbol, reason);
-
                 let analysis = build_analysis_details(&audit.signal.sub_reports);
                 let record = AuditRecord {
                     timestamp: Utc::now().timestamp_millis(),

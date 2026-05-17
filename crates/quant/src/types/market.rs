@@ -148,6 +148,10 @@ pub struct FeatureSet {
     pub space: SpaceGeometry,
     #[serde(flatten)]
     pub signals: SignalStates,
+    #[serde(skip)]
+    pub recent_highs: Vec<f64>,
+    #[serde(skip)]
+    pub recent_lows: Vec<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default)]

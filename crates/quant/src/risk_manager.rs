@@ -862,11 +862,10 @@ impl RiskManager {
             sl_alloc = vec![0.5, 0.5];
         }
 
-        // ---------- 止盈计算 ----------
         let tp1 = targets
             .first()
             .map(|w| w.level)
-            .unwrap_or_else(|| last_price + dir_sign * atr_v * 3.0); // 无目标时默认 2ATR
+            .unwrap_or_else(|| last_price + dir_sign * atr_v * 3.0);
 
         let tp2 = if is_tsunami {
             let base_atr = average_atr.max(atr_v);
