@@ -6,7 +6,7 @@ use crate::config::{AnalyzerConfig, FakeoutConfig};
 use crate::types::gravity::{PriceGravityWell, WellSide, WellSource};
 use crate::types::market::{PriceAction, RsiState, VolumeState};
 use crate::types::session::TradingSession;
-use crate::utils::math::price_to_key;
+use crate::utils::math::{lerp, price_to_key, sigmoid};
 use std::collections::HashMap;
 
 type WellKey = (WellSource, WellSide, i64);
@@ -283,9 +283,8 @@ impl FakeoutDetector {
         }
 
         entry.confirm_count += 1;
-        if entry.confirm_count < cfg.fakeout_confirm_bars() {
-            return None;
-        }
+        let confirm_bars = cfg.fakeout_confirm_bars() as f64;
+        let confirm_strength = sigmoid(entry.confirm_count as f64, confirm_bars, 2.0);
 
         let strength = well.strength.clamp(0.2, 3.0);
         let adjustment = self.calculate_total_adjustment(
@@ -301,17 +300,18 @@ impl FakeoutDetector {
             cfg,
         );
 
-        let penalty = cfg.fakeout_base_penalty() * strength * adjustment;
+        let penalty = cfg.fakeout_base_penalty() * strength * adjustment * confirm_strength;
         let score = if breach_up { -penalty } else { penalty };
 
         let direction_str = if breach_up { "向上" } else { "向下" };
         let bias_str = if breach_up { "看跌" } else { "看涨" };
         let reason = format!(
-            "{}: {}突破假突破 → {} (adj={:.2})",
+            "{}: {}突破假突破 → {} (adj={:.2}, conf={:.2})",
             well.source_string(),
             direction_str,
             bias_str,
-            adjustment
+            adjustment,
+            confirm_strength
         );
 
         entry.confirm_count = 0;
@@ -351,9 +351,9 @@ impl FakeoutDetector {
         session_adj: f64,
         cfg: &FakeoutConfig,
     ) -> f64 {
-        let slope_adj = self.slope_adjustment(up, slope, cfg);
-        let rsi_adj = self.rsi_adjustment(up, down, rsi, cfg);
-        let vol_adj = self.volume_efficiency_penalty(eff, rvol, vol_s, cfg);
+        let slope_adj = self.slope_adjustment_continuous(up, slope, cfg);
+        let rsi_adj = self.rsi_adjustment_continuous(up, down, rsi, cfg);
+        let vol_adj = self.volume_efficiency_penalty_continuous(eff, rvol, vol_s, cfg);
         slope_adj * rsi_adj * vol_adj * v_bias * session_adj
     }
 
@@ -382,49 +382,107 @@ impl FakeoutDetector {
         abs_diff < dynamic_thresh
     }
 
-    fn slope_adjustment(&self, up: bool, slope: f64, cfg: &FakeoutConfig) -> f64 {
+    // 连续斜率调整因子
+    fn slope_adjustment_continuous(&self, up: bool, slope: f64, cfg: &FakeoutConfig) -> f64 {
         let thresh = cfg.slope_strong_threshold();
-        match (up, slope) {
-            (true, s) if s > thresh => cfg.slope_strong_factor(),
-            (false, s) if s < -thresh => cfg.slope_strong_factor(),
-            (true, s) if s < -thresh => cfg.slope_weak_factor(),
-            (false, s) if s > thresh => cfg.slope_weak_factor(),
-            _ => 1.0,
+        let slope_abs = slope.abs();
+        // 斜率强时 factor 接近 0.7，弱时接近 1.3
+        let strong_factor = cfg.slope_strong_factor();
+        let weak_factor = cfg.slope_weak_factor();
+        // 连续强度：斜率绝对值超过 thresh 时趋近1
+        let strength = sigmoid(slope_abs, thresh, 5.0);
+        // 方向匹配：向上突破且斜率为正（或向下突破且斜率为负）时使用强因子，否则弱因子
+        let use_strong = (up && slope > 0.0) || (!up && slope < 0.0);
+        if use_strong {
+            lerp(1.0, strong_factor, strength)
+        } else {
+            lerp(1.0, weak_factor, strength)
         }
     }
 
-    fn rsi_adjustment(&self, up: bool, down: bool, rsi: RsiState, cfg: &FakeoutConfig) -> f64 {
-        match (up, down, rsi) {
-            (true, _, RsiState::Overbought) => cfg.rsi_overbought_factor(),
-            (_, true, RsiState::Oversold) => cfg.rsi_oversold_factor(),
-            _ => 1.0,
+    // 连续RSI调整因子
+    fn rsi_adjustment_continuous(
+        &self,
+        up: bool,
+        down: bool,
+        rsi: RsiState,
+        cfg: &FakeoutConfig,
+    ) -> f64 {
+        // 将 RsiState 数值化（超买/超卖区域）
+        let rsi_val = match rsi {
+            RsiState::Overbought => 70.0,
+            RsiState::Oversold => 30.0,
+            RsiState::Strong => 60.0,
+            RsiState::Weak => 40.0,
+            _ => 50.0,
+        };
+        let rsi_overbought_factor = cfg.rsi_overbought_factor(); // 1.2
+        let rsi_oversold_factor = cfg.rsi_oversold_factor(); // 1.2
+        if up {
+            // 向上突破时，RSI 越高惩罚越大（超买时 factor 1.2）
+            let strength = sigmoid(rsi_val, 70.0, 10.0);
+            lerp(1.0, rsi_overbought_factor, strength)
+        } else if down {
+            let strength = sigmoid(30.0 - rsi_val, 0.0, 10.0); // rsi 越低 strength 越高
+            lerp(1.0, rsi_oversold_factor, strength)
+        } else {
+            1.0
         }
     }
 
-    fn volume_efficiency_penalty(
+    // 连续量价效率惩罚
+    fn volume_efficiency_penalty_continuous(
         &self,
         eff: f64,
         rvol: f64,
         vol_s: VolumeState,
         cfg: &FakeoutConfig,
     ) -> f64 {
-        let mut factor: f64 = 1.0;
-        let is_low_eff = eff < cfg.vol_eff_low_threshold();
-        let is_high_eff = eff > cfg.vol_eff_high_threshold();
-        let is_surge = rvol > cfg.vol_surge_mult();
+        let low_eff_thresh = cfg.vol_eff_low_threshold(); // 0.3
+        let high_eff_thresh = cfg.vol_eff_high_threshold(); // 0.6
+        let surge_mult = cfg.vol_surge_mult(); // 1.5
+        let shrink_mult = cfg.vol_shrink_mult(); // 0.7
 
-        factor *= match (is_low_eff, is_high_eff, is_surge) {
-            (true, _, true) => 1.4,
-            (_, true, true) => 0.7,
-            _ if rvol < cfg.vol_shrink_mult() => 0.9,
-            _ => 1.0,
+        // 低效强度（eff 低于 low_eff_thresh 时高）
+        let low_eff_strength = sigmoid(low_eff_thresh - eff, 0.0, 8.0);
+        // 高效强度
+        let high_eff_strength = sigmoid(eff, high_eff_thresh, 8.0);
+        // 放量强度
+        let surge_strength = sigmoid(rvol, surge_mult, 8.0);
+        // 缩量强度
+        let shrink_strength = sigmoid(shrink_mult - rvol, 0.0, 8.0);
+
+        // 基础因子：低效+放量 → 1.4；高效+放量 → 0.7；缩量 → 0.9
+        let low_eff_surge_factor = 1.4;
+        let high_eff_surge_factor = 0.7;
+        let shrink_factor = 0.9;
+
+        let mut factor = 1.0;
+        // 低效+放量
+        let low_surge = low_eff_strength * surge_strength;
+        factor = lerp(factor, low_eff_surge_factor, low_surge);
+        // 高效+放量
+        let high_surge = high_eff_strength * surge_strength;
+        factor = lerp(factor, high_eff_surge_factor, high_surge);
+        // 缩量
+        factor = lerp(factor, shrink_factor, shrink_strength);
+
+        // 量状态额外调整（连续化）
+        let expand_strength = if vol_s == VolumeState::Expand {
+            1.0
+        } else {
+            0.0
         };
-
-        if vol_s == VolumeState::Expand && is_low_eff {
-            factor *= 1.2;
+        let shrink_state_strength = if vol_s == VolumeState::Shrink {
+            1.0
+        } else {
+            0.0
+        };
+        if expand_strength > 0.0 && low_eff_strength > 0.0 {
+            factor *= lerp(1.0, 1.2, low_eff_strength);
         }
-        if vol_s == VolumeState::Shrink {
-            factor *= 0.9;
+        if shrink_state_strength > 0.0 {
+            factor *= lerp(1.0, 0.9, shrink_state_strength);
         }
 
         factor.clamp(0.5, 2.0)

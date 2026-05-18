@@ -1,6 +1,7 @@
 use crate::config::{AnalyzerConfig, EntryStrategy};
 use crate::types::gravity::PriceGravityWell;
 use crate::types::market::{TradeDirection, TrendStructure};
+use crate::utils::math::sigmoid;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -84,13 +85,16 @@ impl RiskManager {
             &mut tags,
         );
 
-        // ========== 新增：最小 ATR 止损距离检查 ==========
+        // ========== 软惩罚：止损距离过近时降低置信度，不直接拒绝 ==========
         let first_sl_dist = (last_price - sl_levels[0]).abs() / atr_v;
-        if first_sl_dist < 1.2 {
-            *reject_reason = Some(format!("stop_too_tight: {:.2} ATR", first_sl_dist));
-            return None;
+        let stop_penalty = sigmoid(first_sl_dist, 1.2, 10.0).clamp(0.3, 1.0);
+        if stop_penalty < 0.5 {
+            tags.push(format!("STOP_TOO_TIGHT_PENALTY:{:.2}", stop_penalty));
         }
-        // ========== 检查结束 ==========
+        // 将惩罚作用于后续的置信度乘数（将在后面使用）
+        // 注意：此时 conf_mult 尚未计算，我们将在计算后应用惩罚
+        // 因此先保存惩罚因子，后面乘以 conf_mult
+        // =======================================================
 
         let wrr = self.calculate_weighted_rr(
             last_price, last_price, &sl_levels, &sl_alloc, &tp_levels, &tp_alloc,
@@ -117,7 +121,9 @@ impl RiskManager {
         let prior = dynamic_confidence_prior(vol_p, regime, self.config.risk.confidence_prior);
         let posterior = self.bayesian_update(prior, &likelihoods);
         let (mult_min, mult_max) = dynamic_confidence_range(vol_p, regime);
-        let conf_mult = (posterior * 2.4 - 0.4).clamp(mult_min, mult_max);
+        let mut conf_mult = (posterior * 2.4 - 0.4).clamp(mult_min, mult_max);
+        // 应用止损距离软惩罚
+        conf_mult *= stop_penalty;
         tags.push(format!("CONF_MULT:{:.2}", conf_mult));
 
         let trailing = is_tsunami
@@ -821,7 +827,6 @@ impl RiskManager {
             .map(|w| w.level)
             .unwrap_or_else(|| last_price - dir_sign * atr_v * 1.0);
         let sl_scale = dynamic_atr_sl_scale(vol_p);
-        // ========== 新增：动态波动率缩放 ==========
         let vol_scale = if vol_p > 70.0 {
             1.5
         } else if vol_p > 50.0 {
@@ -830,7 +835,6 @@ impl RiskManager {
             1.0
         };
         let final_sl_scale = sl_scale * vol_scale;
-        // ========================================
         let mut buffers = cfg
             .atr_sl_buffers
             .iter()
@@ -1043,7 +1047,10 @@ impl RiskManager {
             (def_strength / cfg.max_strength_cap).clamp(cfg.min_base_size, cfg.base_size_max);
         let vol_adj = dynamic_vol_position_adj(vol_p);
         let regime_adj = dynamic_regime_position_adj(regime);
-        let mut size = base * vol_adj * regime_adj * conf_mult;
+
+        // ========== 动态仓位：置信度平方挂钩，低置信度仓位急剧缩小 ==========
+        let effective_mult = conf_mult * conf_mult; // 平方，范围 0.09~1.0（若 conf_mult 0.3~1.0）
+        let mut size = base * vol_adj * regime_adj * effective_mult;
         if is_tsunami {
             size *= 1.2;
             tags.push("TSUNAMI_MODE".into());

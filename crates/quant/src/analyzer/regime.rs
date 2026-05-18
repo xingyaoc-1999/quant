@@ -7,6 +7,7 @@ use crate::types::futures::OIPositionState;
 use crate::types::gravity::PriceGravityWell;
 use crate::types::market::{RsiState, TrendStructure};
 use crate::types::session::TradingSession;
+use crate::utils::math::sigmoid;
 use std::f64;
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -207,8 +208,7 @@ impl Analyzer for MarketRegimeAnalyzer {
         let base_tsunami_oi = cfg.tsunami_base_oi_delta();
         let tsunami_oi_threshold = dynamic_tsunami_oi_threshold(vol_p, base_tsunami_oi);
 
-        // ========== 海啸判定：增加量价确认 + 过度延伸检查 ==========
-        let (is_tsunami, oi_state) = match oi_delta {
+        let (is_tsunami, oi_state, tsunami_strength) = match oi_delta {
             Some(delta) => {
                 let price_pct = (close_price - open_price) / open_price.max(f64::EPSILON);
                 let state = OIPositionState::determine(price_pct, delta);
@@ -219,23 +219,23 @@ impl Analyzer for MarketRegimeAnalyzer {
                         && is_bearish
                         && delta > tsunami_oi_threshold);
                 if !oi_condition {
-                    (false, state)
+                    (false, state, 0.0)
                 } else {
-                    // 量价确认：放量 + 高效
-                    let volume_ok = rvol > 1.5 && eff > 0.6;
-                    // 过度延伸：价格远离 MA20 > 3% 或 ATR 比率 > 2%
-                    let overextended = ma20_dist.abs() > 0.03 || atr_ratio > 0.02;
-                    let rsi_extreme = match (is_bullish, &rsi_state) {
-                        (true, Some(RsiState::Overbought)) => true,
-                        (false, Some(RsiState::Oversold)) => true,
-                        _ => false,
+                    let vol_score = sigmoid(rvol, 1.5, 8.0); // rvol>1.5 时趋近1
+                    let eff_score = sigmoid(eff, 0.6, 8.0); // eff>0.6 时趋近1
+                    let overextend_score =
+                        sigmoid(ma20_dist.abs(), 0.03, 10.0) * sigmoid(atr_ratio, 0.02, 10.0); // 过度延伸时趋近1
+                    let rsi_penalty = match (is_bullish, &rsi_state) {
+                        (true, Some(RsiState::Overbought)) => 0.2,
+                        (false, Some(RsiState::Oversold)) => 0.2,
+                        _ => 1.0,
                     };
-                    let extreme_ok = !overextended && !rsi_extreme;
-                    let tsunami = volume_ok && extreme_ok;
-                    (tsunami, state)
+                    let strength = vol_score * eff_score * (1.0 - overextend_score) * rsi_penalty;
+                    let tsunami = strength > 0.65; // 软阈值
+                    (tsunami, state, strength)
                 }
             }
-            None => (false, OIPositionState::Neutral),
+            None => (false, OIPositionState::Neutral, 0.0),
         };
         // ========== 海啸判定结束 ==========
 
@@ -244,10 +244,9 @@ impl Analyzer for MarketRegimeAnalyzer {
         ctx.set_cached(ContextKey::RegimeStructure, structure.clone());
 
         if is_tsunami {
-            res = res.because("TSUNAMI: 动能海啸触发（量价确认+非过度延伸）");
-            // 动态乘数：基础 1.3，随 rvol 和 eff 增加，上限 2.0
-            let tsunami_mult = 1.3 + (rvol - 1.5).min(0.8) * 0.5 + (eff - 0.6).min(0.4) * 0.5;
-            let tsunami_mult = tsunami_mult.clamp(1.3, 2.0);
+            res = res.because("TSUNAMI: 动能海啸触发（连续评分）");
+            // 动态乘数：基础 1.3，随强度增加，上限 2.0
+            let tsunami_mult = 1.3 + tsunami_strength * 0.7; // 强度0~1 => 乘数1.3~2.0
             m_momentum *= tsunami_mult;
         }
 

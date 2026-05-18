@@ -359,7 +359,7 @@ pub struct FakeoutConfig {
 impl Default for FakeoutConfig {
     fn default() -> Self {
         Self {
-            severity: 0.2,
+            severity: 0.1,
             persistence: 0.5,
         }
     }
@@ -544,14 +544,14 @@ impl Default for RiskConfig {
             entry_atr_step_mult: 0.5,
             default_entry_allocations: [0.5, 0.3, 0.2],
             direction_base_threshold: 12.0,
-            min_weighted_rr: 1.5,
+            min_weighted_rr: 1.2,
             entry_strategy: EntryStrategy::default(),
             stop_entry_offset_pct: 0.001,
             tsunami_tp2_atr_mult: 5.0,
             min_reliable_defense_strength: 0.3,
             min_stop_dist_pct: 0.008,
             initial_protection_bars: 3,
-            min_confidence_mult: 0.75,
+            min_confidence_mult: 0.6,
         }
     }
 }

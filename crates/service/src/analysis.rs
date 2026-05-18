@@ -5,6 +5,7 @@ use quant::audit::{
 };
 use quant::stats::SignalStats;
 use quant::types::market::TradeDirection;
+use quant::types::session::TradingSession;
 use quant::{
     analyzer::{AnalysisEngine, ContextKey},
     config::AnalyzerConfig,
@@ -368,6 +369,10 @@ impl AnalysisService {
             }
         }
 
+        let session = TradingSession::from_timestamp(ctx.global.timestamp);
+        if session == TradingSession::Weekend {
+            estimated_confidence *= 0.6;
+        }
         let average_atr = ctx
             .get_role(Role::Filter)
             .or_else(|_| ctx.get_role(Role::Trend))
@@ -401,10 +406,10 @@ impl AnalysisService {
                 }
             }
 
-            // 区间边界计算
+            // ===== 区间边界计算（改用 Filter 角色，即 4H） =====
             let price = audit.snapshot.price;
             let range_high = ctx
-                .get_role(Role::Trend)
+                .get_role(Role::Filter)
                 .ok()
                 .and_then(|r| {
                     r.feature_set
@@ -415,7 +420,7 @@ impl AnalysisService {
                 })
                 .unwrap_or(price);
             let range_low = ctx
-                .get_role(Role::Trend)
+                .get_role(Role::Filter)
                 .ok()
                 .and_then(|r| {
                     r.feature_set
@@ -430,30 +435,19 @@ impl AnalysisService {
             if range_width > 0.0 {
                 let position_in_range = (price - range_low) / range_width;
 
-                // 盘整区间中部拒绝（保守放宽：0.4~0.6）
+                // ===== 盘整区间中部：软惩罚（不再直接拒绝）=====
                 let is_mid_range = position_in_range > 0.4 && position_in_range < 0.6;
                 if regime == TrendStructure::Range && is_mid_range {
-                    let reason = format!(
-                        "mid_range_reject: price={:.2} range=[{:.2}, {:.2}] pos={:.2}",
-                        price, range_low, range_high, position_in_range
+                    let t = (position_in_range - 0.4) / 0.2; // 0..1
+                    let mid_penalty = 0.7 - 0.5 * (1.0 / (1.0 + (-10.0 * (t - 0.5)).exp()));
+                    estimated_confidence *= mid_penalty;
+                    info!(
+                        "[MID RANGE PENALTY] {} confidence reduced to {:.2}",
+                        symbol, estimated_confidence
                     );
-                    warn!("[MID RANGE] {} {}", symbol, reason);
-                    let analysis = build_analysis_details(&audit.signal.sub_reports);
-                    let record = AuditRecord {
-                        timestamp: Utc::now().timestamp_millis(),
-                        event: AuditEvent::Reject,
-                        symbol: symbol.as_str().to_string(),
-                        signal: None,
-                        market_snapshot: Some(audit.snapshot.clone()),
-                        analysis,
-                        reject_reason: Some(reason.clone()),
-                    };
-                    write_audit_log(&record).await;
-                    self.stats.lock().await.add_reject(symbol, reason);
-                    return;
                 }
 
-                // 边界突破量能确认（放宽阈值）
+                // ===== 边界突破量能：软惩罚（不再直接拒绝）=====
                 let at_boundary = position_in_range > 0.85 || position_in_range < 0.15;
                 if at_boundary && regime == TrendStructure::Range {
                     let rvol = ctx
@@ -465,24 +459,12 @@ impl AnalysisService {
                         .copied()
                         .unwrap_or(0.5);
                     if rvol < 1.0 && eff < 0.3 {
-                        let reason = format!(
-                            "breakout_no_volume: rvol={:.2} eff={:.2} at_boundary_pos={:.2}",
-                            rvol, eff, position_in_range
+                        let penalty = (rvol / 1.0).max(0.3) * (eff / 0.3).max(0.3);
+                        estimated_confidence *= penalty;
+                        info!(
+                            "[BREAKOUT VOLUME PENALTY] {} confidence reduced to {:.2}",
+                            symbol, estimated_confidence
                         );
-                        warn!("[BREAKOUT REJECT] {} {}", symbol, reason);
-                        let analysis = build_analysis_details(&audit.signal.sub_reports);
-                        let record = AuditRecord {
-                            timestamp: Utc::now().timestamp_millis(),
-                            event: AuditEvent::Reject,
-                            symbol: symbol.as_str().to_string(),
-                            signal: None,
-                            market_snapshot: Some(audit.snapshot.clone()),
-                            analysis,
-                            reject_reason: Some(reason.clone()),
-                        };
-                        write_audit_log(&record).await;
-                        self.stats.lock().await.add_reject(symbol, reason);
-                        return;
                     }
                 }
             }

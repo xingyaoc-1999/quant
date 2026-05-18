@@ -5,7 +5,7 @@ use crate::analyzer::{
 use crate::config::AnalyzerConfig;
 use crate::types::gravity::{ConversionState, PriceGravityWell, WellSide, WellSource};
 use crate::types::market::TrendStructure;
-use crate::utils::math::price_to_key;
+use crate::utils::math::{price_to_key, sigmoid};
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::f64::consts::LN_2;
@@ -108,20 +108,15 @@ impl Analyzer for GravityAnalyzer {
             .copied()
             .unwrap_or(0.5);
 
-        let volume_boost_threshold = 1.5;
-        let volume_boost_mult = 1.3;
-        let volume_penalty_threshold = 0.5;
-        let volume_penalty_mult = 0.7;
+        let boost_strength = sigmoid(rvol, 1.5, 8.0) * sigmoid(eff, 0.6, 8.0);
+        let penalty_strength = sigmoid(0.5 - rvol, 0.0, 8.0) * sigmoid(0.3 - eff, 0.0, 8.0);
+        let volume_factor = 1.0 + (cfg.volume_boost_mult - 1.0) * boost_strength
+            - (1.0 - cfg.volume_penalty_mult) * penalty_strength;
+        let volume_factor = volume_factor.clamp(cfg.volume_penalty_mult, cfg.volume_boost_mult);
 
-        let volume_factor = if rvol > volume_boost_threshold && eff > 0.6 {
-            volume_boost_mult
-        } else if rvol < volume_penalty_threshold && eff < 0.3 {
-            volume_penalty_mult
-        } else {
-            1.0
-        };
-
-        let mut wells = Vec::new();
+        // 预分配容量，减少动态扩容
+        let estimated_capacity = prev_wells.len() + 20;
+        let mut wells = Vec::with_capacity(estimated_capacity);
         let mut dampened_indices = std::collections::HashSet::new();
 
         let sources_to_add = [
@@ -165,7 +160,6 @@ impl Analyzer for GravityAnalyzer {
             );
         }
 
-        // MA20 井：使用 Filter 角色的 ma20_dist_ratio
         if let Some(ratio) = f_space.ma20_dist_ratio {
             self.add_well_source(
                 &WellSourceInput {
@@ -185,7 +179,6 @@ impl Analyzer for GravityAnalyzer {
             );
         }
 
-        // MA50、MA200 井：使用 Filter 角色
         let f_feat = &filter_role.feature_set;
         if let Some(ma50) = f_feat.indicators.ma_50 {
             let dist = (ma50 - last_price) / last_price;
@@ -408,6 +401,7 @@ impl Analyzer for GravityAnalyzer {
 }
 
 impl GravityAnalyzer {
+    // 以下辅助函数保持不变（与原始代码相同）
     fn add_well_source(
         &self,
         input: &WellSourceInput,

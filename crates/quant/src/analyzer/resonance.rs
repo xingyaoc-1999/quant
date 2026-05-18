@@ -6,6 +6,7 @@ use crate::config::AnalyzerConfig;
 use crate::types::gravity::PriceGravityWell;
 use crate::types::gravity::WellSide;
 use crate::types::market::{DivergenceType, MacdCross, MacdMomentum, RsiState, TrendStructure};
+use crate::utils::math::lerp;
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct ResonanceExtra {
@@ -134,7 +135,7 @@ impl Analyzer for ResonanceAnalyzer {
                     } else {
                         (50.0 - rsi_val) / 30.0
                     };
-                    base_score *= (0.8 + rsi_factor.clamp(-0.3, 0.5));
+                    base_score *= 0.8 + rsi_factor.clamp(-0.3, 0.5);
                 }
                 let final_score = base_score.clamp(-100.0, 100.0);
                 return Ok(AnalysisResult::new(self.kind())
@@ -169,17 +170,42 @@ impl Analyzer for ResonanceAnalyzer {
         };
 
         let slope_bars = feat.structure.ma20_slope_bars.abs();
-        if slope_bars < cfg.early_trend_bars {
-            m_resonance *= cfg.early_trend_mult;
-            description.push("EARLY_TREND".to_string());
-        } else if slope_bars > cfg.aging_trend_bars {
+        // ===== 平滑处理：将早趋势和老化改为连续因子 =====
+        let early_bars = cfg.early_trend_bars;
+        let aging_bars = cfg.aging_trend_bars;
+
+        let trend_maturity = if slope_bars <= early_bars {
+            1.0 // 完全年轻
+        } else if slope_bars >= aging_bars {
+            0.0 // 完全衰老
+        } else {
+            // 线性插值：年轻时为1，衰老时为0
+            1.0 - (slope_bars - early_bars) as f64 / (aging_bars - early_bars) as f64
+        };
+
+        // 年轻时的乘数是 early_trend_mult (>1)，衰老时的乘数是最终惩罚 penalty
+        let aging_penalty = {
             let aging_period = cfg.aging_decay_period;
-            let raw_penalty = ((slope_bars - cfg.aging_trend_bars) as f64 / aging_period)
-                .min(cfg.max_aging_penalty);
-            let penalty = (1.0 - raw_penalty).max(0.0);
-            m_resonance *= penalty;
-            description.push(format!("AGING({:.0}% remaining)", penalty * 100.0));
+            let raw_penalty =
+                ((slope_bars - aging_bars) as f64 / aging_period).min(cfg.max_aging_penalty);
+            (1.0 - raw_penalty).max(0.0)
+        };
+        // 衰老时的乘数 = aging_penalty（原逻辑中 penalty 用于乘 m_resonance）
+        let young_mult = cfg.early_trend_mult;
+        let old_mult = aging_penalty;
+        let continuous_mult = lerp(young_mult, old_mult, 1.0 - trend_maturity);
+
+        m_resonance *= continuous_mult;
+        if trend_maturity < 1.0 {
+            description.push(format!("TREND_AGE:{:.0}%", (1.0 - trend_maturity) * 100.0));
         }
+        if trend_maturity > 0.0 && slope_bars > early_bars {
+            description.push("EARLY_TREND".to_string());
+        }
+        if trend_maturity < 1.0 && slope_bars < aging_bars {
+            // 这里不需要额外 push，因为上面已经记录了年龄
+        }
+        // ===== 平滑结束 =====
 
         if let Some(macd_mom) = feat.signals.macd_momentum {
             let mom_confirmed = (is_long && macd_mom == MacdMomentum::Increasing)

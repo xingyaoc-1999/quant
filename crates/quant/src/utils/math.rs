@@ -99,3 +99,11 @@ pub fn dynamic_direction_threshold(
         None
     }
 }
+#[inline]
+pub fn sigmoid(x: f64, mid: f64, k: f64) -> f64 {
+    1.0 / (1.0 + (-k * (x - mid)).exp())
+}
+#[inline]
+pub fn lerp(a: f64, b: f64, t: f64) -> f64 {
+    a + (b - a) * t.clamp(0.0, 1.0)
+}
