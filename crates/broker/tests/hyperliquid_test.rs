@@ -1,14 +1,11 @@
 use hypersdk::{
-    hypercore::{self, types::*, PrivateKeySigner},
+    hypercore::{self, PrivateKeySigner},
     Address,
 };
-use rust_decimal::Decimal;
-use std::str::FromStr;
 
-const TEST_PRIVATE_KEY: &str = "你的测试网钱包私钥";
+const TEST_PRIVATE_KEY: &str = "0x64a7e2d8f62268f0f2456509248714a9d70f2c90d4888afff0300a1d45267ee2";
 
-//  (0x...)
-const TEST_WALLET_ADDRESS: &str = "你的测试网钱包地址";
+const TEST_WALLET_ADDRESS: &str = "0x8B2019cCCCeF2A20314DC15cf4afE7d9fFB6aE14";
 
 fn setup() -> (hypercore::HttpClient, PrivateKeySigner) {
     let client = hypercore::mainnet();
@@ -44,17 +41,16 @@ async fn test_query_positions() -> anyhow::Result<()> {
     Ok(())
 }
 
-// /// 2. 获取市场信息，确定资产索引
-// #[tokio::test]
-// async fn test_get_markets() -> anyhow::Result<()> {
-//     let (client, _) = setup();
-//     let perps = client.perps().await?;
-//     println!("=== 永续合约市场 ===");
-//     for (i, m) in perps.iter().enumerate() {
-//         println!("索引 {}: {} (最大杠杆 {}x)", i, m.name, m.max_leverage);
-//     }
-//     Ok(())
-// }
+#[tokio::test]
+async fn test_get_markets() -> anyhow::Result<()> {
+    let (client, _) = setup();
+    let perps = client.perps().await?;
+    println!("=== 永续合约市场 ===");
+    for (i, m) in perps.iter().enumerate() {
+        println!("索引 {}: {} (最大杠杆 {}x)", i, m.name, m.max_leverage);
+    }
+    Ok(())
+}
 
 // /// 3. 市价单测试 (立即开仓)
 // #[tokio::test]

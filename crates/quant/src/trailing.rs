@@ -9,8 +9,8 @@ pub struct TrailingStop {
     best_price: f64,
     stop_price: f64,
     trail_mult: f64,
+    activation_mult: f64, // 保本激活所需的 ATR 倍数（动态）
     protection_bars_remaining: usize,
-
     breakeven_activated: bool,
 }
 
@@ -20,6 +20,7 @@ impl TrailingStop {
         entry_price: f64,
         initial_stop: f64,
         trail_mult: f64,
+        activation_mult: f64, // 新增参数，用于设置保本激活倍数
         protection_bars: usize,
     ) -> Self {
         Self {
@@ -28,6 +29,7 @@ impl TrailingStop {
             best_price: entry_price,
             stop_price: initial_stop,
             trail_mult,
+            activation_mult,
             protection_bars_remaining: protection_bars,
             breakeven_activated: false,
         }
@@ -46,9 +48,12 @@ impl TrailingStop {
                     self.best_price = current_price;
                 }
 
-                if !self.breakeven_activated && current_price >= self.entry_price + 1.5 * atr {
+                // 使用动态保本激活倍数，且保本后止损设在 entry_price + 0.5 * atr（锁定小利润）
+                if !self.breakeven_activated
+                    && current_price >= self.entry_price + self.activation_mult * atr
+                {
                     self.breakeven_activated = true;
-                    self.stop_price = self.entry_price;
+                    self.stop_price = self.entry_price + 0.5 * atr; // 保本后留 0.5 ATR 缓冲
                 }
 
                 if self.breakeven_activated {
@@ -63,9 +68,11 @@ impl TrailingStop {
                     self.best_price = current_price;
                 }
 
-                if !self.breakeven_activated && current_price <= self.entry_price - 1.5 * atr {
+                if !self.breakeven_activated
+                    && current_price <= self.entry_price - self.activation_mult * atr
+                {
                     self.breakeven_activated = true;
-                    self.stop_price = self.entry_price;
+                    self.stop_price = self.entry_price - 0.5 * atr; // 保本后留 0.5 ATR 缓冲
                 }
 
                 if self.breakeven_activated {
@@ -118,7 +125,6 @@ pub fn refresh_take_profits(
     let new_tp1 = new_tp_array[0];
     let new_tp2 = new_tp_array[1];
 
-    // 检查是否都更优（做多时更高，做空时更低）
     let tp1_better = (is_long && new_tp1 > current_tp1) || (!is_long && new_tp1 < current_tp1);
     let tp2_better = (is_long && new_tp2 > current_tp2) || (!is_long && new_tp2 < current_tp2);
 

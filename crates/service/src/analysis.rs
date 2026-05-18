@@ -149,7 +149,7 @@ impl AnalysisService {
             self.config.risk.direction_base_threshold,
         );
 
-        // ===== 修改：强趋势或海啸时，无需重力井目标 =====
+        // 强趋势或海啸时，无需重力井目标
         let has_valid_targets = if is_tsunami
             || matches!(
                 regime,
@@ -166,7 +166,6 @@ impl AnalysisService {
                     }
             })
         };
-        // ===== 结束修改 =====
 
         let likely_stop = is_tsunami
             || (estimated_confidence > 1.2 && has_valid_targets)
@@ -221,7 +220,7 @@ impl AnalysisService {
             }
         }
 
-        // --- 逆大周期过滤（适度宽松：仅强趋势拦截）---
+        // --- 逆大周期过滤（仅强趋势拦截）---
         let higher_tf_trend = ctx
             .get_role(Role::Filter)
             .or_else(|_| ctx.get_role(Role::Trend))
@@ -430,7 +429,9 @@ impl AnalysisService {
 
             if range_width > 0.0 {
                 let position_in_range = (price - range_low) / range_width;
-                let is_mid_range = position_in_range > 0.35 && position_in_range < 0.65;
+
+                // 盘整区间中部拒绝（保守放宽：0.4~0.6）
+                let is_mid_range = position_in_range > 0.4 && position_in_range < 0.6;
                 if regime == TrendStructure::Range && is_mid_range {
                     let reason = format!(
                         "mid_range_reject: price={:.2} range=[{:.2}, {:.2}] pos={:.2}",
@@ -452,7 +453,8 @@ impl AnalysisService {
                     return;
                 }
 
-                let at_boundary = position_in_range > 0.8 || position_in_range < 0.2;
+                // 边界突破量能确认（放宽阈值）
+                let at_boundary = position_in_range > 0.85 || position_in_range < 0.15;
                 if at_boundary && regime == TrendStructure::Range {
                     let rvol = ctx
                         .get_cached::<f64>(ContextKey::LastRVol)
@@ -462,7 +464,7 @@ impl AnalysisService {
                         .get_cached::<f64>(ContextKey::LastEfficiency)
                         .copied()
                         .unwrap_or(0.5);
-                    if rvol < 1.2 && eff < 0.4 {
+                    if rvol < 1.0 && eff < 0.3 {
                         let reason = format!(
                             "breakout_no_volume: rvol={:.2} eff={:.2} at_boundary_pos={:.2}",
                             rvol, eff, position_in_range
@@ -610,13 +612,20 @@ impl AnalysisService {
             .get_cached::<bool>(ContextKey::IsMomentumTsunami)
             .copied()
             .unwrap_or(false);
-
+        let activation_mult = if vol_p > 70.0 {
+            1.2
+        } else if vol_p < 30.0 {
+            1.8
+        } else {
+            1.5
+        };
         if pos.trailing_stop.is_none() {
             pos.trailing_stop = Some(TrailingStop::new(
                 pos.direction,
                 pos.entry_price,
                 pos.stop_loss,
                 self.config.risk.trailing_atr_mult,
+                activation_mult,
                 self.config.risk.initial_protection_bars,
             ));
         }

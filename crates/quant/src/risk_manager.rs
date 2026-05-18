@@ -84,6 +84,14 @@ impl RiskManager {
             &mut tags,
         );
 
+        // ========== 新增：最小 ATR 止损距离检查 ==========
+        let first_sl_dist = (last_price - sl_levels[0]).abs() / atr_v;
+        if first_sl_dist < 1.2 {
+            *reject_reason = Some(format!("stop_too_tight: {:.2} ATR", first_sl_dist));
+            return None;
+        }
+        // ========== 检查结束 ==========
+
         let wrr = self.calculate_weighted_rr(
             last_price, last_price, &sl_levels, &sl_alloc, &tp_levels, &tp_alloc,
         );
@@ -127,7 +135,6 @@ impl RiskManager {
             tags.push("DYNAMIC_TP".into());
         }
 
-        // ===== 修改：强趋势或海啸时，无需重力井目标 =====
         let has_valid_targets = if is_tsunami
             || matches!(
                 regime,
@@ -148,7 +155,6 @@ impl RiskManager {
             *reject_reason = Some("tsunami_no_target".into());
             return None;
         }
-        // ===== 结束修改 =====
 
         let entry_strategy =
             self.select_entry_strategy(regime, vol_p, is_tsunami, has_valid_targets, conf_mult);
@@ -566,7 +572,7 @@ impl RiskManager {
         let mut allocs = [0.0; 3];
 
         if count == 0 {
-            tags.push("ENTRY_FALLBACK_ATR".into()); // 明确标记后备
+            tags.push("ENTRY_FALLBACK_ATR".into());
             let step = atr_v * cfg.entry_atr_step_mult;
             levels[0] = last_price;
             allocs[0] = cfg.default_entry_allocations[0];
@@ -670,7 +676,7 @@ impl RiskManager {
         let mut used_offset_pct = base_offset_pct;
 
         if count == 0 {
-            tags.push("ENTRY_STOP_FALLBACK_ATR".into()); // 明确标记后备
+            tags.push("ENTRY_STOP_FALLBACK_ATR".into());
             let step = atr_v * 0.5;
             let dynamic_offset_pct = base_offset_pct + atr_pct * 0.5;
             used_offset_pct = dynamic_offset_pct;
@@ -815,6 +821,16 @@ impl RiskManager {
             .map(|w| w.level)
             .unwrap_or_else(|| last_price - dir_sign * atr_v * 1.0);
         let sl_scale = dynamic_atr_sl_scale(vol_p);
+        // ========== 新增：动态波动率缩放 ==========
+        let vol_scale = if vol_p > 70.0 {
+            1.5
+        } else if vol_p > 50.0 {
+            1.2
+        } else {
+            1.0
+        };
+        let final_sl_scale = sl_scale * vol_scale;
+        // ========================================
         let mut buffers = cfg
             .atr_sl_buffers
             .iter()
@@ -824,7 +840,7 @@ impl RiskManager {
         while buffers.len() < 2 {
             buffers.push(1.0);
         }
-        buffers.iter_mut().for_each(|b| *b *= sl_scale);
+        buffers.iter_mut().for_each(|b| *b *= final_sl_scale);
 
         for (_i, &buf) in buffers.iter().enumerate() {
             let raw = base_def - dir_sign * atr_v * buf;
@@ -862,7 +878,6 @@ impl RiskManager {
             sl_alloc = vec![0.5, 0.5];
         }
 
-        // 止损后备标记
         if defenses.is_empty() {
             tags.push("SL_FALLBACK_ATR".into());
         } else {

@@ -523,7 +523,7 @@ impl Default for RiskConfig {
             rr_min_acceptable: 2.2,
             ma20_extreme_mult: 3.5,
             atr_sl_buffers: [0.8, 1.5, 2.2],
-            min_sl_atr_mult: 0.3,
+            min_sl_atr_mult: 0.8,
             max_strength_cap: 3.5,
             base_size_max: 0.5,
             min_base_size: 0.1,
@@ -544,14 +544,14 @@ impl Default for RiskConfig {
             entry_atr_step_mult: 0.5,
             default_entry_allocations: [0.5, 0.3, 0.2],
             direction_base_threshold: 12.0,
-            min_weighted_rr: 0.8,
+            min_weighted_rr: 1.5,
             entry_strategy: EntryStrategy::default(),
             stop_entry_offset_pct: 0.001,
             tsunami_tp2_atr_mult: 5.0,
             min_reliable_defense_strength: 0.3,
-            min_stop_dist_pct: 0.0002,
+            min_stop_dist_pct: 0.008,
             initial_protection_bars: 3,
-            min_confidence_mult: 0.65,
+            min_confidence_mult: 0.75,
         }
     }
 }

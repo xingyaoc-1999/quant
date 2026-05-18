@@ -100,8 +100,7 @@ impl Analyzer for ResonanceAnalyzer {
                     .because(reason));
             }
 
-            // ===== 新增：强趋势且无重力井时，基础追踪分 =====
-            let regime = ctx
+            let regime: Option<TrendStructure> = ctx
                 .get_cached::<TrendStructure>(ContextKey::RegimeStructure)
                 .copied();
             let wells = ctx
